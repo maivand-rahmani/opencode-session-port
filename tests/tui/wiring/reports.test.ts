@@ -15,7 +15,7 @@ import { ProjectDestinationError } from "../../../src/tui/adapters/project-desti
 import { ArtifactFileError } from "../../../src/tui/artifacts/files.ts";
 import { CryptoContainerError } from "../../../src/core/crypto/errors.ts";
 import { RestorePlanError } from "../../../src/core/restore/planner.ts";
-import { SessionCollectionError } from "../../../src/core/sessions/index.ts";
+import { SessionCollectionError, type SessionCollectionErrorCode } from "../../../src/core/sessions/index.ts";
 import type { RestoreExecutionResult } from "../../../src/tui/orchestration/index.ts";
 import {
 	reportCheckpointFailure,
@@ -70,6 +70,59 @@ describe("checkpoint reports", () => {
 			expect(notification.message).toContain(expectMessage);
 			expect(notification.message).not.toContain(RAW);
 		}
+	});
+
+	test("adds a fixed reason and the exact known code for every known collection failure code", () => {
+		const expected: ReadonlyArray<readonly [SessionCollectionErrorCode, string]> = [
+			["invalid-request", "the session collection request was invalid"],
+			["invalid-policy", "the session collection policy was invalid"],
+			["session-list-failed", "the host session list could not be read"],
+			["message-list-failed", "a session's message history could not be read"],
+			["malformed-session-page", "the host returned a malformed session list page"],
+			["malformed-message-page", "the host returned a malformed message list page"],
+			["malformed-session-record", "the host returned a malformed session record"],
+			["malformed-message-record", "the host returned a malformed message record"],
+			["session-project-mismatch", "a listed session did not belong to the requested project"],
+			["duplicate-session-id", "the host returned a session more than once"],
+			["duplicate-message-id", "the host returned a message more than once"],
+			["repeated-session-cursor", "the host repeated a session list cursor"],
+			["repeated-message-cursor", "the host repeated a message list cursor"],
+			["session-limit-exceeded", "the session count exceeded the configured limit"],
+			["message-limit-exceeded", "a session's message count exceeded the configured limit"],
+			["total-message-limit-exceeded", "the total message count exceeded the configured limit"],
+			["unsettled-message", "the project history contains an unfinished message"],
+		];
+
+		for (const [code, reason] of expected) {
+			const notification = reportCheckpointFailure(new SessionCollectionError(code, RAW));
+			expect(notification).toEqual({
+				title: "Checkpoint failed",
+				message: `Collecting the project's sessions failed; no artifact was written. Reason: ${reason} (${code}).`,
+				variant: "error",
+			});
+		}
+	});
+
+	test("unknown or forged collection codes, raw messages, and non-collection errors never leak", () => {
+		const genericCollection = "Collecting the project's sessions failed; no artifact was written.";
+
+		for (const code of ["future-unknown-code", "constructor", "__proto__", "toString", "hasOwnProperty"]) {
+			const forged = new SessionCollectionError(code as SessionCollectionErrorCode, RAW);
+			const notification = reportCheckpointFailure(forged);
+			expect(notification.message).toBe(genericCollection);
+			expect(notification.message).not.toContain(code);
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// A code-shaped plain object is not a SessionCollectionError: stays fully generic.
+		const fake = reportCheckpointFailure({ code: "unsettled-message", message: RAW });
+		expect(fake.message).toBe("Checkpoint failed; no artifact was written.");
+		expect(fake.message).not.toContain("unsettled-message");
+		expect(fake.message).not.toContain(RAW);
+
+		// Restore's collection category is unchanged: the reason/code text is checkpoint-only.
+		const restore = reportRestoreFailure(new SessionCollectionError("unsettled-message", RAW), false);
+		expect(restore.message).toBe("The destination project's sessions could not be read; no sessions were changed.");
 	});
 });
 

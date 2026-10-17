@@ -4,7 +4,10 @@
  * Every function here returns a fixed, generic notification object; raw host
  * or exception text is NEVER interpolated. Classification uses stable error
  * classes/codes only, never message text, so a failure report cannot leak
- * session IDs, paths, host internals, or password material. Exact user-facing
+ * session IDs, paths, host internals, or password material. Checkpoint
+ * collection failures additionally append a fixed human reason and the exact
+ * machine code, but only for `SessionCollectionError` codes on an explicit
+ * allowlist; unknown or forged codes keep the generic text. Exact user-facing
  * copy remains OPEN (OQ-15); these strings are the wiring lane's generic
  * sanitized categories.
  *
@@ -31,7 +34,7 @@ import { HostAdapterError, ProjectDestinationError } from "../adapters/index.ts"
 import { LocationResolutionError } from "../adapters/location-resolver.ts";
 import { CryptoContainerError } from "../../core/crypto/errors.ts";
 import { RestorePlanError } from "../../core/restore/planner.ts";
-import { SessionCollectionError } from "../../core/sessions/index.ts";
+import { SessionCollectionError, type SessionCollectionErrorCode } from "../../core/sessions/index.ts";
 import { RESTORE_PASSWORD_ATTEMPT_LIMIT } from "../orchestration/index.ts";
 import type { CheckpointOutcome, RestoreExecutionResult } from "../orchestration/index.ts";
 import type {
@@ -94,7 +97,7 @@ export function reportCheckpointFailure(error: unknown): SessionPortNotification
 		case "capability":
 			return checkpointFailure("This OpenCode host does not expose the required session-listing capability; no artifact was written.");
 		case "collection":
-			return checkpointFailure("Collecting the project's sessions failed; no artifact was written.");
+			return checkpointFailure(checkpointCollectionFailureMessage(error));
 		case "path-exists":
 			return checkpointFailure("An artifact already exists at that path; nothing was overwritten.");
 		case "artifact-path":
@@ -114,6 +117,51 @@ export function reportCheckpointFailure(error: unknown): SessionPortNotification
 
 function checkpointFailure(message: string): SessionPortNotification {
 	return { title: "Checkpoint failed", message, variant: "error" };
+}
+
+/** Existing generic checkpoint collection failure copy; also the fallback for unknown codes. */
+const CHECKPOINT_COLLECTION_FAILURE = "Collecting the project's sessions failed; no artifact was written.";
+
+/**
+ * Fixed human reason per known `SessionCollectionError` code. This record is
+ * the explicit allowlist: the raw code is echoed to the user only when it
+ * exactly matches one of these keys, and the raw `error.message` (which can
+ * contain session/project IDs, paths, and host error text) is never used.
+ * Adding a code to `SessionCollectionErrorCode` fails compilation until a
+ * fixed reason is added here.
+ */
+const CHECKPOINT_COLLECTION_REASONS: Readonly<Record<SessionCollectionErrorCode, string>> = {
+	"invalid-request": "the session collection request was invalid",
+	"invalid-policy": "the session collection policy was invalid",
+	"session-list-failed": "the host session list could not be read",
+	"message-list-failed": "a session's message history could not be read",
+	"malformed-session-page": "the host returned a malformed session list page",
+	"malformed-message-page": "the host returned a malformed message list page",
+	"malformed-session-record": "the host returned a malformed session record",
+	"malformed-message-record": "the host returned a malformed message record",
+	"session-project-mismatch": "a listed session did not belong to the requested project",
+	"duplicate-session-id": "the host returned a session more than once",
+	"duplicate-message-id": "the host returned a message more than once",
+	"repeated-session-cursor": "the host repeated a session list cursor",
+	"repeated-message-cursor": "the host repeated a message list cursor",
+	"session-limit-exceeded": "the session count exceeded the configured limit",
+	"message-limit-exceeded": "a session's message count exceeded the configured limit",
+	"total-message-limit-exceeded": "the total message count exceeded the configured limit",
+	"unsettled-message": "the project history contains an unfinished message",
+};
+
+/**
+ * Checkpoint collection failure copy: the existing generic message plus
+ * `Reason: <fixed human reason> (<known code>).` for a `SessionCollectionError`
+ * whose code is on the allowlist. Any other error or code keeps the generic
+ * text; only allowlisted literal code strings are ever echoed.
+ */
+function checkpointCollectionFailureMessage(error: unknown): string {
+	if (!(error instanceof SessionCollectionError)) return CHECKPOINT_COLLECTION_FAILURE;
+	const code: string = error.code;
+	if (!Object.hasOwn(CHECKPOINT_COLLECTION_REASONS, code)) return CHECKPOINT_COLLECTION_FAILURE;
+	const reason = CHECKPOINT_COLLECTION_REASONS[code as SessionCollectionErrorCode];
+	return `${CHECKPOINT_COLLECTION_FAILURE} Reason: ${reason} (${code}).`;
 }
 
 /* ------------------------------------------------------------------------- */
