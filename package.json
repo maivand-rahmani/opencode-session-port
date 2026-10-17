@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-port",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "license": "MIT",
   "description": "SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.",
