@@ -4,12 +4,12 @@
 
 SessionPort is a local plugin for the OpenCode TUI. It captures the sessions of your current project into a single password-encrypted artifact and restores them in another checkout, worktree, or machine. Artifacts travel with Git or any other channel you choose — SessionPort never runs Git commands itself.
 
-> **Status: experimental pre-release (0.1.4).** SessionPort completed one bounded synthetic checkpoint/restore round trip on Windows with OpenCode v2.0.22. That test used test-only password and project-selector seams and staged source, not the npm tarball. On one real Windows OpenCode v2.0.22 host, a bounded diagnostic observed both commands registered (`commands=yes`) but hidden from the command palette and slash list until the keymap layer opted into global mode; 0.1.2 applies that global-mode registration fix, with focused command-registration tests and the TUI build passing. 0.1.3 additionally enables the commands on macOS and Linux through an explicit platform allowlist (`win32`/`darwin`/`linux`). 0.1.2 and 0.1.3 are published to npm (0.1.3 latest, per a read-only registry check); 0.1.4 is the current local candidate. 0.1.4 is a diagnostics/copy patch only: a failed checkpoint collection now appends a fixed sanitized reason and the known machine code (`Reason: <fixed reason> (<code>).`) for the 17 current collection codes; unknown codes keep the generic text and raw host/exception text is never shown. Collector behavior is unchanged, and no root cause is established for an earlier Windows collection failure; a user later reported a local checkpoint succeeding from the repository checkout, which is not attributed to this patch. macOS has one user-reported successful checkpoint only; Linux is untested; restore and cross-OS artifact interchange remain unestablished. End-to-end execution from the packed package has not been host-tested. Real modal interactions and loading the packed package in OpenCode have not been verified. The checkpoint format may change; no compatibility, security, or platform-support guarantee is made.
+> **Status: experimental pre-release (0.1.5).** SessionPort completed one bounded synthetic checkpoint/restore round trip on Windows with OpenCode v2.0.22. That test used test-only password and project-selector seams and staged source, not the npm tarball. On one real Windows OpenCode v2.0.22 host, a bounded diagnostic observed both commands registered (`commands=yes`) but hidden from the command palette and slash list until the keymap layer opted into global mode; 0.1.2 applies that global-mode registration fix, with focused command-registration tests and the TUI build passing. 0.1.3 additionally enables the commands on macOS and Linux through an explicit platform allowlist (`win32`/`darwin`/`linux`). 0.1.2 and 0.1.3 are published to npm (0.1.3 latest, per a read-only registry check); 0.1.4 and 0.1.5 are local candidates (0.1.5 current). 0.1.4 was a diagnostics/copy patch: a failed checkpoint collection appends a fixed sanitized reason and the known machine code (`Reason: <fixed reason> (<code>).`) for the current collection codes; unknown codes keep the generic text and raw host/exception text is never shown. 0.1.5 adds a bare `/restore` default that uses the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time; no fallback to an older artifact on a corrupt file, wrong password, or read failure) and extends the same fixed-reason diagnostics to known restore plan/collection error codes. Collector behavior is unchanged, and no root cause is established for an earlier Windows collection failure; the concrete code behind an earlier restore rejection is likewise still pending a user runtime observation, and no planner correctness fix is claimed. macOS has one user-reported successful checkpoint only; Linux is untested; restore and cross-OS artifact interchange remain unestablished. End-to-end execution from the packed package has not been host-tested. Real modal interactions and loading the packed package in OpenCode have not been verified. The checkpoint format may change; no compatibility, security, or platform-support guarantee is made.
 
 ## Commands
 
 - **`/checkpoint [artifact-path]`** — collects the current project's sessions as returned by the host (child/subagent and archived sessions included when the host returns them) and writes one encrypted artifact. It fails cleanly, with no artifact, when the set is empty, a session cannot be captured completely, or the output file already exists.
-- **`/restore <artifact-path>`** — decrypts and validates the artifact before session imports, then restores it into an existing project you select. Restore does not overwrite existing sessions: exact destination matches are skipped, conflicting IDs are remapped deterministically, and parents are imported before children.
+- **`/restore [artifact-path]`** — decrypts and validates the artifact before session imports, then restores it into an existing project you select. Without a path, `/restore` uses the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time; an exact tie is broken deterministically by filename). Restore does not overwrite existing sessions: exact destination matches are skipped, conflicting IDs are remapped deterministically, and parents are imported before children.
 
 Both commands are registered by the plugin as `sessionport.checkpoint` and `sessionport.restore`, and appear in the slash-command list and the command palette.
 
@@ -24,17 +24,17 @@ Add the plugin to the `plugins` array in your global CLI-only config (`cli.json`
 
 ```json
 {
-  "plugins": ["opencode-session-port@0.1.4"]
+  "plugins": ["opencode-session-port@0.1.5"]
 }
 ```
 
 Or install the package plugin with the OpenCode CLI:
 
 ```sh
-opencode plugin add opencode-session-port@0.1.4
+opencode plugin add opencode-session-port@0.1.5
 ```
 
-`cli.json` is the documented OpenCode v2 config for CLI-only plugins: they run locally in the terminal and remain active when the CLI connects to a remote server. The npm registry shows 0.1.2 and 0.1.3 published (0.1.3 latest; read-only registry check); no published artifact has been loaded by OpenCode here, and no local package-verification record exists for the published 0.1.3 tarball. The 0.1.1 tarball passed npm consumer checks, but a direct Bun package-manager install timed out in the verification environment, so that install path remains unverified. The 0.1.2 tarball passed manifest/allowlist and packed-entry checks only. The 0.1.4 candidate tarball passed the same local manifest/allowlist and packed-entry checks (including the sanitized collection-failure copy); it is not published.
+`cli.json` is the documented OpenCode v2 config for CLI-only plugins: they run locally in the terminal and remain active when the CLI connects to a remote server. The npm registry shows 0.1.2 and 0.1.3 published (0.1.3 latest; read-only registry check); no published artifact has been loaded by OpenCode here, and no local package-verification record exists for the published 0.1.3 tarball. The 0.1.1 tarball passed npm consumer checks, but a direct Bun package-manager install timed out in the verification environment, so that install path remains unverified. The 0.1.2 tarball passed manifest/allowlist and packed-entry checks only. The 0.1.4 and 0.1.5 candidate tarballs passed the same local manifest/allowlist and packed-entry checks (0.1.5 including the bare-restore latest-checkpoint resolver and the restore reason-copy allowlists); neither is published by this repository lane.
 
 ## Usage
 
@@ -51,8 +51,10 @@ Checkpoint prompts for a password twice in a masked input (paste is allowed); bo
 ### Restore
 
 ```text
-/restore <artifact-path>
+/restore [artifact-path]
 ```
+
+Without an argument, `/restore` picks the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time wins; an exact tie is broken deterministically by filename, descending). If the project has no active directory or no checkpoint is found, nothing is changed. Restore never falls back to an older checkpoint: a corrupt file, wrong password, or read failure stops the command with an error instead of trying another artifact.
 
 Restore first asks which existing project to import into, then prompts for the password (up to three attempts). The artifact is fully checked before the first session import. Project resolution may still update bounded host project metadata through OpenCode's public `location.get` API. Imports run parents-first, one session at a time: independent branches continue after a failure, descendants of a failed parent are blocked, and outcomes are reported per session. There is no atomic rollback. A later manual rerun may skip exact matching records, but exact retry behavior on a real host has not been established. Imported sessions are not opened or navigated to automatically.
 

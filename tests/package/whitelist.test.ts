@@ -50,7 +50,7 @@ describe("packed path classification", () => {
 			".vscode/settings.json",
 			"node_modules/opencode-session-port/package.json",
 			".package-verify-work/abc123/canary.txt",
-			".package-verify-work/abc123/tarball/opencode-session-port-0.1.4.tgz",
+			".package-verify-work/abc123/tarball/opencode-session-port-0.1.5.tgz",
 		]) {
 			expect(classifyPackedPath(forbidden)).toBe("forbidden");
 		}
@@ -101,7 +101,7 @@ describe("live dry-run pack listings", () => {
 		expect(files.length).toBe(56);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.4.tgz"))).toBe(false);
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.5.tgz"))).toBe(false);
 	});
 
 	test("bun pm pack --dry-run honors the allowlist and writes no tarball", async () => {
@@ -116,6 +116,6 @@ describe("live dry-run pack listings", () => {
 		expect(files.length).toBe(56);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.4.tgz"))).toBe(false);
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.5.tgz"))).toBe(false);
 	});
 });
