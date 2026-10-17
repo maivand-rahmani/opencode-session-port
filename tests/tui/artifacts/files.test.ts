@@ -12,13 +12,14 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	ArtifactFileError,
 	readEncryptedArtifact,
 	resolveCheckpointOutputPath,
+	resolveLatestCheckpointArtifact,
 	writeEncryptedArtifact,
 } from "../../../src/tui/artifacts/files.ts";
 
@@ -174,6 +175,111 @@ describe("resolveCheckpointOutputPath (P-15)", () => {
 		await expect(
 			resolveCheckpointOutputPath({ projectDirectory: root, now: new Date(Number.NaN) }),
 		).rejects.toMatchObject({ code: "invalid-request" });
+	});
+});
+
+describe("resolveLatestCheckpointArtifact (bare /restore discovery)", () => {
+	test("missing .sessionport directory resolves undefined and creates nothing", async () => {
+		const root = await makeTempRoot();
+
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBeUndefined();
+		await expect(lstat(path.join(root, ".sessionport"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readdir(root)).toEqual([]);
+	});
+
+	test("empty .sessionport directory resolves undefined", async () => {
+		const root = await makeTempRoot();
+		await mkdir(path.join(root, ".sessionport"));
+
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBeUndefined();
+	});
+
+	test("rejects an empty or missing projectDirectory with invalid-request", async () => {
+		await expect(resolveLatestCheckpointArtifact({ projectDirectory: "" })).rejects.toMatchObject({
+			code: "invalid-request",
+		});
+		await expect(resolveLatestCheckpointArtifact(undefined as never)).rejects.toMatchObject({
+			code: "invalid-request",
+		});
+	});
+
+	test("selects the newest .sessionport-suffixed regular file; an exact mtime tie breaks by filename descending", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		const older = path.join(directory, "checkpoint-old.sessionport");
+		const newer = path.join(directory, "checkpoint-new.sessionport");
+		const tiedAlpha = path.join(directory, "alpha.sessionport");
+		const tiedBeta = path.join(directory, "beta.sessionport");
+		for (const target of [older, newer, tiedAlpha, tiedBeta]) {
+			await writeFile(target, syntheticBytes(2));
+		}
+		await utimes(older, new Date(1_000_000), new Date(1_000_000));
+		await utimes(tiedAlpha, new Date(5_000_000), new Date(5_000_000));
+		await utimes(tiedBeta, new Date(5_000_000), new Date(5_000_000));
+		await utimes(newer, new Date(9_000_000), new Date(9_000_000));
+
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBe(newer);
+
+		// Remove the newest file: the exact-tie pair remains, and the descending
+		// UTF-16 code-unit filename order ("beta" > "alpha") wins deterministically.
+		await rm(newer);
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBe(tiedBeta);
+	});
+
+	test("requires the exact .sessionport suffix and excludes directories, other names, and nested paths", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		await writeFile(path.join(directory, "notes.txt"), syntheticBytes(2));
+		await writeFile(path.join(directory, "checkpoint.sessionport.bak"), syntheticBytes(2));
+		await writeFile(path.join(directory, "checkpoint.SessionPort"), syntheticBytes(2));
+		await mkdir(path.join(directory, "nested.sessionport")); // directory with a matching suffix
+		await mkdir(path.join(directory, "sub"));
+		await writeFile(path.join(directory, "sub", "checkpoint.sessionport"), syntheticBytes(2)); // nested: not recursive
+
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBeUndefined();
+
+		// No prefix is required: any regular file with the exact suffix qualifies.
+		const plain = path.join(directory, "plain.sessionport");
+		await writeFile(plain, syntheticBytes(2));
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBe(plain);
+	});
+
+	test("a symlinked artifact candidate is excluded (skipped when the platform disallows symlinks)", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		const target = path.join(root, "outside.sessionport");
+		await writeFile(target, syntheticBytes(2));
+		try {
+			await symlink(target, path.join(directory, "linked.sessionport"), "file");
+		} catch {
+			return; // Platform/permission-dependent; no privilege escalation in tests.
+		}
+
+		expect(await resolveLatestCheckpointArtifact({ projectDirectory: root })).toBeUndefined();
+	});
+
+	test("a symlinked/junction .sessionport directory is refused, not traversed (skipped when the platform disallows it)", async () => {
+		const root = await makeTempRoot();
+		const target = await makeTempRoot();
+		await mkdir(path.join(target, ".sessionport"));
+		const inner = path.join(target, ".sessionport", "checkpoint-x.sessionport");
+		await writeFile(inner, syntheticBytes(2));
+		try {
+			// Junction on Windows (no privilege required); ignored type on POSIX.
+			await symlink(target, path.join(root, ".sessionport"), "junction");
+		} catch {
+			return; // Platform/permission-dependent; no privilege escalation in tests.
+		}
+
+		await expect(resolveLatestCheckpointArtifact({ projectDirectory: root })).rejects.toMatchObject({
+			name: "ArtifactFileError",
+			code: "invalid-request",
+		});
+		// The linked directory was never traversed or modified.
+		expect((await readFile(inner)).byteLength).toBe(2);
 	});
 });
 

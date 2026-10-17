@@ -12,10 +12,16 @@
  *      resolution, seal, exclusive encrypted write;
  *   3. report path/size/session-count facts or a sanitized failure.
  *
- * `/restore <artifact-path>`
- *   1. require the artifact path argument (nothing runs without it);
- *   2. probe `session.import` capability FIRST — before any artifact read,
- *      decrypt, or import (O-12);
+ * `/restore [artifact-path]`
+ *   1. probe `session.import` capability FIRST — before any filesystem
+ *      discovery, artifact read, decrypt, or import (O-12, both forms);
+ *   2. when no artifact path is given (bare `/restore`), read the active
+ *      project directory, fail closed with fixed copy when it is unavailable,
+ *      and resolve the newest checkpoint in that project's `.sessionport/`
+ *      directory through the injected resolver; no latest file reports a
+ *      fixed no-checkpoint copy. An explicit path bypasses this lookup (and
+ *      the active-directory read) entirely. No active `location.get` and no
+ *      automatic destination selection are used for either form;
  *   3. enumerate existing host projects via `project.list`, let the user select
  *      with `selectRestoreProject`;
  *   4. call `location.get` ONLY for the selected candidate and require an exact
@@ -33,6 +39,9 @@
  *      empty result keeps the truthful non-success notification, and a
  *      dialog-display failure falls back to bounded aggregate-only copy.
  *
+ * No fallback artifact: a corrupt file, wrong password, or read failure stops
+ * the command; an older checkpoint is never silently substituted.
+ *
  * Hard boundaries: no shell/Git, no LLM/model call, no historical tool replay,
  * no direct database access, no `project.update`; passwords stay masked and are
  * owned/zeroed by the orchestration helpers; only already-sealed ciphertext is
@@ -47,7 +56,7 @@
 import type { ByteSource, CheckpointCryptoFactory } from "../../core/contracts/index.ts";
 import { collectCheckpointPayload } from "../../core/sessions/index.ts";
 import type { RemappedIdDeriver } from "../../core/restore/index.ts";
-import type { ResolveCheckpointOutputPathOptions } from "../artifacts/files.ts";
+import type { ResolveCheckpointOutputPathOptions, ResolveLatestCheckpointArtifactOptions } from "../artifacts/files.ts";
 import { createLocationResolver, LocationResolutionError } from "../adapters/location-resolver.ts";
 import { createProjectDestinationsAdapter } from "../adapters/project-destinations.ts";
 import { createSessionIdInventory } from "../adapters/session-id-inventory.ts";
@@ -78,7 +87,8 @@ import {
 	reportRestoreExecution,
 	reportRestoreExecutionFallback,
 	reportRestoreFailure,
-	reportRestoreUsage,
+	reportRestoreNoActiveProject,
+	reportRestoreNoCheckpointFound,
 	type SessionPortNotification,
 } from "./reports.ts";
 
@@ -118,6 +128,15 @@ export interface SessionPortHandlerDependencies {
 	readonly idDeriver: RemappedIdDeriver;
 	/** P-15 artifact output-path resolver. */
 	readonly resolveCheckpointOutputPath: (options: ResolveCheckpointOutputPathOptions) => Promise<string>;
+	/**
+	 * Bare `/restore` latest-artifact resolver: newest `.sessionport` artifact
+	 * under the project's default `.sessionport/` directory, or `undefined`
+	 * when none exists. Production uses the filesystem resolver; tests inject a
+	 * fake so no real discovery happens.
+	 */
+	readonly resolveLatestCheckpointArtifact: (
+		options: ResolveLatestCheckpointArtifactOptions,
+	) => Promise<string | undefined>;
 	/** Exclusive encrypted-artifact writer (ciphertext only). */
 	readonly writeEncryptedArtifact: (targetPath: string, source: ByteSource) => Promise<number>;
 	/** Lazy encrypted-artifact reader (no IO until iterated). */
@@ -142,6 +161,7 @@ export function createSessionPortHandlers(dependencies: SessionPortHandlerDepend
 	requireCallable(dependencies.showRestoreReport, "showRestoreReport");
 	requireCallable(dependencies.requestPassword, "requestPassword");
 	requireCallable(dependencies.resolveCheckpointOutputPath, "resolveCheckpointOutputPath");
+	requireCallable(dependencies.resolveLatestCheckpointArtifact, "resolveLatestCheckpointArtifact");
 	requireCallable(dependencies.writeEncryptedArtifact, "writeEncryptedArtifact");
 	requireCallable(dependencies.readEncryptedArtifact, "readEncryptedArtifact");
 	if (!isRecordValue(dependencies.cryptoFactory) || typeof dependencies.cryptoFactory.create !== "function") {
@@ -209,14 +229,12 @@ async function runRestoreCommand(
 	dependencies: SessionPortHandlerDependencies,
 	rawInput: string | undefined,
 ): Promise<void> {
-	const artifactPath = parseRestoreArtifactArgument(rawInput);
-	if (artifactPath === undefined) {
-		dependencies.notify(reportRestoreUsage());
-		return;
-	}
+	// `undefined` means no explicit path: bare `/restore` uses the newest
+	// checkpoint in the active project's `.sessionport/` directory.
+	const explicitArtifactPath = parseRestoreArtifactArgument(rawInput);
 
-	// O-12: capability absence is the first check — before any file read,
-	// decrypt, destination enumeration, or import.
+	// O-12: capability absence is the first check — before any filesystem
+	// discovery, file read, decrypt, destination enumeration, or import.
 	const capability = probeSessionImportCapability(dependencies.client);
 	if (!capability.available) {
 		dependencies.notify(reportRestoreCapabilityUnavailable());
@@ -225,6 +243,24 @@ async function runRestoreCommand(
 
 	let executionStarted = false;
 	try {
+		let artifactPath: string;
+		if (explicitArtifactPath !== undefined) {
+			// Explicit paths bypass the active-project lookup entirely.
+			artifactPath = explicitArtifactPath;
+		} else {
+			const activeDirectory = dependencies.getActiveDirectory();
+			if (typeof activeDirectory !== "string" || activeDirectory.trim().length === 0) {
+				dependencies.notify(reportRestoreNoActiveProject());
+				return;
+			}
+			const latest = await dependencies.resolveLatestCheckpointArtifact({ projectDirectory: activeDirectory });
+			if (latest === undefined) {
+				dependencies.notify(reportRestoreNoCheckpointFound());
+				return;
+			}
+			artifactPath = latest;
+		}
+
 		// Candidate enumeration and user selection happen before any location.get
 		// or artifact access; a canceled selection changes nothing.
 		const destinations = await createProjectDestinationsAdapter(dependencies.client).listDestinations();
@@ -342,10 +378,11 @@ export function parseCheckpointOutputArgument(rawInput: string | undefined): str
 }
 
 /**
- * `/restore` requires one raw argument: the artifact path. `undefined` or an
- * all-whitespace argument yields `undefined` so the caller reports usage
- * without touching the host; any other argument is trimmed of surrounding
- * whitespace and used verbatim.
+ * `/restore` accepts one optional raw argument: the artifact path. `undefined`
+ * or an all-whitespace argument means the bare form (newest checkpoint in the
+ * active project's `.sessionport/` directory); any other argument is trimmed
+ * of surrounding whitespace and used verbatim (no flag parsing, no shell
+ * expansion, no quote handling).
  */
 export function parseRestoreArtifactArgument(rawInput: string | undefined): string | undefined {
 	if (rawInput === undefined) return undefined;

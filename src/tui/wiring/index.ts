@@ -47,6 +47,8 @@ export {
 	reportRestoreCapabilityUnavailable,
 	reportRestoreExecution,
 	reportRestoreFailure,
+	reportRestoreNoActiveProject,
+	reportRestoreNoCheckpointFound,
 	reportRestoreUsage,
 } from "./reports.ts";
 export type { SessionPortNotification, SessionPortNotificationVariant } from "./reports.ts";

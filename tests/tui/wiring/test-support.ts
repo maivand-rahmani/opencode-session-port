@@ -18,7 +18,7 @@ import {
 	type JsonValue,
 	type SessionRecord,
 } from "../../../src/core/contracts/index.ts";
-import type { ResolveCheckpointOutputPathOptions } from "../../../src/tui/artifacts/files.ts";
+import type { ResolveCheckpointOutputPathOptions, ResolveLatestCheckpointArtifactOptions } from "../../../src/tui/artifacts/files.ts";
 import type { LocationGetCallInput } from "../../../src/tui/adapters/index.ts";
 import { CryptoContainerError } from "../../../src/core/crypto/errors.ts";
 import type { RestoreProjectChoice } from "../../../src/tui/ui/restore-project-selector.ts";
@@ -366,6 +366,38 @@ export function createFakeArtifactIo(options: FakeArtifactIoOptions = {}): FakeA
 }
 
 /* ------------------------------------------------------------------ */
+/* Fake latest-checkpoint resolver                                     */
+/* ------------------------------------------------------------------ */
+
+export interface FakeLatestArtifactOptions {
+	/** Result for every call; a configured Error is thrown instead. Default: no checkpoint found. */
+	readonly result?: string | Error;
+}
+
+export interface FakeLatestArtifactHandle {
+	readonly resolveLatestCheckpointArtifact: (
+		options: ResolveLatestCheckpointArtifactOptions,
+	) => Promise<string | undefined>;
+	readonly calls: ResolveLatestCheckpointArtifactOptions[];
+}
+
+/**
+ * Records bare `/restore` latest-checkpoint resolver calls; performs no
+ * filesystem access. The default result is `undefined` (no checkpoint found).
+ */
+export function createFakeLatestArtifactResolver(options: FakeLatestArtifactOptions = {}): FakeLatestArtifactHandle {
+	const calls: ResolveLatestCheckpointArtifactOptions[] = [];
+	return {
+		async resolveLatestCheckpointArtifact(input) {
+			calls.push({ ...input });
+			if (options.result instanceof Error) throw options.result;
+			return options.result;
+		},
+		calls,
+	};
+}
+
+/* ------------------------------------------------------------------ */
 /* Fake password provider / dialog / notifier                          */
 /* ------------------------------------------------------------------ */
 
@@ -461,6 +493,8 @@ export interface WiringHarnessOptions {
 	readonly password?: FakePasswordOptions;
 	readonly dialog?: FakeDialogOptions;
 	readonly report?: FakeRestoreReportOptions;
+	/** Bare `/restore` resolver result; a configured Error is thrown. Default: no checkpoint found. */
+	readonly latestArtifact?: string | Error;
 }
 
 export interface WiringHarness {
@@ -472,6 +506,7 @@ export interface WiringHarness {
 	readonly password: FakePasswordHandle;
 	readonly dialog: FakeDialogHandle;
 	readonly report: FakeRestoreReportHandle;
+	readonly latestArtifact: FakeLatestArtifactHandle;
 	readonly notifications: SessionPortNotification[];
 }
 
@@ -495,6 +530,7 @@ export function createWiringHarness(options: WiringHarnessOptions = {}): WiringH
 	const password = createFakePasswordProvider(options.password);
 	const dialog = createFakeDialog(options.dialog);
 	const report = createFakeRestoreReport(options.report);
+	const latestArtifact = createFakeLatestArtifactResolver({ result: options.latestArtifact });
 	const notifications: SessionPortNotification[] = [];
 
 	const dependencies: SessionPortHandlerDependencies = {
@@ -513,6 +549,7 @@ export function createWiringHarness(options: WiringHarnessOptions = {}): WiringH
 			},
 		},
 		resolveCheckpointOutputPath: artifacts.resolveCheckpointOutputPath,
+		resolveLatestCheckpointArtifact: latestArtifact.resolveLatestCheckpointArtifact,
 		writeEncryptedArtifact: artifacts.writeEncryptedArtifact,
 		readEncryptedArtifact: artifacts.readEncryptedArtifact,
 	};
@@ -526,6 +563,7 @@ export function createWiringHarness(options: WiringHarnessOptions = {}): WiringH
 		password,
 		dialog,
 		report,
+		latestArtifact,
 		notifications,
 	};
 }

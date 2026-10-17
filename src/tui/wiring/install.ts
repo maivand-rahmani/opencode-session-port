@@ -41,7 +41,7 @@ import type { Plugin } from "@opencode/plugin/tui";
 import type { CheckpointCryptoFactory } from "../../core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../core/crypto/index.ts";
 import { createRemappedIdDeriver, type RemappedIdDeriver } from "../../core/restore/index.ts";
-import { readEncryptedArtifact, resolveCheckpointOutputPath, writeEncryptedArtifact } from "../artifacts/files.ts";
+import { readEncryptedArtifact, resolveCheckpointOutputPath, resolveLatestCheckpointArtifact, writeEncryptedArtifact } from "../artifacts/files.ts";
 import { requestPassword as showPasswordDialog } from "../ui/password-dialog.tsx";
 import { showRestoreReportDialog } from "../ui/restore-report-dialog.tsx";
 import { installSessionPortCommands } from "../ui/sessionport-commands.tsx";
@@ -99,6 +99,7 @@ export async function installSessionPortWiring(
 		cryptoFactory,
 		idDeriver,
 		resolveCheckpointOutputPath,
+		resolveLatestCheckpointArtifact,
 		writeEncryptedArtifact,
 		readEncryptedArtifact,
 	});

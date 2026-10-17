@@ -40,10 +40,16 @@
  *   `:` from the UTC timestamp, no reserved device name), and drive-relative
  *   explicit paths (`C:foo`) fail closed instead of silently anchoring to the
  *   per-drive current directory.
+ * - `resolveLatestCheckpointArtifact` implements the bare `/restore` default:
+ *   a non-recursive, content-free scan of `<projectDirectory>/.sessionport/`
+ *   (newest `mtimeMs` wins; an exact tie is broken by filename, descending
+ *   code-unit order). It never creates, opens, or reads a file, excludes
+ *   symlink/swapped entries, and refuses a non-regular `.sessionport` entry
+ *   instead of traversing it.
  */
 
 /// <reference types="node" />
-import { lstat, mkdir, open, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import type { ByteSource } from "../../core/contracts/index.ts";
 
@@ -185,6 +191,93 @@ async function assertPathDoesNotExist(candidate: string): Promise<void> {
 
 function isErrnoCode(value: unknown, code: string): boolean {
 	return typeof value === "object" && value !== null && (value as { readonly code?: unknown }).code === code;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Latest-checkpoint discovery (bare `/restore`)                             */
+/* ------------------------------------------------------------------------- */
+
+/** Options for `resolveLatestCheckpointArtifact`. */
+export interface ResolveLatestCheckpointArtifactOptions {
+	/** Current project directory; the default checkpoint directory sits beneath it. */
+	readonly projectDirectory: string;
+}
+
+/**
+ * Resolves the newest default checkpoint artifact under
+ * `<projectDirectory>/.sessionport/`, or `undefined` when that directory is
+ * missing or contains no candidate. Selection is non-recursive and
+ * content-free: only entries whose name ends in the exact `.sessionport`
+ * suffix are considered (no prefix required), a candidate must be a regular
+ * file by `lstat` at selection time (symlinks and entries swapped after
+ * `readdir` are excluded), and only finite modification times qualify. The
+ * newest `mtimeMs` wins; an exact tie is broken by filename, descending
+ * UTF-16 code-unit order (deterministic, never locale-dependent). Nothing is
+ * created, opened, or read.
+ *
+ * Fail-closed behavior: a `.sessionport` entry that is not a regular
+ * directory (symlink/junction/file) is refused, not traversed. A missing
+ * directory, an empty directory, or a scan with no candidate resolves
+ * `undefined`; every other filesystem error (for example permissions)
+ * propagates unchanged to the caller's sanitized failure reporting. A
+ * candidate that disappears during the scan (ENOENT) is skipped; unrelated
+ * errors are never suppressed. This is a best-effort local discovery helper:
+ * it does not promise race-freedom against a malicious filesystem writer
+ * beyond the `lstat` re-check and the existing read safeguards.
+ */
+export async function resolveLatestCheckpointArtifact(
+	options: ResolveLatestCheckpointArtifactOptions,
+): Promise<string | undefined> {
+	const input: unknown = options;
+	if (typeof input !== "object" || input === null) {
+		throw new ArtifactFileError("invalid-request", "resolveLatestCheckpointArtifact options must be an object");
+	}
+	const projectDirectory = requireNonEmptyString(
+		(input as { readonly projectDirectory?: unknown }).projectDirectory,
+		"projectDirectory",
+	);
+
+	const directory = path.resolve(projectDirectory, CHECKPOINT_DIRECTORY_NAME);
+	let directoryStats;
+	try {
+		// lstat: a symlinked/junction directory is never followed or traversed.
+		directoryStats = await lstat(directory);
+	} catch (error) {
+		if (isErrnoCode(error, "ENOENT")) return undefined;
+		throw error;
+	}
+	if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+		throw new ArtifactFileError(
+			"invalid-request",
+			"The project's .sessionport checkpoint location is not a regular directory; refusing to scan it",
+		);
+	}
+
+	let bestName: string | undefined;
+	let bestMtimeMs = Number.NEGATIVE_INFINITY;
+	for (const entry of await readdir(directory, { withFileTypes: true })) {
+		if (!entry.name.endsWith(CHECKPOINT_FILENAME_EXTENSION)) continue;
+		// Dirent-level exclusion first; the lstat below is authoritative for
+		// the rest (including entries whose dirent type is unknown).
+		if (entry.isDirectory() || entry.isSymbolicLink()) continue;
+		let candidateStats;
+		try {
+			// Re-check after readdir: the entry may have been swapped for a
+			// symlink or a different object between the two calls.
+			candidateStats = await lstat(path.join(directory, entry.name));
+		} catch (error) {
+			if (isErrnoCode(error, "ENOENT")) continue;
+			throw error;
+		}
+		if (!candidateStats.isFile()) continue;
+		const mtimeMs = candidateStats.mtimeMs;
+		if (!Number.isFinite(mtimeMs)) continue;
+		if (bestName === undefined || mtimeMs > bestMtimeMs || (mtimeMs === bestMtimeMs && entry.name > bestName)) {
+			bestName = entry.name;
+			bestMtimeMs = mtimeMs;
+		}
+	}
+	return bestName === undefined ? undefined : path.join(directory, bestName);
 }
 
 /* ------------------------------------------------------------------------- */

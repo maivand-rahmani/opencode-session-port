@@ -3,7 +3,9 @@
  *
  * These are pure string/shape tests over synthetic outcomes and real error
  * classes. They pin the sanitization rule (no raw exception text, ever), the
- * truthful-success rule (empty/canceled outcomes never report success), and the
+ * truthful-success rule (empty/canceled outcomes never report success), the
+ * fixed reason/code diagnostics for known collection/plan error codes
+ * (explicit allowlist only; unknown/forged codes stay generic), and the
  * O-06/O-15 report default (aggregate counts plus per-session facts; partial
  * progress states no atomic rollback).
  */
@@ -14,7 +16,7 @@ import { LocationResolutionError } from "../../../src/tui/adapters/location-reso
 import { ProjectDestinationError } from "../../../src/tui/adapters/project-destinations.ts";
 import { ArtifactFileError } from "../../../src/tui/artifacts/files.ts";
 import { CryptoContainerError } from "../../../src/core/crypto/errors.ts";
-import { RestorePlanError } from "../../../src/core/restore/planner.ts";
+import { RestorePlanError, type RestorePlanErrorCode } from "../../../src/core/restore/planner.ts";
 import { SessionCollectionError, type SessionCollectionErrorCode } from "../../../src/core/sessions/index.ts";
 import type { RestoreExecutionResult } from "../../../src/tui/orchestration/index.ts";
 import {
@@ -25,6 +27,8 @@ import {
 	reportRestoreCapabilityUnavailable,
 	reportRestoreExecution,
 	reportRestoreFailure,
+	reportRestoreNoActiveProject,
+	reportRestoreNoCheckpointFound,
 	reportRestoreUsage,
 } from "../../../src/tui/wiring/index.ts";
 import {
@@ -120,9 +124,14 @@ describe("checkpoint reports", () => {
 		expect(fake.message).not.toContain("unsettled-message");
 		expect(fake.message).not.toContain(RAW);
 
-		// Restore's collection category is unchanged: the reason/code text is checkpoint-only.
+		// Restore's collection category now surfaces the same fixed reason map
+		// with its own restore base copy; raw text still never leaks.
 		const restore = reportRestoreFailure(new SessionCollectionError("unsettled-message", RAW), false);
-		expect(restore.message).toBe("The destination project's sessions could not be read; no sessions were changed.");
+		expect(restore.message).toBe(
+			"The destination project's sessions could not be read; no sessions were changed. " +
+				"Reason: the project history contains an unfinished message (unsettled-message).",
+		);
+		expect(restore.message).not.toContain(RAW);
 	});
 });
 
@@ -137,8 +146,22 @@ describe("restore reports", () => {
 			expect(notification.variant).not.toBe("success");
 		}
 		expect(reportRestoreUsage().message).toContain("Usage: /restore");
+		expect(reportRestoreUsage().message).toContain("[artifact-path]");
 		expect(reportRestoreCapabilityUnavailable().message).toContain("session-import capability");
 		expect(reportRestoreAuthenticationFailed().message).toContain("3 password attempts");
+	});
+
+	test("bare-restore fixed copies: no active project and no checkpoint found never report success", () => {
+		const noActive = reportRestoreNoActiveProject();
+		expect(noActive.variant).toBe("warning");
+		expect(noActive.message).toContain("active project directory is unavailable");
+		expect(noActive.message).toContain("no sessions were changed");
+
+		const noCheckpoint = reportRestoreNoCheckpointFound();
+		expect(noCheckpoint.variant).toBe("warning");
+		expect(noCheckpoint.message).toContain(".sessionport");
+		expect(noCheckpoint.message).toContain("no sessions were changed");
+		expect(noCheckpoint.message).not.toContain("Usage:");
 	});
 
 	test("sanitizes restore failures and distinguishes the execution-started phase", () => {
@@ -165,6 +188,104 @@ describe("restore reports", () => {
 		expect(afterExecution.message).not.toContain(RAW);
 		expect(afterExecution.message).not.toContain("no sessions were changed");
 		expect(afterExecution.message).toContain("no atomic rollback");
+	});
+
+	test("adds a fixed reason and the exact known code for every known restore plan failure code", () => {
+		const expected: ReadonlyArray<readonly [RestorePlanErrorCode, string]> = [
+			["invalid-input", "the restore planning request was invalid"],
+			["malformed-payload", "the checkpoint payload was malformed"],
+			["malformed-destination", "the destination session history could not be read"],
+			["divergent-artifact-session", "the checkpoint repeats a session with different content"],
+			["duplicate-artifact-message-id", "the checkpoint repeats a message ID across sessions"],
+			["ambiguous-destination", "the destination repeats a session or message ID"],
+			["dangling-session-reference", "a session reference does not resolve in the destination or plan"],
+			["dangling-message-reference", "a message reference does not resolve in the destination"],
+			["session-id-collision", "a planned session ID collides with existing session history"],
+			["message-id-collision", "a planned message ID collides with existing session history"],
+			["dependency-cycle", "session parent/reference relationships contain a cycle"],
+			["derivation-failure", "a remapped session or message ID could not be derived"],
+		];
+
+		for (const [code, reason] of expected) {
+			const notification = reportRestoreFailure(new RestorePlanError(code, RAW), false);
+			expect(notification).toEqual({
+				title: "Restore failed",
+				message: `The checkpoint does not match this destination safely; no sessions were changed. Reason: ${reason} (${code}).`,
+				variant: "error",
+			});
+			expect(notification.message).not.toContain(RAW);
+		}
+	});
+
+	test("unknown or forged plan codes, prototype keys, and non-instance objects keep the generic restore copy", () => {
+		const genericPlan = "The checkpoint does not match this destination safely; no sessions were changed.";
+
+		for (const code of ["future-unknown-code", "constructor", "__proto__", "toString", "hasOwnProperty"]) {
+			const forged = new RestorePlanError(code as RestorePlanErrorCode, RAW);
+			const notification = reportRestoreFailure(forged, false);
+			expect(notification.message).toBe(genericPlan);
+			expect(notification.message).not.toContain(code);
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// A code-shaped plain object is not a RestorePlanError: it cannot reach
+		// the plan category and keeps the unknown-category copy.
+		const fake = reportRestoreFailure({ code: "invalid-input", message: RAW }, false);
+		expect(fake.message).toBe("Restore failed; no sessions were changed.");
+		expect(fake.message).not.toContain("invalid-input");
+		expect(fake.message).not.toContain(RAW);
+
+		// A forged object with the class prototype but no own code property
+		// classifies as a plan error yet keeps the generic plan copy.
+		const prototypeForged = reportRestoreFailure(Object.create(RestorePlanError.prototype), false);
+		expect(prototypeForged.message).toBe(genericPlan);
+		expect(prototypeForged.message).not.toContain(RAW);
+
+		// An unclassified error keeps the unknown-category copy.
+		const unknown = reportRestoreFailure(new Error(RAW), false);
+		expect(unknown.message).toBe("Restore failed; no sessions were changed.");
+		expect(unknown.message).not.toContain(RAW);
+	});
+
+	test("known restore collection codes surface the shared fixed reasons with the restore base copy", () => {
+		const expected: ReadonlyArray<readonly [SessionCollectionErrorCode, string]> = [
+			["invalid-request", "the session collection request was invalid"],
+			["invalid-policy", "the session collection policy was invalid"],
+			["session-list-failed", "the host session list could not be read"],
+			["message-list-failed", "a session's message history could not be read"],
+			["malformed-session-page", "the host returned a malformed session list page"],
+			["malformed-message-page", "the host returned a malformed message list page"],
+			["malformed-session-record", "the host returned a malformed session record"],
+			["malformed-message-record", "the host returned a malformed message record"],
+			["session-project-mismatch", "a listed session did not belong to the requested project"],
+			["duplicate-session-id", "the host returned a session more than once"],
+			["duplicate-message-id", "the host returned a message more than once"],
+			["repeated-session-cursor", "the host repeated a session list cursor"],
+			["repeated-message-cursor", "the host repeated a message list cursor"],
+			["session-limit-exceeded", "the session count exceeded the configured limit"],
+			["message-limit-exceeded", "a session's message count exceeded the configured limit"],
+			["total-message-limit-exceeded", "the total message count exceeded the configured limit"],
+			["unsettled-message", "the project history contains an unfinished message"],
+		];
+
+		for (const [code, reason] of expected) {
+			const notification = reportRestoreFailure(new SessionCollectionError(code, RAW), false);
+			expect(notification).toEqual({
+				title: "Restore failed",
+				message: `The destination project's sessions could not be read; no sessions were changed. Reason: ${reason} (${code}).`,
+				variant: "error",
+			});
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// Unknown/forged collection codes keep the restore base copy with no leak.
+		const genericCollection = "The destination project's sessions could not be read; no sessions were changed.";
+		for (const code of ["future-unknown-code", "constructor", "__proto__", "toString"]) {
+			const forged = reportRestoreFailure(new SessionCollectionError(code as SessionCollectionErrorCode, RAW), false);
+			expect(forged.message).toBe(genericCollection);
+			expect(forged.message).not.toContain(code);
+			expect(forged.message).not.toContain(RAW);
+		}
 	});
 
 	test("an empty execution result is never reported as success", () => {

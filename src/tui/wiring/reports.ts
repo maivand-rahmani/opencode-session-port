@@ -5,9 +5,10 @@
  * or exception text is NEVER interpolated. Classification uses stable error
  * classes/codes only, never message text, so a failure report cannot leak
  * session IDs, paths, host internals, or password material. Checkpoint
- * collection failures additionally append a fixed human reason and the exact
- * machine code, but only for `SessionCollectionError` codes on an explicit
- * allowlist; unknown or forged codes keep the generic text. Exact user-facing
+ * collection failures, restore collection failures, and restore plan failures
+ * additionally append a fixed human reason and the exact machine code, but
+ * only for `SessionCollectionError`/`RestorePlanError` codes on explicit
+ * allowlists; unknown or forged codes keep the generic text. Exact user-facing
  * copy remains OPEN (OQ-15); these strings are the wiring lane's generic
  * sanitized categories.
  *
@@ -33,7 +34,7 @@ import { ArtifactFileError } from "../artifacts/files.ts";
 import { HostAdapterError, ProjectDestinationError } from "../adapters/index.ts";
 import { LocationResolutionError } from "../adapters/location-resolver.ts";
 import { CryptoContainerError } from "../../core/crypto/errors.ts";
-import { RestorePlanError } from "../../core/restore/planner.ts";
+import { RestorePlanError, type RestorePlanErrorCode } from "../../core/restore/planner.ts";
 import { SessionCollectionError, type SessionCollectionErrorCode } from "../../core/sessions/index.ts";
 import { RESTORE_PASSWORD_ATTEMPT_LIMIT } from "../orchestration/index.ts";
 import type { CheckpointOutcome, RestoreExecutionResult } from "../orchestration/index.ts";
@@ -124,13 +125,14 @@ const CHECKPOINT_COLLECTION_FAILURE = "Collecting the project's sessions failed;
 
 /**
  * Fixed human reason per known `SessionCollectionError` code. This record is
- * the explicit allowlist: the raw code is echoed to the user only when it
+ * the shared explicit allowlist for both the checkpoint and the restore
+ * collection category: the raw code is echoed to the user only when it
  * exactly matches one of these keys, and the raw `error.message` (which can
  * contain session/project IDs, paths, and host error text) is never used.
  * Adding a code to `SessionCollectionErrorCode` fails compilation until a
  * fixed reason is added here.
  */
-const CHECKPOINT_COLLECTION_REASONS: Readonly<Record<SessionCollectionErrorCode, string>> = {
+const COLLECTION_FAILURE_REASONS: Readonly<Record<SessionCollectionErrorCode, string>> = {
 	"invalid-request": "the session collection request was invalid",
 	"invalid-policy": "the session collection policy was invalid",
 	"session-list-failed": "the host session list could not be read",
@@ -157,22 +159,64 @@ const CHECKPOINT_COLLECTION_REASONS: Readonly<Record<SessionCollectionErrorCode,
  * text; only allowlisted literal code strings are ever echoed.
  */
 function checkpointCollectionFailureMessage(error: unknown): string {
-	if (!(error instanceof SessionCollectionError)) return CHECKPOINT_COLLECTION_FAILURE;
+	return withKnownCollectionReason(error, CHECKPOINT_COLLECTION_FAILURE);
+}
+
+/**
+ * Shared allowlist lookup for collection failures: appends
+ * `Reason: <fixed human reason> (<known code>).` to `base` for a
+ * `SessionCollectionError` whose code is on the fixed map. Any other error,
+ * non-instance object, or unknown/forged code keeps `base` unchanged; only
+ * allowlisted literal code strings are ever echoed.
+ */
+function withKnownCollectionReason(error: unknown, base: string): string {
+	if (!(error instanceof SessionCollectionError)) return base;
 	const code: string = error.code;
-	if (!Object.hasOwn(CHECKPOINT_COLLECTION_REASONS, code)) return CHECKPOINT_COLLECTION_FAILURE;
-	const reason = CHECKPOINT_COLLECTION_REASONS[code as SessionCollectionErrorCode];
-	return `${CHECKPOINT_COLLECTION_FAILURE} Reason: ${reason} (${code}).`;
+	if (!Object.hasOwn(COLLECTION_FAILURE_REASONS, code)) return base;
+	const reason = COLLECTION_FAILURE_REASONS[code as SessionCollectionErrorCode];
+	return `${base} Reason: ${reason} (${code}).`;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Restore reports                                                           */
 /* ------------------------------------------------------------------------- */
 
-/** The artifact path argument is required; nothing was read or changed. */
+/**
+ * Exported for compatibility. Bare `/restore` now resolves the newest
+ * checkpoint automatically, so the current wiring does not show this usage
+ * copy; it documents the optional artifact-path argument.
+ */
 export function reportRestoreUsage(): SessionPortNotification {
 	return {
-		title: "Restore needs an artifact path",
-		message: "Usage: /restore <path-to-checkpoint>. No sessions were changed.",
+		title: "Restore usage",
+		message:
+			"Usage: /restore [artifact-path]. Without a path, the newest checkpoint in the current project's .sessionport directory is used. No sessions were changed.",
+		variant: "warning",
+	};
+}
+
+/**
+ * Bare `/restore` with no active project directory: fixed, specific copy with
+ * no raw path/error text; nothing was read or changed.
+ */
+export function reportRestoreNoActiveProject(): SessionPortNotification {
+	return {
+		title: "Restore unavailable",
+		message:
+			"The active project directory is unavailable, so the latest checkpoint could not be found; no sessions were changed.",
+		variant: "warning",
+	};
+}
+
+/**
+ * Bare `/restore` with no checkpoint in the active project's default
+ * `.sessionport/` directory: fixed friendly copy; nothing was read or changed.
+ */
+export function reportRestoreNoCheckpointFound(): SessionPortNotification {
+	return {
+		title: "No checkpoint found",
+		message:
+			"No checkpoint artifact was found in the current project's .sessionport directory; no sessions were changed. Create one with /checkpoint or pass an artifact path to /restore.",
 		variant: "warning",
 	};
 }
@@ -205,6 +249,59 @@ export function reportRestoreAuthenticationFailed(): SessionPortNotification {
 	};
 }
 
+/** Existing generic restore collection failure copy; also the fallback for unknown codes. */
+const RESTORE_COLLECTION_FAILURE = "The destination project's sessions could not be read; no sessions were changed.";
+
+/** Existing generic restore plan failure copy; also the fallback for unknown codes. */
+const RESTORE_PLAN_FAILURE = "The checkpoint does not match this destination safely; no sessions were changed.";
+
+/**
+ * Fixed human reason per known `RestorePlanError` code — the explicit
+ * allowlist for the restore plan category. As with collection codes, the raw
+ * code is echoed only on an exact key match and the raw `error.message` (which
+ * can contain session/message IDs and labels) is never used. Adding a code to
+ * `RestorePlanErrorCode` fails compilation until a fixed reason is added here.
+ */
+const RESTORE_PLAN_REASONS: Readonly<Record<RestorePlanErrorCode, string>> = {
+	"invalid-input": "the restore planning request was invalid",
+	"malformed-payload": "the checkpoint payload was malformed",
+	"malformed-destination": "the destination session history could not be read",
+	"divergent-artifact-session": "the checkpoint repeats a session with different content",
+	"duplicate-artifact-message-id": "the checkpoint repeats a message ID across sessions",
+	"ambiguous-destination": "the destination repeats a session or message ID",
+	"dangling-session-reference": "a session reference does not resolve in the destination or plan",
+	"dangling-message-reference": "a message reference does not resolve in the destination",
+	"session-id-collision": "a planned session ID collides with existing session history",
+	"message-id-collision": "a planned message ID collides with existing session history",
+	"dependency-cycle": "session parent/reference relationships contain a cycle",
+	"derivation-failure": "a remapped session or message ID could not be derived",
+};
+
+/**
+ * Restore collection failure copy: the existing restore base message plus
+ * `Reason: <fixed human reason> (<known code>).` for a known
+ * `SessionCollectionError` code (shared allowlist with the checkpoint
+ * category). Unknown/forged codes and non-instance errors keep the base text;
+ * raw messages, IDs, and paths never leak.
+ */
+function restoreCollectionFailureMessage(error: unknown): string {
+	return withKnownCollectionReason(error, RESTORE_COLLECTION_FAILURE);
+}
+
+/**
+ * Restore plan failure copy: the existing restore base message plus
+ * `Reason: <fixed human reason> (<known code>).` for a `RestorePlanError`
+ * whose code is on the allowlist. Unknown/forged codes and non-instance
+ * errors keep the base text; raw plan messages (IDs/labels) never leak.
+ */
+function restorePlanFailureMessage(error: unknown): string {
+	if (!(error instanceof RestorePlanError)) return RESTORE_PLAN_FAILURE;
+	const code: string = error.code;
+	if (!Object.hasOwn(RESTORE_PLAN_REASONS, code)) return RESTORE_PLAN_FAILURE;
+	const reason = RESTORE_PLAN_REASONS[code as RestorePlanErrorCode];
+	return `${RESTORE_PLAN_FAILURE} Reason: ${reason} (${code}).`;
+}
+
 /**
  * Reports one restore failure as a fixed, sanitized category. `executionStarted`
  * is true only once the import executor was invoked; the copy never claims
@@ -232,9 +329,9 @@ export function reportRestoreFailure(error: unknown, executionStarted: boolean):
 		case "destinations":
 			return restoreFailure("The host project list could not be read; no sessions were changed.");
 		case "collection":
-			return restoreFailure("The destination project's sessions could not be read; no sessions were changed.");
+			return restoreFailure(restoreCollectionFailureMessage(error));
 		case "plan":
-			return restoreFailure("The checkpoint does not match this destination safely; no sessions were changed.");
+			return restoreFailure(restorePlanFailureMessage(error));
 		case "artifact-path":
 			return restoreFailure("The artifact path is not usable; no sessions were changed.");
 		case "path-exists":

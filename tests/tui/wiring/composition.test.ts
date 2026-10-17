@@ -45,7 +45,7 @@ describe("command argument parsing", () => {
 		expect(parseCheckpointOutputArgument("  C:/out/a.sessionport  ")).toBe("C:/out/a.sessionport");
 	});
 
-	test("restore: an artifact path is required; no flag syntax is interpreted", () => {
+	test("restore: an absent/blank argument is the bare form; no flag syntax is interpreted", () => {
 		expect(parseRestoreArtifactArgument(undefined)).toBeUndefined();
 		expect(parseRestoreArtifactArgument("   ")).toBeUndefined();
 		expect(parseRestoreArtifactArgument("  C:/in/a.sessionport ")).toBe("C:/in/a.sessionport");
@@ -279,8 +279,14 @@ describe("restore command callback", () => {
 		expect(harness.password.calls).toHaveLength(0);
 	});
 
-	test("missing artifact argument reports usage without touching the host", async () => {
-		const harness = createWiringHarness({ client: { withImport: false } });
+	test("bare restore with no checkpoint: capability probe first, then the resolver, then a fixed no-checkpoint copy with no destination/read/password/import", async () => {
+		const harness = createWiringHarness({
+			client: {
+				projects: async () => {
+					throw new Error("project.list must not be called");
+				},
+			},
+		});
 
 		await harness.handlers.restore(undefined);
 		await harness.handlers.restore("   ");
@@ -288,11 +294,123 @@ describe("restore command callback", () => {
 		expect(harness.notifications).toHaveLength(2);
 		for (const notification of harness.notifications) {
 			expect(notification.variant).toBe("warning");
-			expect(notification.message).toContain("Usage: /restore");
+			expect(notification.message).toContain(".sessionport");
+			expect(notification.message).toContain("no sessions were changed");
+			expect(notification.message).not.toContain("Usage: /restore");
 		}
-		expect(harness.client.sessionImportGetterReads).toBe(0);
+		// The capability probe stays first (O-12); the resolver then runs once
+		// per command with the validated active directory, and nothing else.
+		expect(harness.client.sessionImportGetterReads).toBeGreaterThan(0);
+		expect(harness.latestArtifact.calls).toEqual([
+			{ projectDirectory: TEST_ACTIVE_DIRECTORY },
+			{ projectDirectory: TEST_ACTIVE_DIRECTORY },
+		]);
+		expect(harness.client.projectListCalls).toBe(0);
+		expect(harness.client.locationGetInputs).toHaveLength(0);
+		expect(harness.artifacts.readCalls).toHaveLength(0);
+		expect(harness.artifacts.artifactIterations).toBe(0);
+		expect(harness.crypto.openAndStageCalls).toBe(0);
+		expect(harness.password.calls).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(0);
+	});
+
+	test("bare restore resolves the newest checkpoint and runs the same selection/auth/import flow", async () => {
+		const harness = createWiringHarness({
+			client: { sessions: [], projects: async () => destinationProjects() },
+			crypto: { authenticatedBytes: parentChildArtifactBytes() },
+			latestArtifact: CHECKPOINT_ARTIFACT_PATH,
+		});
+
+		await harness.handlers.restore("   ");
+
+		expect(harness.latestArtifact.calls).toEqual([{ projectDirectory: TEST_ACTIVE_DIRECTORY }]);
+		expect(harness.client.projectListCalls).toBe(1);
+		expect(harness.dialog.selectCalls).toEqual([{ title: "Choose an existing project to restore into", optionCount: 1 }]);
+		expect(harness.client.locationGetInputs).toEqual([{ location: { directory: TEST_DEST_DIRECTORY } }]);
+		expect(harness.password.calls).toEqual([{ mode: "restore", maxPasswordBytes: EXPERIMENTAL_MAX_PASSWORD_BYTES }]);
+		expect(harness.artifacts.readCalls).toEqual([CHECKPOINT_ARTIFACT_PATH]);
+		expect(harness.crypto.openAndStageCalls).toBe(1);
+		expect(harness.client.importInputs).toHaveLength(2);
+		expect(harness.notifications).toHaveLength(0);
+		expect(harness.report.models[0]?.summary.imported).toBe(2);
+	});
+
+	test("bare restore without an active directory reports a fixed message and never calls the resolver or the host", async () => {
+		const harness = createWiringHarness({ activeDirectory: undefined });
+
+		await harness.handlers.restore(undefined);
+
+		const notification = harness.notifications[0]!;
+		expect(notification.variant).toBe("warning");
+		expect(notification.message).toContain("active project directory is unavailable");
+		expect(notification.message).toContain("no sessions were changed");
+		expect(harness.latestArtifact.calls).toHaveLength(0);
+		expect(harness.client.projectListCalls).toBe(0);
+		expect(harness.client.locationGetInputs).toHaveLength(0);
+		expect(harness.artifacts.readCalls).toHaveLength(0);
+		expect(harness.password.calls).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(0);
+	});
+
+	test("bare restore capability absence precedes the latest-checkpoint resolver (O-12)", async () => {
+		const harness = createWiringHarness({
+			client: {
+				withImport: false,
+				projects: async () => {
+					throw new Error("project.list must not be called");
+				},
+			},
+			latestArtifact: CHECKPOINT_ARTIFACT_PATH,
+		});
+
+		await harness.handlers.restore(undefined);
+
+		const notification = harness.notifications[0]!;
+		expect(notification.variant).toBe("warning");
+		expect(notification.message).toContain("session-import capability");
+		expect(harness.latestArtifact.calls).toHaveLength(0);
 		expect(harness.client.projectListCalls).toBe(0);
 		expect(harness.artifacts.readCalls).toHaveLength(0);
+		expect(harness.password.calls).toHaveLength(0);
+	});
+
+	test("a latest-checkpoint resolution failure is sanitized and stops before destination/read/password/import", async () => {
+		const rawFsMessage = "RAW-FS-DETAIL";
+		const harness = createWiringHarness({
+			client: {
+				projects: async () => {
+					throw new Error("project.list must not be called");
+				},
+			},
+			latestArtifact: new Error(rawFsMessage),
+		});
+
+		await harness.handlers.restore(undefined);
+
+		const notification = harness.notifications[0]!;
+		expect(notification.variant).toBe("error");
+		expect(notification.message).toContain("Restore failed");
+		expect(notification.message).toContain("no sessions were changed");
+		expect(notification.message).not.toContain(rawFsMessage);
+		expect(harness.client.projectListCalls).toBe(0);
+		expect(harness.artifacts.readCalls).toHaveLength(0);
+		expect(harness.password.calls).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(0);
+	});
+
+	test("an explicit artifact path bypasses the active-project lookup and resolver entirely", async () => {
+		const harness = createWiringHarness({
+			activeDirectory: undefined,
+			client: { sessions: [], projects: async () => destinationProjects() },
+			crypto: { authenticatedBytes: parentChildArtifactBytes() },
+		});
+
+		await harness.handlers.restore(CHECKPOINT_ARTIFACT_PATH);
+
+		expect(harness.latestArtifact.calls).toHaveLength(0);
+		expect(harness.artifacts.readCalls).toEqual([CHECKPOINT_ARTIFACT_PATH]);
+		expect(harness.client.importInputs).toHaveLength(2);
+		expect(harness.report.models[0]?.summary.imported).toBe(2);
 	});
 
 	test("canceled selection prevents location resolution, artifact read, and import", async () => {
