@@ -1,0 +1,11 @@
+# Deepwork progress state is local/session-specific.
+.slim/deepwork/
+
+# Bun/npm dependencies
+/node_modules/
+
+# Generated TUI bundle (built by `bun run build:tui` / prepack)
+/dist/
+
+.package-verify-work
+.vscode

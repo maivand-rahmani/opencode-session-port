@@ -1,0 +1,3 @@
+# Allow OpenCode to read local deepwork progress state.
+!.slim/deepwork/
+!.slim/deepwork/**
