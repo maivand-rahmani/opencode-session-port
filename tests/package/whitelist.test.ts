@@ -50,7 +50,7 @@ describe("packed path classification", () => {
 			".vscode/settings.json",
 			"node_modules/opencode-session-port/package.json",
 			".package-verify-work/abc123/canary.txt",
-			".package-verify-work/abc123/tarball/opencode-session-port-0.1.5.tgz",
+			".package-verify-work/abc123/tarball/opencode-session-port-0.1.6.tgz",
 		]) {
 			expect(classifyPackedPath(forbidden)).toBe("forbidden");
 		}
@@ -64,7 +64,18 @@ describe("packed path classification", () => {
 
 	test("checkPackedListing reports missing required paths and forbidden entries", () => {
 		expect(
-			checkPackedListing(["tui.ts", "src/tui.ts", "src/tui/wiring/index.ts", "dist/tui.js", "tsconfig.json", "package.json", "README.md", "LICENSE"]),
+			checkPackedListing([
+				"tui.ts",
+				"src/tui.ts",
+				"src/tui/wiring/index.ts",
+				"src/core/sessions/dependencies.ts",
+				"src/core/sessions/references.ts",
+				"dist/tui.js",
+				"tsconfig.json",
+				"package.json",
+				"README.md",
+				"LICENSE",
+			]),
 		).toEqual([]);
 		const problems = checkPackedListing(["package.json", "README.md", "tui.ts", "src/tui.ts", "src/tui/wiring/index.ts", "tsconfig.json", "docs/v1/decision-log.md"]);
 		expect(problems.some((problem) => problem.includes("docs/v1/decision-log.md"))).toBe(true);
@@ -97,11 +108,13 @@ describe("live dry-run pack listings", () => {
 		expect(files).toContain("LICENSE");
 		expect(files).toContain("dist/tui.js");
 		expect(files).toContain("src/tui.ts");
-		// 56 whitelist-only files after adding the compiled dist/tui.js entry (E51 baseline: 55).
-		expect(files.length).toBe(56);
+		// 58 whitelist-only files: 56-file 0.1.5 baseline plus the two new core
+		// dependency-closure modules (src/core/sessions/dependencies.ts,
+		// src/core/sessions/references.ts).
+		expect(files.length).toBe(58);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.5.tgz"))).toBe(false);
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.6.tgz"))).toBe(false);
 	});
 
 	test("bun pm pack --dry-run honors the allowlist and writes no tarball", async () => {
@@ -113,9 +126,9 @@ describe("live dry-run pack listings", () => {
 		expect(files).toContain("tui.ts");
 		expect(files).toContain("LICENSE");
 		expect(files).toContain("dist/tui.js");
-		expect(files.length).toBe(56);
+		expect(files.length).toBe(58);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.5.tgz"))).toBe(false);
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.6.tgz"))).toBe(false);
 	});
 });

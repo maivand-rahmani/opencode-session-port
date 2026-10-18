@@ -67,7 +67,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const REPO_ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 export const SCRATCH_DIR_NAME = ".package-verify-work";
 export const EXPECTED_PACKAGE_NAME = "opencode-session-port";
-export const EXPECTED_VERSION = "0.1.5";
+export const EXPECTED_VERSION = "0.1.6";
 export const EXPECTED_LICENSE = "MIT";
 export const EXPECTED_DESCRIPTION =
 	"SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.";
@@ -106,6 +106,10 @@ export const REQUIRED_PACKED_PATHS = [
 	"tui.ts",
 	"src/tui.ts",
 	"src/tui/wiring/index.ts",
+	// 2026-10-18 checkpoint dependency closure: the new core modules must be
+	// present in every packed tarball (they are reached through src/**).
+	"src/core/sessions/dependencies.ts",
+	"src/core/sessions/references.ts",
 	BUILT_ENTRY_PATH,
 	"tsconfig.json",
 ];
