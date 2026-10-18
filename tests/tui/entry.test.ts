@@ -1,207 +1,92 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import * as path from "node:path";
 
 /**
- * Entry regression tests for the Phase 2 wiring: the entrypoint delegates to
- * the wiring install root, which is gated to the explicit `win32`/`darwin`/
- * `linux` allowlist. These tests pin the fail-closed behavior (no registration,
- * no host-context access) on unsupported platforms and the activation path on
- * the allowlisted platforms.
+ * CI-02 isolation wrapper for the entry regression tests.
  *
- * Import-gate coverage: the designer-owned UI modules statically import the
- * optional UI peers (`@opentui/solid`, `solid-js`). They are mocked here so
- * their evaluation is observable and this file's own graph stays free of those
- * peers. The entry must not evaluate them before the `process.platform` check;
- * on a supported platform the dynamic wiring import must evaluate them.
+ * `bun test` runs all discovered files in one process, and the entry tests own
+ * process-wide `mock.module` fake seams for the UI dialogs and the core
+ * crypto/restore modules. Those registrations previously leaked into every
+ * test file loaded afterwards (missing named exports, stubbed `planRestore`).
  *
- * The darwin/linux activation tests simulate `process.platform` only: they
- * establish no real macOS/Linux execution, host run, or platform-support claim.
- * The pinned core crypto/deriver modules are mocked with fakes so simulated
- * activation never initializes real sodium, and `process.platform` is always
- * restored in `finally`.
+ * The cases and seams therefore live, unchanged, in
+ * `tests/tui/fixtures/entry-isolated.fixture.ts` — a name Bun's discovery does
+ * NOT match (no `.test`/`_test_`/`.spec`/`_spec_`), so a full `bun test` run can
+ * never load it in-process. This wrapper launches exactly that single fixture
+ * as a bounded child process (`./`-prefixed path = explicit path, not a
+ * discovery filter) and fails hard when the child cannot launch, crashes on a
+ * signal, times out, exits non-zero, or changes the expected case counts — the
+ * isolated cases cannot silently vanish.
+ *
+ * The child runs only the synthetic entry tests: no user host, config, or
+ * runtime input, and no real crypto initialization (the fixture keeps its
+ * original fake seams).
  */
 
-const uiModuleEvaluations: string[] = [];
-let cryptoFactoryCalls = 0;
+const repoRoot = path.resolve(import.meta.dir, "..", "..");
+const fixturePath = path.join(import.meta.dir, "fixtures", "entry-isolated.fixture.ts");
+const fixtureFilter = `./${path.relative(repoRoot, fixturePath).split(path.sep).join("/")}`;
+const CHILD_TIMEOUT_MS = 30_000;
+const PARENT_TEST_TIMEOUT_MS = 45_000;
 
-mock.module("../../src/tui/ui/password-dialog.tsx", () => {
-	uiModuleEvaluations.push("password-dialog");
-	return { requestPassword: async () => undefined };
-});
-
-mock.module("../../src/tui/ui/restore-report-dialog.tsx", () => {
-	uiModuleEvaluations.push("restore-report-dialog");
-	return { showRestoreReportDialog: () => {} };
-});
-
-// Fake crypto/deriver seams: the wiring graph resolves these instead of the
-// real sodium-backed factories, so no real crypto runs in this file.
-mock.module("../../src/core/crypto/index.ts", () => ({
-	createCheckpointCryptoFactory: () => {
-		cryptoFactoryCalls += 1;
-		return { create: async () => ({}) };
-	},
-}));
-
-mock.module("../../src/core/restore/index.ts", () => ({
-	createRemappedIdDeriver: async () => ({
-		derive: () => "ses_0000000000000000000000000000000000000000000000000000000000000000",
-	}),
-	// Never invoked by these entry tests; present so the wiring graph's
-	// `planRestore` import resolves against the mock.
-	planRestore: () => {
-		throw new Error("planRestore is not used by entry tests");
-	},
-}));
-
-const sessionPort = (await import("../../src/tui.ts")).default;
-/** UI module evaluations caused by loading the entry itself (must be none). */
-const evaluationsAtEntryImport = [...uiModuleEvaluations];
-
-describe("SessionPort plugin entrypoint", () => {
-	test("loading the entry does not evaluate the optional-peer UI modules", () => {
-		expect(sessionPort.id).toBe("sessionport");
-		expect(evaluationsAtEntryImport).toEqual([]);
+function runIsolatedFixture(): { status: number | null; signal: NodeJS.Signals | null; error?: Error; output: string } {
+	const result = spawnSync(process.execPath, ["test", fixtureFilter], {
+		cwd: repoRoot,
+		encoding: "utf8",
+		timeout: CHILD_TIMEOUT_MS,
+		maxBuffer: 2 * 1024 * 1024,
+		windowsHide: true,
 	});
+	return {
+		status: result.status,
+		signal: result.signal,
+		error: result.error,
+		output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+	};
+}
 
-	test("unsupported platform (freebsd): registers nothing, never touches the host context, and evaluates no UI module", async () => {
-		const originalPlatform = process.platform;
-		const accessed: string[] = [];
-		const context = new Proxy({} as Parameters<typeof sessionPort.setup>[0], {
-			get(_target, property) {
-				accessed.push(String(property));
-				throw new Error(`Unexpected host context access: ${String(property)}`);
-			},
-		});
-		const evaluationsBefore = uiModuleEvaluations.length;
+describe("SessionPort plugin entrypoint (isolated fixture child)", () => {
+	test(
+		"runs every entry case in a bounded child with no failures",
+		() => {
+			const { status, signal, error, output } = runIsolatedFixture();
+			expect(error, `child launch failed: ${String(error)}\n${output}`).toBeUndefined();
+			expect(signal, `child terminated by signal ${String(signal)}\n${output}`).toBeNull();
+			expect(status, `child exited with status ${String(status)}\n${output}`).toBe(0);
 
-		try {
-			Object.defineProperty(process, "platform", { value: "freebsd", configurable: true });
-			expect(await sessionPort.setup(context)).toBeUndefined();
-			expect(accessed).toEqual([]);
-			// The wiring module (and with it every UI module) must stay unloaded.
-			expect(uiModuleEvaluations.length).toBe(evaluationsBefore);
-		} finally {
-			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
-		}
-	});
-
-	// Simulated platform only: `process.platform` is overridden to exercise the
-	// allowlist on the current test host. These tests do NOT run on macOS/Linux
-	// and prove nothing about real cross-platform behavior.
-	for (const platform of ["darwin", "linux"] as const) {
-		test(`simulated ${platform}: loads the wiring, registers inside the app slot, and returns the slot disposer`, async () => {
-			const originalPlatform = process.platform;
-			let disposed = 0;
-			let layerCalls = 0;
-			let layerMode: string | undefined;
-			let commandIDs: Array<string | undefined> = [];
-			let slotClaim: { readonly append?: string; readonly render?: (input: unknown) => unknown } | undefined;
-			const factoryCallsBefore = cryptoFactoryCalls;
-			const context = {
-				client: {},
-				location: { directory: "/work/active" },
-				ui: {
-					dialog: { select: async () => undefined },
-					toast: { show() {} },
-					slot(claim: { readonly append?: string; readonly render?: (input: unknown) => unknown }) {
-						slotClaim = claim;
-						return () => {
-							disposed += 1;
-						};
-					},
-				},
-				keymap: {
-					layer(
-						factory: () =>
-							| { readonly mode?: string; readonly commands?: ReadonlyArray<{ readonly id?: string }> }
-							| undefined,
-					) {
-						layerCalls += 1;
-						const layer = factory();
-						layerMode = layer?.mode;
-						commandIDs = (layer?.commands ?? []).map((command) => command.id);
-					},
-				},
-			} as unknown as Parameters<typeof sessionPort.setup>[0];
-
-			try {
-				Object.defineProperty(process, "platform", { value: platform, configurable: true });
-				const cleanup = await sessionPort.setup(context);
-
-				expect(typeof cleanup).toBe("function");
-				expect(slotClaim?.append).toBe("app");
-
-				// Loading the wiring on an allowlisted platform evaluates the UI modules it imports.
-				expect(uiModuleEvaluations).toContain("password-dialog");
-				expect(uiModuleEvaluations).toContain("restore-report-dialog");
-
-				// Activation reached the mocked crypto seam, not real sodium.
-				expect(cryptoFactoryCalls).toBeGreaterThan(factoryCallsBefore);
-
-				slotClaim?.render?.({});
-				expect(layerCalls).toBe(1);
-				expect(layerMode).toBe("global");
-				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore"]);
-
-				(cleanup as () => void)();
-				expect(disposed).toBe(1);
-			} finally {
-				Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+			// Exact counts so a child that silently drops or weakens cases fails here.
+			expect(output, output).toContain("Ran 6 tests across 1 file");
+			const fail = Number(/\b(\d+) fail\b/.exec(output)?.[1] ?? -1);
+			const pass = Number(/\b(\d+) pass\b/.exec(output)?.[1] ?? -1);
+			// Bun omits zero-count summary lines, so an absent skip line means 0.
+			const skip = Number(/\b(\d+) skip\b/.exec(output)?.[1] ?? 0);
+			expect(fail, output).toBe(0);
+			if (process.platform === "win32") {
+				expect(pass, output).toBe(6);
+				expect(skip, output).toBe(0);
+			} else {
+				// The two Windows-only cases keep their original skip behavior.
+				expect(pass, output).toBe(4);
+				expect(skip, output).toBe(2);
 			}
-		});
-	}
-
-	test.skipIf(process.platform !== "win32")(
-		"Windows: fails closed without registering when the host command surface is unavailable",
-		async () => {
-			let layerCalls = 0;
-			const context = {
-				client: {},
-				location: undefined,
-				ui: {},
-				keymap: {
-					layer() {
-						layerCalls += 1;
-					},
-				},
-			} as unknown as Parameters<typeof sessionPort.setup>[0];
-
-			await expect(sessionPort.setup(context)).rejects.toBeInstanceOf(TypeError);
-			expect(layerCalls).toBe(0);
 		},
+		PARENT_TEST_TIMEOUT_MS,
 	);
 
-	test.skipIf(process.platform !== "win32")(
-		"Windows: dynamically loads the wiring, registers inside the app slot, and returns the slot disposer",
-		async () => {
-			let disposed = 0;
-			let slotClaim: { readonly append?: string } | undefined;
-			const context = {
-				client: {},
-				location: { directory: "C:/work/active" },
-				ui: {
-					dialog: { select: async () => undefined },
-					toast: { show() {} },
-					slot(claim: { readonly append?: string }) {
-						slotClaim = claim;
-						return () => {
-							disposed += 1;
-						};
-					},
-				},
-				keymap: { layer() {} },
-			} as unknown as Parameters<typeof sessionPort.setup>[0];
+	test("the child's module mocks never reach this process: real crypto/restore modules stay real", async () => {
+		// Directly imports the modules the fixture mocks. If the mock registrations
+		// leaked into this process, these imports would throw / expose fakes.
+		const crypto = (await import("../../src/core/crypto/index.ts")) as Record<string, unknown>;
+		expect(typeof crypto.CryptoContainerError).toBe("function");
+		const realCrypto = await import("../../src/core/crypto/container.ts");
+		expect(realCrypto.createCheckpointCryptoFactory).toBe(crypto.createCheckpointCryptoFactory);
 
-			const cleanup = await sessionPort.setup(context);
-
-			// Loading the wiring on Windows evaluates the UI modules it imports.
-			expect(uiModuleEvaluations).toContain("password-dialog");
-			expect(uiModuleEvaluations).toContain("restore-report-dialog");
-
-			expect(slotClaim?.append).toBe("app");
-			expect(typeof cleanup).toBe("function");
-			(cleanup as () => void)();
-			expect(disposed).toBe(1);
-		},
-	);
+		const restore = (await import("../../src/core/restore/index.ts")) as Record<string, unknown>;
+		expect(typeof restore.RestorePlanError).toBe("function");
+		expect(typeof restore.planRestore).toBe("function");
+		// The fixture's stub throws "planRestore is not used by entry tests";
+		// the real function must not be that stub.
+		expect(String(restore.planRestore)).not.toContain("planRestore is not used by entry tests");
+	});
 });
