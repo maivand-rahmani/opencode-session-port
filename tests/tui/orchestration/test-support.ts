@@ -23,8 +23,8 @@ import {
 import type {
 	MessageListPageRequest,
 	SessionCollectionPolicy,
+	SessionDependencyReadPort,
 	SessionListPageRequest,
-	SessionReadPort,
 } from "../../../src/core/sessions/index.ts";
 import type { RemappedIdDeriver } from "../../../src/core/restore/index.ts";
 
@@ -119,8 +119,21 @@ export function sessionRecord(
 	};
 }
 
-/** Single-page fake `SessionReadPort`; messages are served from the supplied records. */
-export function createFakeSessionPort(sessions: readonly SessionRecord[], events?: EventLog): SessionReadPort {
+/**
+ * Single-page fake `SessionDependencyReadPort`; messages and `getSession`
+ * resolve from the supplied seed records plus optional external dependency
+ * records (referenced sessions outside the seed project). `getSession`
+ * returns the record's `info` object directly (the pinned public client
+ * already unwraps the protocol envelope) and throws a synthetic host-style
+ * error for an unknown ID; the seed-list collection itself never reads a
+ * dependency.
+ */
+export function createFakeSessionPort(
+	sessions: readonly SessionRecord[],
+	events?: EventLog,
+	dependencySessions: readonly SessionRecord[] = [],
+): SessionDependencyReadPort {
+	const allSessions = [...sessions, ...dependencySessions];
 	return {
 		async listSessions(_request: SessionListPageRequest): Promise<unknown> {
 			events?.record("collect:sessions");
@@ -128,9 +141,17 @@ export function createFakeSessionPort(sessions: readonly SessionRecord[], events
 		},
 		async listMessages(request: MessageListPageRequest): Promise<unknown> {
 			events?.record("collect:messages");
-			const record = sessions.find((session) => session.info["id"] === request.sessionID);
+			const record = allSessions.find((session) => session.info["id"] === request.sessionID);
 			if (record === undefined) throw new Error(`fake port has no session ${request.sessionID}`);
 			return { data: [...record.messages], cursor: null };
+		},
+		async getSession(sessionID: string): Promise<unknown> {
+			events?.record(`collect:get:${sessionID}`);
+			const record = allSessions.find((session) => session.info["id"] === sessionID);
+			if (record === undefined) {
+				throw Object.assign(new Error(`fake port has no session ${sessionID}`), { name: "HostApiError", status: 404 });
+			}
+			return { ...record.info };
 		},
 	};
 }

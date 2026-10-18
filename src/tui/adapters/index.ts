@@ -2,8 +2,17 @@
  * SessionPort V1 TUI host adapters (Phase 4, non-visual lane).
  *
  * Public surface for orchestration integration:
- * - `createSessionReadAdapter(client)` → core `SessionReadPort` backed by
- *   `context.client.session.list` / `context.client.message.list`.
+ * - `createSessionReadAdapter(client)` → list-only core `SessionReadPort`
+ *   backed by `context.client.session.list` / `context.client.message.list`.
+ *   Used by the restore destination snapshot and the session-ID inventory; it
+ *   never resolves `session.get`.
+ * - `createSessionDependencyReadAdapter(client)` → core
+ *   `SessionDependencyReadPort` (list/message reads plus `getSession`) for the
+ *   checkpoint flow's dependency closure (owner-approved 2026-10-18
+ *   amendment). Construction fails closed when any required method is
+ *   missing; `getSession` maps exactly `{ sessionID }` and returns the raw
+ *   resolved value unchanged. The adapter never fetches dependencies on its
+ *   own: only core-requested schema references are resolved.
  * - `probeSessionImportCapability(client)` → O-12 restore-start capability
  *   probe (never throws).
  * - `createSessionImportAdapter(client)` → single-session import adapter that
@@ -39,6 +48,7 @@ export { HostAdapterError } from "./host-client.ts";
 export type {
 	HostAdapterErrorCode,
 	MessageListCallInput,
+	SessionGetCallInput,
 	SessionImportCallInput,
 	SessionImportResult,
 	SessionListCallInput,
@@ -67,6 +77,11 @@ export type {
 	SessionIdInventoryInput,
 	SessionIdInventoryProject,
 } from "./session-id-inventory.ts";
-export { createSessionReadAdapter, mapMessageListRequest, mapSessionListRequest } from "./session-read.ts";
+export {
+	createSessionDependencyReadAdapter,
+	createSessionReadAdapter,
+	mapMessageListRequest,
+	mapSessionListRequest,
+} from "./session-read.ts";
 export { buildSessionImportCall, createSessionImportAdapter, probeSessionImportCapability } from "./session-import.ts";
 export type { SessionImportAdapter, SessionImportProbe, SessionImportRequest } from "./session-import.ts";

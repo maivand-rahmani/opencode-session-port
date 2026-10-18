@@ -2,9 +2,11 @@
  * SessionPort V1 TUI orchestration (Phase 4, bounded non-visual lane; `fix-57`).
  *
  * Public surface:
- * - `runCheckpointFlow(port, input)` → collect, prompt, resolve the P-15 path,
- *   seal, and write one encrypted artifact; returns only `no-sessions` /
- *   `canceled` / `written` low-level facts.
+ * - `runCheckpointFlow(port, input)` → collect (including the owner-approved
+ *   2026-10-18 recursive `parentID`/`fork.sessionID` dependency closure through
+ *   the port's `getSession`), prompt, resolve the P-15 path, seal, and write
+ *   one encrypted artifact; returns only `no-sessions` / `canceled` /
+ *   `written` low-level facts.
  * - `runRestorePreflight(client, input)` → O-12 capability probe, one password
  *   attempt, authenticated strict-parse of the artifact, destination snapshot,
  *   the required bounded metadata-only cross-project session-ID occupancy

@@ -26,6 +26,7 @@ import { describe, expect, test } from "bun:test";
 import type { SessionRecord } from "../../../src/core/contracts/index.ts";
 import { resolveUnaryMethod } from "../../../src/tui/adapters/host-client.ts";
 import {
+	createSessionDependencyReadAdapter,
 	createSessionImportAdapter,
 	createSessionReadAdapter,
 	probeSessionImportCapability,
@@ -37,11 +38,13 @@ const DETACHED = "invoked without its owning object as receiver";
 interface ReceiverDependentReadOwner {
 	readonly ownerTag: string;
 	list(input: unknown): Promise<unknown>;
+	get?(input: unknown): Promise<unknown>;
 }
 
 interface ReceiverDependentReadClientOptions {
 	readonly sessionListError?: unknown;
 	readonly messageListError?: unknown;
+	readonly sessionGetError?: unknown;
 }
 
 interface ReceiverDependentReadClientHandle {
@@ -50,19 +53,21 @@ interface ReceiverDependentReadClientHandle {
 	readonly message: ReceiverDependentReadOwner;
 	readonly sessionListCalls: unknown[];
 	readonly messageListCalls: unknown[];
+	readonly sessionGetCalls: unknown[];
 }
 
 /**
- * Read-surface fake whose `session.list` / `message.list` verify `this` is the
- * exact owning object before recording the input. Detached invocation throws a
- * distinctive error instead of silently working, so the adapter tests below
- * fail if the wrapper loses the receiver.
+ * Read-surface fake whose `session.list`, `session.get`, and `message.list`
+ * verify `this` is the exact owning object before recording the input.
+ * Detached invocation throws a distinctive error instead of silently working,
+ * so the adapter tests below fail if the wrapper loses the receiver.
  */
 function createReceiverDependentReadClient(
 	options: ReceiverDependentReadClientOptions = {},
 ): ReceiverDependentReadClientHandle {
 	const sessionListCalls: unknown[] = [];
 	const messageListCalls: unknown[] = [];
+	const sessionGetCalls: unknown[] = [];
 	const session: ReceiverDependentReadOwner = {
 		ownerTag: "session-owner",
 		async list(input: unknown): Promise<unknown> {
@@ -72,6 +77,17 @@ function createReceiverDependentReadClient(
 			sessionListCalls.push(input);
 			if (options.sessionListError !== undefined) throw options.sessionListError;
 			return { data: [], cursor: {} };
+		},
+		async get(input: unknown): Promise<unknown> {
+			if (this !== session || this.ownerTag !== "session-owner") {
+				throw new Error(`session.get ${DETACHED}`);
+			}
+			sessionGetCalls.push(input);
+			if (options.sessionGetError !== undefined) throw options.sessionGetError;
+			// Direct unwrapped info, matching the pinned generated-client
+			// declaration (`get(input) => Promise<SessionInfo>`).
+			const sessionID = (input as { readonly sessionID: string }).sessionID;
+			return { id: sessionID, projectID: "proj_1", location: { directory: "C:/repo" } };
 		},
 	};
 	const message: ReceiverDependentReadOwner = {
@@ -85,7 +101,7 @@ function createReceiverDependentReadClient(
 			return { data: [], cursor: {} };
 		},
 	};
-	return { client: { session, message }, session, message, sessionListCalls, messageListCalls };
+	return { client: { session, message }, session, message, sessionListCalls, messageListCalls, sessionGetCalls };
 }
 
 interface ReceiverDependentImportOwner {
@@ -141,15 +157,17 @@ function plannedRecord(): SessionRecord {
 }
 
 describe("harness self-check: receiver-dependent fakes fail when detached", () => {
-	test("detached session.list, message.list, and session.import all reject", async () => {
+	test("detached session.list, session.get, message.list, and session.import all reject", async () => {
 		const { session, message } = createReceiverDependentReadClient();
 		const { session: importOwner } = createReceiverDependentImportClient();
 
 		const detachedSessionList = session.list;
+		const detachedSessionGet = session.get!;
 		const detachedMessageList = message.list;
 		const detachedImport = importOwner.import;
 
 		await expect(detachedSessionList({ project: "proj_1", limit: 1 })).rejects.toThrow(DETACHED);
+		await expect(detachedSessionGet({ sessionID: "ses_1" })).rejects.toThrow(DETACHED);
 		await expect(detachedMessageList({ sessionID: "ses_1", limit: 1, order: "asc" })).rejects.toThrow(DETACHED);
 		await expect(detachedImport({ info: {}, messages: [] })).rejects.toThrow(DETACHED);
 	});
@@ -204,6 +222,28 @@ describe("receiver-dependent read methods through createSessionReadAdapter", () 
 
 		await expect(port.listSessions({ project: "proj_1", limit: 1 })).rejects.toBe(sessionListError);
 		await expect(port.listMessages({ sessionID: "ses_1", limit: 1, order: "asc" })).rejects.toBe(messageListError);
+	});
+});
+
+describe("receiver-dependent session.get through the dependency adapter", () => {
+	test("session.get keeps its owning object, sends exactly { sessionID }, and returns the raw direct info unchanged", async () => {
+		const { client, sessionGetCalls } = createReceiverDependentReadClient();
+		const port = createSessionDependencyReadAdapter(client);
+
+		const result = await port.getSession("ses_dep");
+
+		expect(sessionGetCalls).toEqual([{ sessionID: "ses_dep" }]);
+		expect(Object.keys(sessionGetCalls[0] as object)).toEqual(["sessionID"]);
+		expect(result).toEqual({ id: "ses_dep", projectID: "proj_1", location: { directory: "C:/repo" } });
+	});
+
+	test("propagates host errors unchanged from a receiver-dependent session.get", async () => {
+		const sessionGetError = Object.assign(new Error("session get rejected"), { name: "HostApiError", status: 404 });
+		const { client, sessionGetCalls } = createReceiverDependentReadClient({ sessionGetError });
+		const port = createSessionDependencyReadAdapter(client);
+
+		await expect(port.getSession("ses_dep")).rejects.toBe(sessionGetError);
+		expect(sessionGetCalls).toEqual([{ sessionID: "ses_dep" }]);
 	});
 });
 

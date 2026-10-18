@@ -178,6 +178,56 @@ describe("checkpoint command callback", () => {
 		expect(notification.message).toContain("Checkpoint failed");
 		expect(harness.artifacts.writeCalls).toHaveLength(0);
 	});
+
+	test("collects a referenced dependency from another project via session.get and never scans other projects", async () => {
+		const externalParent = sessionRecord("ses_ext_parent", [userMessage("msg_ext")], FOREIGN_PROJECT_ID);
+		const sessions = [
+			sessionRecord("ses_child", [userMessage("msg_child")], "proj_active", { parentID: "ses_ext_parent" }),
+			externalParent,
+		];
+		const harness = createWiringHarness({ client: { sessions } });
+
+		await harness.handlers.checkpoint(undefined);
+
+		expect(harness.notifications[0]?.variant).toBe("success");
+		expect(harness.notifications[0]?.message).toContain("2 sessions");
+
+		// The referenced dependency was resolved by explicit ID only through the
+		// dependency-capable read adapter: no project.list and no extra
+		// dependency-project session.list scan happened.
+		expect(harness.client.sessionGetInputs).toEqual([{ sessionID: "ses_ext_parent" }]);
+		expect(harness.client.projectListCalls).toBe(0);
+		expect(harness.client.sessionListInputs).toEqual([{ project: "proj_active", limit: 50 }]);
+		const collectedMessageSessionIDs = harness.client.messageListInputs.map((input) => input.sessionID);
+		expect(collectedMessageSessionIDs).toHaveLength(2);
+		expect(collectedMessageSessionIDs).toContain("ses_child");
+		expect(collectedMessageSessionIDs).toContain("ses_ext_parent");
+	});
+
+	test("missing session.get capability reports a fixed checkpoint failure and writes nothing", async () => {
+		const harness = createWiringHarness({
+			client: {
+				withSessionGet: false,
+				sessions: [sessionRecord("ses_a", [userMessage("msg_a1")], "proj_active")],
+			},
+		});
+
+		await harness.handlers.checkpoint(undefined);
+
+		const notification = harness.notifications[0]!;
+		expect(notification.variant).toBe("error");
+		expect(notification.title).toBe("Checkpoint failed");
+		expect(notification.message).toContain("capability");
+		expect(notification.message).not.toContain("session.get");
+
+		// Capability detection failed closed before any list, prompt, path,
+		// crypto, or write.
+		expect(harness.client.sessionListInputs).toHaveLength(0);
+		expect(harness.password.calls).toHaveLength(0);
+		expect(harness.artifacts.resolveCalls).toHaveLength(0);
+		expect(harness.crypto.createPolicies).toHaveLength(0);
+		expect(harness.artifacts.writeCalls).toHaveLength(0);
+	});
 });
 
 /* ------------------------------------------------------------------------- */
@@ -248,6 +298,34 @@ describe("restore command callback", () => {
 		expect(model.sessions.map((session) => session.sessionID)).toEqual(["ses_parent", "ses_child"]);
 		expect(model.sessions.map((session) => session.classification)).toEqual(["imported", "imported"]);
 		expect(model.sessions.map((session) => session.status)).toEqual(["imported", "imported"]);
+	});
+
+	test("restore destination snapshot never resolves session.get or performs dependency lookup", async () => {
+		const harness = createWiringHarness({
+			client: {
+				sessions: [
+					sessionRecord("ses_dest", [userMessage("msg_dest")], TEST_DEST_PROJECT_ID),
+					sessionRecord("ses_foreign", [userMessage("msg_foreign")], FOREIGN_PROJECT_ID),
+				],
+				projects: async () => destinationAndForeignProjects(),
+			},
+			crypto: {
+				authenticatedBytes: encodeJson({
+					sessions: [sessionRecord("ses_src", [userMessage("msg_src")], "proj_source")],
+				}),
+			},
+		});
+
+		await harness.handlers.restore(CHECKPOINT_ARTIFACT_PATH);
+
+		// The restore path uses the list-only adapter: it never reads the
+		// session.get getter and never asks for a dependency by ID, so the
+		// destination snapshot and inventory stay strictly project-scoped.
+		expect(harness.client.sessionGetGetterReads).toBe(0);
+		expect(harness.client.sessionGetInputs).toEqual([]);
+		expect(harness.client.sessionListInputs.map((input) => input.project)).not.toContain("proj_source");
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.report.models[0]?.summary.imported).toBe(1);
 	});
 
 	test("capability absence precedes project list, location, artifact read, and import (O-12)", async () => {

@@ -107,6 +107,8 @@ export function deriveTestId(namespace: "session" | "message", originalID: strin
 export interface FakeClientOptions {
 	/** When false, `session.import` is present but not callable (O-12 absence). */
 	readonly withImport?: boolean;
+	/** When false, `session.get` is present but not callable (checkpoint dependency capability absence). */
+	readonly withSessionGet?: boolean;
 	readonly locationGet?: (input: LocationGetCallInput) => Promise<unknown>;
 	readonly projects?: () => Promise<unknown>;
 	readonly sessions?: readonly SessionRecord[];
@@ -116,6 +118,8 @@ export interface FakeClientOptions {
 		readonly limit: number;
 		readonly cursor?: string;
 	}) => Promise<unknown>;
+	/** Overrides the default direct-info `session.get` response; inputs are still recorded. */
+	readonly sessionGet?: (input: { readonly sessionID: string }) => Promise<unknown>;
 	/** Overrides the import response; the default derives a well-formed response from the request. */
 	readonly importSession?: (input: unknown) => Promise<unknown>;
 }
@@ -131,9 +135,12 @@ export interface FakeClientHandle {
 		readonly order?: "asc";
 		readonly cursor?: string;
 	}>;
+	readonly sessionGetInputs: Array<{ readonly sessionID: string }>;
 	readonly importInputs: unknown[];
 	/** Times `client.session.import` was read (the capability probe is the first read). */
 	readonly sessionImportGetterReads: number;
+	/** Times `client.session.get` was read; the restore path must never read it. */
+	readonly sessionGetGetterReads: number;
 }
 
 /** One well-formed `location.get` response. */
@@ -159,9 +166,11 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 	const locationGetInputs: LocationGetCallInput[] = [];
 	const sessionListInputs: FakeClientHandle["sessionListInputs"] = [];
 	const messageListInputs: FakeClientHandle["messageListInputs"] = [];
+	const sessionGetInputs: FakeClientHandle["sessionGetInputs"] = [];
 	const importInputs: unknown[] = [];
 	let projectListCalls = 0;
 	let sessionImportGetterReads = 0;
+	let sessionGetGetterReads = 0;
 
 	const session: Record<string, unknown> = {
 		async list(input: { project: string; limit: number; cursor?: string }): Promise<unknown> {
@@ -173,6 +182,28 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 			};
 		},
 	};
+	Object.defineProperty(session, "get", {
+		enumerable: true,
+		configurable: true,
+		get() {
+			sessionGetGetterReads += 1;
+			if (options.withSessionGet === false) return undefined;
+			return async (input: { readonly sessionID: string }): Promise<unknown> => {
+				sessionGetInputs.push({ ...input });
+				if (options.sessionGet !== undefined) return options.sessionGet(input);
+				const record = sessions.find((candidate) => candidate.info["id"] === input.sessionID);
+				if (record === undefined) {
+					throw Object.assign(new Error(`fake client has no session ${input.sessionID}`), {
+						name: "HostApiError",
+						status: 404,
+					});
+				}
+				// Direct unwrapped info, matching the pinned generated client's
+				// `session.get(input) => Promise<SessionInfo>` declaration.
+				return { ...record.info };
+			};
+		},
+	});
 	Object.defineProperty(session, "import", {
 		enumerable: true,
 		configurable: true,
@@ -220,9 +251,13 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 		},
 		sessionListInputs,
 		messageListInputs,
+		sessionGetInputs,
 		importInputs,
 		get sessionImportGetterReads(): number {
 			return sessionImportGetterReads;
+		},
+		get sessionGetGetterReads(): number {
+			return sessionGetGetterReads;
 		},
 	};
 }

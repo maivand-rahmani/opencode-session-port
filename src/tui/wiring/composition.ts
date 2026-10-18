@@ -7,8 +7,12 @@
  * `/checkpoint [artifact-path]`
  *   1. resolve the active project from `context.location.directory` through the
  *      public `location.get` resolver (exact response matching; fail closed);
- *   2. `runCheckpointFlow` — exhaustive project-scoped collection (fail, never
- *      truncate, on any collection cap), matching password prompt, P-15 path
+ *   2. `runCheckpointFlow` — exhaustive project-scoped collection including the
+ *      owner-approved 2026-10-18 recursive `parentID`/`fork.sessionID`
+ *      dependency closure (a dependency-capable read adapter is created here
+ *      and only here; a host without callable `session.get` fails closed
+ *      through the existing sanitized capability report), fail (never
+ *      truncate) on any collection cap, matching password prompt, P-15 path
  *      resolution, seal, exclusive encrypted write;
  *   3. report path/size/session-count facts or a sanitized failure.
  *
@@ -60,7 +64,7 @@ import type { ResolveCheckpointOutputPathOptions, ResolveLatestCheckpointArtifac
 import { createLocationResolver, LocationResolutionError } from "../adapters/location-resolver.ts";
 import { createProjectDestinationsAdapter } from "../adapters/project-destinations.ts";
 import { createSessionIdInventory } from "../adapters/session-id-inventory.ts";
-import { createSessionReadAdapter } from "../adapters/session-read.ts";
+import { createSessionDependencyReadAdapter, createSessionReadAdapter } from "../adapters/session-read.ts";
 import { createSessionImportAdapter, probeSessionImportCapability } from "../adapters/session-import.ts";
 import {
 	runCheckpointFlow,
@@ -203,7 +207,11 @@ async function runCheckpointCommand(
 		}
 		// One explicit location.get for the active directory (E42 side effect).
 		const resolved = await createLocationResolver(dependencies.client).resolveActiveProject(activeDirectory);
-		const readPort = createSessionReadAdapter(dependencies.client);
+		// Checkpoint collection resolves schema-referenced dependencies, so it
+		// needs the dependency-capable read port (session.list/message.list plus
+		// session.get). This is the only place that adapter is created; the
+		// restore path below keeps the list-only adapter.
+		const readPort = createSessionDependencyReadAdapter(dependencies.client);
 		const outcome = await runCheckpointFlow(readPort, {
 			projectID: resolved.projectID,
 			projectDirectory: resolved.directory,
@@ -282,7 +290,9 @@ async function runRestoreCommand(
 		// after full authentication and strict parsing. The cross-project
 		// session-ID inventory reuses the already-validated selection candidates
 		// (no second project.list) and scans only session metadata (no message
-		// reads, no location.get, no import).
+		// reads, no location.get, no import). The list-only adapter is
+		// intentional: restore never resolves `session.get` and never performs
+		// dependency lookup for the destination snapshot.
 		const readPort = createSessionReadAdapter(dependencies.client);
 		const sessionIdInventory = createSessionIdInventory({
 			readPort,

@@ -4,7 +4,13 @@
  * `runCheckpointFlow` wires the completed Phase 2/3 core and Phase 4 adapters
  * into one testable sequence and returns only low-level structured facts:
  *
- *   collectCheckpointPayload(port, { projectID, policy })
+ *   collectCheckpointPayloadWithDependencies(port, { projectID, policy })
+ *     → recursive owner-approved dependency closure (2026-10-18 amendment):
+ *       sessions referenced by `parentID`/`fork.sessionID` (and their complete
+ *       message histories) are included even when they live outside the seed
+ *       project; missing/malformed/wrong-ID dependencies, unresolved
+ *       references, cycles rejected by restore semantics, and cap violations
+ *       fail closed before any password, path, crypto, or write step
  *     → zero sessions ⇒ `no-sessions` outcome (P-04), before the password
  *       prompt, path resolution, crypto creation, and any filesystem write
  *     → requestPassword("checkpoint")
@@ -32,10 +38,12 @@
  * - O-01/O-02/O-03: no production numeric policy, format, or cap exists in
  *   this module. `CryptoPolicy` and the `CheckpointCryptoFactory` are injected
  *   by the caller; tests use clearly test-only fakes.
- * - O-10: this flow uses the existing collector's project-scoped enumeration
- *   and adds no child/subagent enumeration of its own; child-association
- *   semantics remain OPEN and the collector includes exactly what the
- *   explicit project scope returns.
+ * - O-10 (2026-10-18 amendment): collection starts from the existing
+ *   project-scoped enumeration and adds no unrelated-project scan; only
+ *   recursively referenced `parentID`/`fork.sessionID` dependencies (and each
+ *   dependency's complete message history) are additionally fetched through
+ *   the port's `getSession`. Child-association semantics beyond the
+ *   schema-referenced closure remain OPEN.
  * - O-15: report formats remain OPEN; only path/session-count/encrypted-byte
  *   facts cross this boundary.
  * - P-15/O-08: the path itself comes from the injected
@@ -43,16 +51,17 @@
  *   overwrites an existing artifact.
  *
  * Evidence boundary: exercised only by fake ports, fake password providers,
- * fake crypto factories, and fake store functions. No real host call,
- * filesystem write, KDF, or import is performed by this lane, and no runtime
- * or compatibility claim follows.
+ * fake crypto factories, and fake store functions. Dependency-closure
+ * behavior (external referenced sessions) is covered synthetically only; no
+ * real host call, filesystem write, KDF, or import is performed by this lane,
+ * and no runtime or compatibility claim follows.
  */
 
 import {
-	collectCheckpointPayload,
+	collectCheckpointPayloadWithDependencies,
 	serializeCheckpointPayload,
 	type SessionCollectionPolicy,
-	type SessionReadPort,
+	type SessionDependencyReadPort,
 } from "../../core/sessions/index.ts";
 import type { ByteSource, CheckpointCryptoFactory, CryptoPolicy } from "../../core/contracts/index.ts";
 import type { ResolveCheckpointOutputPathOptions } from "../artifacts/files.ts";
@@ -103,11 +112,14 @@ export type CheckpointOutcome =
 
 /**
  * Runs one checkpoint to a completed encrypted artifact or to a clear
- * no-sessions/canceled outcome. Errors propagate unchanged; see the module
- * comment for the exact sequence and policy boundaries.
+ * no-sessions/canceled outcome. The port must provide the dependency read
+ * surface (`SessionDependencyReadPort`); collection uses the
+ * dependency-closure collector so schema-referenced sessions are included.
+ * Errors propagate unchanged; see the module comment for the exact sequence
+ * and policy boundaries.
  */
 export async function runCheckpointFlow(
-	port: SessionReadPort,
+	port: SessionDependencyReadPort,
 	input: CheckpointFlowInput,
 ): Promise<CheckpointOutcome> {
 	if (!isRecordValue(input)) {
@@ -124,7 +136,7 @@ export async function runCheckpointFlow(
 	const projectID = requireNonEmptyString(input.projectID, "projectID");
 	requireNonEmptyString(input.projectDirectory, "projectDirectory");
 
-	const payload = await collectCheckpointPayload(port, { projectID, policy: input.policy });
+	const payload = await collectCheckpointPayloadWithDependencies(port, { projectID, policy: input.policy });
 	if (payload.sessions.length === 0) {
 		// P-04: no empty checkpoints. Nothing is prompted, resolved, encrypted, or written.
 		return { status: "no-sessions" };

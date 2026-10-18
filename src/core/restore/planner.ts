@@ -86,6 +86,7 @@ import {
 	type JsonValue,
 	type SessionRecord,
 } from "../contracts/index.ts";
+import { findSchemaReferenceViolation } from "../sessions/references.ts";
 import type { RemappedIdDeriver } from "./identity.ts";
 
 /* ------------------------------------------------------------------------- */
@@ -206,10 +207,6 @@ function isJsonRecordValue(value: unknown): value is { readonly [key: string]: J
 function describeError(value: unknown): string {
 	return value instanceof Error ? value.message : String(value);
 }
-
-/** Schema reference prefixes: session references use `ses`, message references `msg_`. */
-const SESSION_REFERENCE_PREFIX = "ses";
-const MESSAGE_REFERENCE_PREFIX = "msg_";
 
 /** Exact selected target-ID shapes (O-22): lowercase hex digests only. */
 const TARGET_ID_PATTERNS: Readonly<Record<"session" | "message", RegExp>> = Object.freeze({
@@ -340,67 +337,14 @@ function validateSessionRecord(
 
 /**
  * Validates the schema-defined reference fields and their required nested
- * shape. `info.parentID` is optional when absent. When `info.fork` is present
- * it must carry a string `sessionID`, an object `boundary`, a `boundary.type`
- * that is exactly `before` or `through`, and a string `boundary.messageID`;
- * when `info.revert` is present it must carry a string `messageID`. Present
- * reference IDs must use their `ses`/`msg_` schema prefixes, and a present
- * value that does not match fails closed instead of being treated as absent.
+ * shape via the shared validator in `../sessions/references.ts` (also used by
+ * the checkpoint dependency collector, so reference rules cannot drift). The
+ * violation message is identical to the previous local implementation.
  */
 function validateSchemaReferences(record: SessionRecord, code: RestorePlanErrorCode, label: string): void {
-	const info = record.info;
-	validateOptionalReferenceString(info, "parentID", code, `${label}.info`, SESSION_REFERENCE_PREFIX);
-
-	const fork = info["fork"];
-	if (fork !== undefined) {
-		if (!isJsonRecordValue(fork)) {
-			throw new RestorePlanError(code, `${label}.info.fork must be an object when present`);
-		}
-		validateRequiredReferenceString(fork, "sessionID", code, `${label}.info.fork`, SESSION_REFERENCE_PREFIX);
-		const boundary = fork["boundary"];
-		if (!isJsonRecordValue(boundary)) {
-			throw new RestorePlanError(code, `${label}.info.fork.boundary must be an object`);
-		}
-		const boundaryType = boundary["type"];
-		if (boundaryType !== "before" && boundaryType !== "through") {
-			throw new RestorePlanError(code, `${label}.info.fork.boundary.type must be exactly "before" or "through"`);
-		}
-		validateRequiredReferenceString(boundary, "messageID", code, `${label}.info.fork.boundary`, MESSAGE_REFERENCE_PREFIX);
-	}
-
-	const revert = info["revert"];
-	if (revert !== undefined) {
-		if (!isJsonRecordValue(revert)) {
-			throw new RestorePlanError(code, `${label}.info.revert must be an object when present`);
-		}
-		validateRequiredReferenceString(revert, "messageID", code, `${label}.info.revert`, MESSAGE_REFERENCE_PREFIX);
-	}
-}
-
-function validateOptionalReferenceString(
-	container: JsonObject,
-	key: string,
-	code: RestorePlanErrorCode,
-	label: string,
-	prefix: string,
-): void {
-	const value: JsonValue | undefined = container[key];
-	if (value === undefined) return;
-	if (typeof value !== "string" || !value.startsWith(prefix)) {
-		throw new RestorePlanError(code, `${label}.${key} must be a string starting with ${JSON.stringify(prefix)} when present`);
-	}
-}
-
-function validateRequiredReferenceString(
-	container: JsonObject,
-	key: string,
-	code: RestorePlanErrorCode,
-	label: string,
-	prefix: string,
-): void {
-	const value: JsonValue | undefined = container[key];
-	if (typeof value !== "string" || !value.startsWith(prefix)) {
-		throw new RestorePlanError(code, `${label}.${key} must be a string starting with ${JSON.stringify(prefix)}`);
+	const violation = findSchemaReferenceViolation(record.info, `${label}.info`);
+	if (violation !== undefined) {
+		throw new RestorePlanError(code, violation);
 	}
 }
 

@@ -170,8 +170,13 @@ export async function collectCheckpointPayload(
  * page size` before the page is accumulated: a page that would push the
  * collection over the bound rejects the whole collection instead of being
  * truncated.
+ *
+ * `@internal` Exported for the dependency-closure collector
+ * (`dependencies.ts`), which reuses this exact pagination/settled/bound
+ * implementation for referenced sessions instead of duplicating it. Not part
+ * of the public sessions API surface.
  */
-async function collectSessionMessages(
+export async function collectSessionMessages(
 	port: SessionReadPort,
 	sessionID: string,
 	policy: SessionCollectionPolicy,
@@ -291,8 +296,14 @@ function parsePageEnvelope(value: unknown, code: SessionCollectionErrorCode, lab
 	return { items: data, next };
 }
 
-/** Copies one API record into a detached JSON-only object, rejecting anything JSON would omit or coerce. */
-function snapshotJsonRecord(value: unknown, code: SessionCollectionErrorCode, label: string): JsonObject {
+/**
+ * Copies one API record into a detached JSON-only object, rejecting anything
+ * JSON would omit or coerce.
+ *
+ * `@internal` Exported for the dependency-closure collector
+ * (`dependencies.ts`); not part of the public sessions API surface.
+ */
+export function snapshotJsonRecord(value: unknown, code: SessionCollectionErrorCode, label: string): JsonObject {
 	if (!isJsonObject(value)) {
 		throw new SessionCollectionError(code, `${label} was not an object`);
 	}
@@ -308,8 +319,14 @@ function snapshotJsonRecord(value: unknown, code: SessionCollectionErrorCode, la
 	return snapshot as JsonObject;
 }
 
-/** Awaits one port call and converts non-collection failures into a coded error while preserving the cause. */
-async function callPort(
+/**
+ * Awaits one port call and converts non-collection failures into a coded error
+ * while preserving the cause.
+ *
+ * `@internal` Exported for the dependency-closure collector
+ * (`dependencies.ts`); not part of the public sessions API surface.
+ */
+export async function callPort(
 	call: () => Promise<unknown>,
 	code: SessionCollectionErrorCode,
 	label: string,

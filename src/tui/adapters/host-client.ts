@@ -84,6 +84,21 @@ export interface MessageListCallInput {
 }
 
 /**
+ * One `session.get` request as mapped from the checkpoint dependency port.
+ *
+ * The pinned v2.0.22 generated client declares
+ * `get(input: SessionGetInput) => Promise<SessionInfo>` where `SessionGetInput`
+ * is exactly `{ readonly sessionID: string }` and the resolved value is the
+ * already-unwrapped `SessionInfo` (the protocol `{ data }` envelope is
+ * unwrapped by the generated promise client, not by this adapter). Only this
+ * one field is ever sent.
+ */
+export interface SessionGetCallInput {
+	/** The single session ID to resolve; the only field ever sent. */
+	readonly sessionID: string;
+}
+
+/**
  * Narrow structural view of the public read surface used for enumeration.
  *
  * All members are optional because capability absence is a real runtime state
@@ -95,6 +110,17 @@ export interface MessageListCallInput {
 export interface SessionReadClientLike {
 	readonly session?: {
 		list?(input: SessionListCallInput): Promise<unknown>;
+		/**
+		 * Optional `session.get`, required only by the checkpoint
+		 * dependency-closure adapter (`createSessionDependencyReadAdapter`).
+		 * The restore destination-snapshot adapter
+		 * (`createSessionReadAdapter`) never resolves or calls it, so a
+		 * list-only client remains sufficient for restore. The pinned
+		 * declaration resolves the unwrapped `SessionInfo` directly (no
+		 * `{ data }` envelope), which is the raw value the dependency adapter
+		 * passes through unchanged.
+		 */
+		get?(input: SessionGetCallInput): Promise<unknown>;
 	};
 	readonly message?: {
 		list?(input: MessageListCallInput): Promise<unknown>;
@@ -165,6 +191,27 @@ type AssertTrue<T extends true> = T;
  * here instead of failing at runtime.
  */
 type _AssertHostReadClientCompatible = AssertTrue<HostTuiClient extends SessionReadClientLike ? true : false>;
+
+/**
+ * The installed v2.0.22 declaration must keep `session.get` accepting exactly
+ * the narrow `{ sessionID }` input the dependency adapter sends. Drift in the
+ * input shape is a compile error, not a runtime surprise.
+ */
+type _AssertHostSessionGetInputCompatible = AssertTrue<
+	Parameters<HostTuiClient["session"]["get"]>[0] extends SessionGetCallInput ? true : false
+>;
+
+/**
+ * The declared `session.get` output must stay the already-unwrapped
+ * `SessionInfo` (declared `Promise<SessionInfo>`, not a `{ data: SessionInfo }`
+ * envelope). The dependency adapter returns this raw value to the core
+ * collector unchanged and performs no envelope fallback, so a declaration
+ * change back to an enveloped shape must fail compilation here.
+ */
+type HostSessionGetOutput = Awaited<ReturnType<HostTuiClient["session"]["get"]>>;
+type _AssertHostSessionGetOutputIsDirectSessionInfo = AssertTrue<
+	HostSessionGetOutput extends { readonly id: string; readonly projectID: string } ? true : false
+>;
 
 /**
  * The installed declaration must expose the import surface with a payload

@@ -10,11 +10,16 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { serializeCheckpointPayload, SessionCollectionError } from "../../../src/core/sessions/index.ts";
+import {
+	serializeCheckpointPayload,
+	SessionCollectionError,
+	type SessionCollectionPolicy,
+} from "../../../src/core/sessions/index.ts";
 import type { SessionRecord } from "../../../src/core/contracts/index.ts";
 import { runCheckpointFlow, type CheckpointFlowInput } from "../../../src/tui/orchestration/index.ts";
 import type { ResolveCheckpointOutputPathOptions } from "../../../src/tui/artifacts/files.ts";
 import {
+	assistantMessage,
 	createEventLog,
 	createFakeCryptoFactory,
 	createFakeSessionPort,
@@ -32,6 +37,8 @@ const ARTIFACT_PATH = "C:/work/project/.sessionport/checkpoint-test.sessionport"
 
 interface CheckpointHarnessOptions {
 	readonly sessions?: readonly SessionRecord[];
+	/** External referenced sessions served only through `getSession` (dependency closure). */
+	readonly dependencySessions?: readonly SessionRecord[];
 	/** Defaults to a synthetic non-zero password; `"cancel"` resolves `undefined`. */
 	readonly passwordResult?: Uint8Array | "cancel";
 	readonly crypto?: FakeCryptoFactoryOptions;
@@ -40,6 +47,7 @@ interface CheckpointHarnessOptions {
 	readonly writeErrorAfterConsume?: Error;
 	readonly explicitOutputPath?: string;
 	readonly portError?: Error;
+	readonly policy?: SessionCollectionPolicy;
 }
 
 interface CheckpointHarness {
@@ -65,8 +73,11 @@ function createCheckpointHarness(options: CheckpointHarnessOptions = {}): Checkp
 				async listMessages(): Promise<unknown> {
 					throw options.portError;
 				},
+				async getSession(): Promise<unknown> {
+					throw options.portError;
+				},
 			}
-		: createFakeSessionPort(sessions, events);
+		: createFakeSessionPort(sessions, events, options.dependencySessions ?? []);
 	const crypto = createFakeCryptoFactory(options.crypto ?? {}, events);
 	const passwordCalls: string[] = [];
 	const resolveCalls: ResolveCheckpointOutputPathOptions[] = [];
@@ -77,7 +88,7 @@ function createCheckpointHarness(options: CheckpointHarnessOptions = {}): Checkp
 	const input: CheckpointFlowInput = {
 		projectID: PROJECT_ID,
 		projectDirectory: PROJECT_DIRECTORY,
-		policy: TEST_COLLECTION_POLICY,
+		policy: options.policy ?? TEST_COLLECTION_POLICY,
 		cryptoFactory: crypto.factory,
 		cryptoPolicy: TEST_CRYPTO_POLICY,
 		resolveCheckpointOutputPath: async (resolveOptions) => {
@@ -262,5 +273,97 @@ describe("runCheckpointFlow", () => {
 		await expect(runCheckpointFlow(harness.port, badInput)).rejects.toThrow(TypeError);
 
 		expect(harness.events.events).toEqual([]);
+	});
+
+	test("collects a referenced external dependency with its full history and writes one artifact", async () => {
+		const harness = createCheckpointHarness({
+			sessions: [sessionRecord("ses_child", [userMessage("msg_c")], PROJECT_ID, { parentID: "ses_ext" })],
+			dependencySessions: [
+				sessionRecord("ses_ext", [userMessage("msg_p"), assistantMessage("msg_a")], "proj_other"),
+			],
+		});
+
+		const outcome = await runCheckpointFlow(harness.port, harness.input);
+
+		expect(outcome).toEqual({
+			status: "written",
+			artifactPath: ARTIFACT_PATH,
+			sessionCount: 2,
+			encryptedBytes: 5,
+		});
+
+		// The dependency was fetched only through the explicit dependency read,
+		// after the project-scoped list and before the password prompt.
+		expect(harness.events.events).toContain("collect:get:ses_ext");
+		const getIndex = harness.events.events.indexOf("collect:get:ses_ext");
+		expect(getIndex).toBeGreaterThan(harness.events.events.indexOf("collect:sessions"));
+		expect(getIndex).toBeLessThan(harness.events.events.indexOf("password"));
+
+		// The sealed plaintext is the serialized payload of the seed session plus
+		// the complete external dependency history.
+		const plaintext = harness.crypto.sealIterations[0]?.plaintextText ?? "";
+		expect(plaintext).toContain("ses_child");
+		expect(plaintext).toContain("ses_ext");
+		expect(plaintext).toContain("msg_c");
+		expect(plaintext).toContain("msg_p");
+		expect(plaintext).toContain("msg_a");
+	});
+
+	test("a missing referenced dependency fails closed before password, path, crypto, and write", async () => {
+		const harness = createCheckpointHarness({
+			sessions: [sessionRecord("ses_child", [userMessage("msg_c")], PROJECT_ID, { parentID: "ses_missing" })],
+		});
+
+		await expect(runCheckpointFlow(harness.port, harness.input)).rejects.toBeInstanceOf(SessionCollectionError);
+
+		expect(harness.events.events).toContain("collect:get:ses_missing");
+		expect(harness.passwordCalls).toEqual([]);
+		expect(harness.resolveCalls).toEqual([]);
+		expect(harness.crypto.createPolicies).toEqual([]);
+		expect(harness.crypto.sealPasswords).toEqual([]);
+		expect(harness.writeCalls).toEqual([]);
+	});
+
+	test("a dependency that exceeds the aggregate message limit fails closed before password, path, crypto, and write", async () => {
+		const harness = createCheckpointHarness({
+			sessions: [sessionRecord("ses_child", [userMessage("msg_c")], PROJECT_ID, { parentID: "ses_ext" })],
+			dependencySessions: [
+				sessionRecord("ses_ext", [userMessage("msg_p1"), userMessage("msg_p2")], "proj_other"),
+			],
+			policy: { ...TEST_COLLECTION_POLICY, maxTotalMessages: 1 },
+		});
+
+		await expect(runCheckpointFlow(harness.port, harness.input)).rejects.toBeInstanceOf(SessionCollectionError);
+
+		expect(harness.events.events).toContain("collect:get:ses_ext");
+		expect(harness.passwordCalls).toEqual([]);
+		expect(harness.resolveCalls).toEqual([]);
+		expect(harness.crypto.createPolicies).toEqual([]);
+		expect(harness.crypto.sealPasswords).toEqual([]);
+		expect(harness.writeCalls).toEqual([]);
+	});
+
+	test("a dependency without a nonblank projectID fails closed before password, path, crypto, and write", async () => {
+		const missingProject = sessionRecord("ses_ext", [userMessage("msg_p")], "proj_other");
+		delete (missingProject.info as Record<string, unknown>)["projectID"];
+		const blankProject = sessionRecord("ses_ext", [userMessage("msg_p")], "   ");
+
+		for (const dependency of [missingProject, blankProject]) {
+			const harness = createCheckpointHarness({
+				sessions: [sessionRecord("ses_child", [userMessage("msg_c")], PROJECT_ID, { parentID: "ses_ext" })],
+				dependencySessions: [dependency],
+			});
+
+			await expect(runCheckpointFlow(harness.port, harness.input)).rejects.toBeInstanceOf(SessionCollectionError);
+
+			// The dependency fetch happened, then the malformed record failed the
+			// whole flow before any downstream effect.
+			expect(harness.events.events).toContain("collect:get:ses_ext");
+			expect(harness.passwordCalls).toEqual([]);
+			expect(harness.resolveCalls).toEqual([]);
+			expect(harness.crypto.createPolicies).toEqual([]);
+			expect(harness.crypto.sealPasswords).toEqual([]);
+			expect(harness.writeCalls).toEqual([]);
+		}
 	});
 });

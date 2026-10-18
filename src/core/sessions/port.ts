@@ -51,6 +51,35 @@ export interface SessionReadPort {
 	listMessages(request: MessageListPageRequest): Promise<unknown>;
 }
 
+/**
+ * Dependency-capable read surface for checkpoint collection (owner-approved
+ * 2026-10-18 amendment): the project-scoped list/message reads plus an explicit
+ * single-session fetch used only to resolve schema-referenced `parentID` /
+ * `fork.sessionID` dependencies.
+ *
+ * `getSession` maps to the public `session.get` route addressed by exact
+ * session ID and is the only approved way to read a referenced session that
+ * the project-scoped list did not return; the collector never scans other
+ * projects and never calls `listSessions` for a dependency. The pinned v2.0.22
+ * generated client declares `get(input: { sessionID }) => Promise<SessionInfo>`
+ * and resolves the already-unwrapped `SessionInfo` directly (the raw protocol
+ * `{ data: sessionInfo }` envelope is unwrapped by the generated promise
+ * client before the port sees it), so the resolved value is returned as raw
+ * `unknown`. The core collector validates whatever value the port resolves as
+ * a direct session info object whose `id` equals the exact requested ID, or
+ * the whole collection fails closed; an enveloped `{ data: ... }` value is not
+ * the declared shape and is rejected. A port must not pre-filter,
+ * pre-truncate, or coerce API data.
+ */
+export interface SessionDependencyReadPort extends SessionReadPort {
+	/**
+	 * Requests exactly one session record by its exact session ID.
+	 * Expected resolved value: the direct unwrapped session info object
+	 * (`{ id, ... }`). No other request fields exist.
+	 */
+	getSession(sessionID: string): Promise<unknown>;
+}
+
 /** One session list page request. The project scope is always explicit; the collector never infers it. */
 export interface SessionListPageRequest {
 	/** Explicit project scope; mapped to the list route's `project` filter. */

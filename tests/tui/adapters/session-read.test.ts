@@ -11,10 +11,12 @@
 import { describe, expect, test } from "bun:test";
 import {
 	collectCheckpointPayload,
+	collectCheckpointPayloadWithDependencies,
 	type SessionCollectionPolicy,
 	type SessionListPageRequest,
 } from "../../../src/core/sessions/index.ts";
 import {
+	createSessionDependencyReadAdapter,
 	createSessionReadAdapter,
 	HostAdapterError,
 } from "../../../src/tui/adapters/index.ts";
@@ -22,23 +24,32 @@ import {
 interface FakeReadClientOptions {
 	readonly sessionList?: (input: unknown) => Promise<unknown>;
 	readonly messageList?: (input: unknown) => Promise<unknown>;
+	/** Defaults to a direct unwrapped info object for the requested ID. */
+	readonly sessionGet?: (input: unknown) => Promise<unknown>;
 }
 
 interface FakeReadClientHandle {
 	readonly client: unknown;
 	readonly sessionListCalls: unknown[];
 	readonly messageListCalls: unknown[];
+	readonly sessionGetCalls: unknown[];
 }
 
 /** Recording fake of the public read surface; scripts page responses per call. */
 function createFakeReadClient(options: FakeReadClientOptions = {}): FakeReadClientHandle {
 	const sessionListCalls: unknown[] = [];
 	const messageListCalls: unknown[] = [];
+	const sessionGetCalls: unknown[] = [];
 	const client = {
 		session: {
 			async list(input: unknown): Promise<unknown> {
 				sessionListCalls.push(input);
 				return options.sessionList ? options.sessionList(input) : undefined;
+			},
+			async get(input: unknown): Promise<unknown> {
+				sessionGetCalls.push(input);
+				if (options.sessionGet) return options.sessionGet(input);
+				return sessionInfo((input as { readonly sessionID: string }).sessionID);
 			},
 		},
 		message: {
@@ -48,18 +59,20 @@ function createFakeReadClient(options: FakeReadClientOptions = {}): FakeReadClie
 			},
 		},
 	};
-	return { client, sessionListCalls, messageListCalls };
+	return { client, sessionListCalls, messageListCalls, sessionGetCalls };
 }
 
 /** Sequential-page fake: session pages and per-session message pages are consumed in call order. */
 function createScriptedReadClient(
 	sessionPages: readonly unknown[],
 	messagePages: Readonly<Record<string, readonly unknown[]>>,
+	dependencyInfos: Readonly<Record<string, unknown>> = {},
 ): FakeReadClientHandle {
 	let sessionPageIndex = 0;
 	const messagePageIndexes = new Map<string, number>();
 	const sessionListCalls: unknown[] = [];
 	const messageListCalls: unknown[] = [];
+	const sessionGetCalls: unknown[] = [];
 	const client = {
 		session: {
 			async list(input: unknown): Promise<unknown> {
@@ -68,6 +81,12 @@ function createScriptedReadClient(
 				sessionPageIndex += 1;
 				if (page === undefined) throw new Error(`unexpected session page request ${sessionPageIndex}`);
 				return page;
+			},
+			async get(input: unknown): Promise<unknown> {
+				sessionGetCalls.push(input);
+				const sessionID = (input as { readonly sessionID: string }).sessionID;
+				if (!(sessionID in dependencyInfos)) throw new Error(`unexpected session.get for ${sessionID}`);
+				return dependencyInfos[sessionID];
 			},
 		},
 		message: {
@@ -82,7 +101,7 @@ function createScriptedReadClient(
 			},
 		},
 	};
-	return { client, sessionListCalls, messageListCalls };
+	return { client, sessionListCalls, messageListCalls, sessionGetCalls };
 }
 
 /** Captures and asserts a thrown `HostAdapterError` (returns it for code checks). */
@@ -341,5 +360,136 @@ describe("integration with the core collector", () => {
 			{ sessionID: "ses_2", limit: 2, order: "asc" },
 			{ sessionID: "ses_3", limit: 2, order: "asc" },
 		]);
+	});
+});
+
+/* ------------------------------------------------------------------------- */
+/* Dependency-capable read adapter (checkpoint closure, 2026-10-18 amendment) */
+/* ------------------------------------------------------------------------- */
+
+describe("createSessionDependencyReadAdapter capability detection", () => {
+	test("fails closed when session.list or message.list is missing or not callable", () => {
+		for (const client of [
+			{},
+			{ session: {} },
+			{ session: { list: 42 } },
+			{ message: { list: async () => undefined } },
+			null,
+			undefined,
+			"client",
+			[],
+		]) {
+			const error = captureHostAdapterError(() => createSessionDependencyReadAdapter(client));
+			expect(error.code).toBe("capability-unavailable");
+		}
+	});
+
+	test("fails closed when session.get is missing or not callable", () => {
+		for (const getValue of [undefined, 42, null]) {
+			const client = {
+				session: { list: async () => undefined, ...(getValue === undefined ? {} : { get: getValue }) },
+				message: { list: async () => undefined },
+			};
+			const error = captureHostAdapterError(() => createSessionDependencyReadAdapter(client));
+			expect(error.code).toBe("capability-unavailable");
+			expect(error.message).toContain("session.get");
+		}
+	});
+
+	test("returns a SessionDependencyReadPort when all three methods are callable", () => {
+		const { client } = createFakeReadClient();
+		const port = createSessionDependencyReadAdapter(client);
+		expect(typeof port.listSessions).toBe("function");
+		expect(typeof port.listMessages).toBe("function");
+		expect(typeof port.getSession).toBe("function");
+	});
+});
+
+describe("dependency getSession mapping", () => {
+	test("sends exactly { sessionID } and returns the raw direct info unchanged", async () => {
+		const directInfo = sessionInfo("ses_dep");
+		const { client, sessionGetCalls } = createFakeReadClient({ sessionGet: async () => directInfo });
+		const port = createSessionDependencyReadAdapter(client);
+
+		const result = await port.getSession("ses_dep");
+
+		expect(result).toBe(directInfo);
+		expect(sessionGetCalls).toEqual([{ sessionID: "ses_dep" }]);
+		expect(Object.keys(sessionGetCalls[0] as object)).toEqual(["sessionID"]);
+	});
+
+	test("does not unwrap or repair an enveloped response (raw value passes through)", async () => {
+		const enveloped = { data: sessionInfo("ses_dep") };
+		const { client } = createFakeReadClient({ sessionGet: async () => enveloped });
+		const port = createSessionDependencyReadAdapter(client);
+
+		expect(await port.getSession("ses_dep")).toBe(enveloped);
+	});
+
+	test("fails closed on a missing/blank session ID without calling the host", async () => {
+		const { client, sessionGetCalls } = createFakeReadClient();
+		const port = createSessionDependencyReadAdapter(client);
+
+		await expect(port.getSession("")).rejects.toMatchObject({ code: "invalid-request" });
+		await expect(port.getSession(undefined as unknown as string)).rejects.toMatchObject({ code: "invalid-request" });
+		expect(sessionGetCalls.length).toBe(0);
+	});
+
+	test("propagates host errors unchanged", async () => {
+		const hostError = Object.assign(new Error("session get rejected"), { name: "HostApiError", status: 404 });
+		const { client } = createFakeReadClient({
+			sessionGet: async () => {
+				throw hostError;
+			},
+		});
+		const port = createSessionDependencyReadAdapter(client);
+
+		await expect(port.getSession("ses_dep")).rejects.toBe(hostError);
+	});
+
+	test("never fetches dependencies proactively: list reads make no get calls", async () => {
+		const { client, sessionGetCalls } = createFakeReadClient({
+			sessionList: async () => ({ data: [], cursor: {} }),
+			messageList: async () => ({ data: [], cursor: {} }),
+		});
+		const port = createSessionDependencyReadAdapter(client);
+
+		await port.listSessions({ project: PROJECT_ID, limit: 2 });
+		await port.listMessages({ sessionID: "ses_1", limit: 2, order: "asc" });
+		expect(sessionGetCalls.length).toBe(0);
+	});
+});
+
+describe("dependency adapter with the closure collector", () => {
+	test("resolves an external referenced parent through the raw get response and includes its history", async () => {
+		const externalInfo = { ...sessionInfo("ses_ext"), projectID: "proj_other" };
+		const { client, sessionGetCalls } = createScriptedReadClient(
+			[
+				{
+					data: [{ ...sessionInfo("ses_child"), parentID: "ses_ext" }],
+					cursor: null,
+				},
+			],
+			{
+				ses_child: [{ data: [userMessage("msg_child")], cursor: {} }],
+				ses_ext: [{ data: [userMessage("msg_ext")], cursor: {} }],
+			},
+			{ ses_ext: externalInfo },
+		);
+		const port = createSessionDependencyReadAdapter(client);
+		const payload = await collectCheckpointPayloadWithDependencies(port, {
+			projectID: PROJECT_ID,
+			policy: policy(),
+		});
+
+		expect(payload.sessions.map((session) => session.info["id"]).sort()).toEqual(["ses_child", "ses_ext"]);
+		const child = payload.sessions.find((session) => session.info["id"] === "ses_child");
+		const dependency = payload.sessions.find((session) => session.info["id"] === "ses_ext");
+		expect(child?.messages.map((message) => message["id"])).toEqual(["msg_child"]);
+		expect(dependency?.messages.map((message) => message["id"])).toEqual(["msg_ext"]);
+
+		// Only the schema-referenced, not-yet-collected session was fetched, and
+		// exactly `{ sessionID }` was sent.
+		expect(sessionGetCalls).toEqual([{ sessionID: "ses_ext" }]);
 	});
 });

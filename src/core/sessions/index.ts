@@ -1,5 +1,5 @@
 /**
- * SessionPort V1 core session lane (Phase 2).
+ * SessionPort V1 core session lane (Phase 2; dependency closure 2026-10-18).
  *
  * Bounded session enumeration, detached JSON snapshotting, and payload
  * serialization against the approved shared contracts. Session records are
@@ -11,6 +11,19 @@
  * check or normalization is invented. No TUI/OpenCode imports; the host API
  * is reached only through the injected `SessionReadPort`.
  *
+ * Two collectors exist:
+ * - `collectCheckpointPayload` — the unchanged project-only/default collector.
+ *   Restore destination snapshots must keep using exactly this function; it
+ *   never calls `getSession` and never follows references.
+ * - `collectCheckpointPayloadWithDependencies` — the checkpoint collector
+ *   (owner-approved 2026-10-18 amendment): the same seed collection plus a
+ *   recursive, deduplicated, sequential closure over the schema-defined
+ *   `info.parentID`/`info.fork.sessionID` references, each fetched once
+ *   through `SessionDependencyReadPort.getSession` and completed with its full
+ *   message history. Malformed references, wrong-ID/unavailable dependencies,
+ *   unresolved schema message references, cycles, and cap violations fail
+ *   closed before any payload is returned.
+ *
  * Consistency caveat (O-21 / OQ-23): upstream list APIs document no atomic
  * snapshot. A successful collection is a best-effort page sequence, not a
  * consistent point-in-time capture, and this lane invents no retry policy.
@@ -19,11 +32,17 @@
  */
 export { collectCheckpointPayload } from "./collector.ts";
 export type { CollectCheckpointPayloadRequest } from "./collector.ts";
+export { collectCheckpointPayloadWithDependencies } from "./dependencies.ts";
 export { SessionCollectionError } from "./errors.ts";
 export type { SessionCollectionErrorCode } from "./errors.ts";
 export { MESSAGE_PAGE_SIZE_CAP, validateSessionCollectionPolicy } from "./policy.ts";
 export type { SessionCollectionPolicy } from "./policy.ts";
-export type { MessageListPageRequest, SessionListPageRequest, SessionReadPort } from "./port.ts";
+export type {
+	MessageListPageRequest,
+	SessionDependencyReadPort,
+	SessionListPageRequest,
+	SessionReadPort,
+} from "./port.ts";
 export { serializeCheckpointPayload } from "./serialize.ts";
 export { findUnsettledMessageReason } from "./unsettled.ts";
 export type { UnsettledMessageReason } from "./unsettled.ts";
