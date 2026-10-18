@@ -9,3 +9,6 @@
 
 .package-verify-work
 .vscode
+
+# Temporary staged release output (release CI verify -> publish handoff)
+/release-artifact/

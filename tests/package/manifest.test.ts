@@ -11,6 +11,7 @@ import {
 	EXPECTED_LICENSE,
 	EXPECTED_PACKAGE_NAME,
 	EXPECTED_PEER_DEPENDENCIES,
+	EXPECTED_REPOSITORY,
 	EXPECTED_VERSION,
 	FORBIDDEN_MANIFEST_FIELDS,
 	npmHostPeerInstallArgs,
@@ -70,9 +71,33 @@ describe("package manifest invariants", () => {
 			expect(field in manifest).toBe(false);
 		}
 		expect(manifest.publishConfig).toBeUndefined();
-		expect(manifest.repository).toBeUndefined();
 		expect(manifest.homepage).toBeUndefined();
 		expect(manifest.author).toBeUndefined();
+	});
+
+	test("repository metadata is exactly the reviewed GitHub identity", () => {
+		// CI-02: the expected repository object is approved metadata (OIDC
+		// trusted publishing needs repository.url to match the GitHub origin),
+		// but nothing else about the repository field may drift.
+		expect(manifest.repository).toEqual(EXPECTED_REPOSITORY);
+		expect(EXPECTED_REPOSITORY).toEqual({
+			type: "git",
+			url: "git+https://github.com/maivand-rahmani/opencode-session-port.git",
+		});
+		expect(checkManifest(manifest)).toEqual([]);
+	});
+
+	test("malformed or unexpected repository metadata is rejected", () => {
+		const cases: unknown[] = [
+			undefined,
+			"maivand-rahmani/opencode-session-port",
+			{ type: "git", url: "git+https://github.com/attacker/opencode-session-port.git" },
+			{ type: "svn", url: EXPECTED_REPOSITORY.url },
+			{ type: "git", url: EXPECTED_REPOSITORY.url, extra: true },
+		];
+		for (const repository of cases) {
+			expect(checkManifest({ ...manifest, repository })).not.toEqual([]);
+		}
 	});
 
 	test("build hook scripts exist and no publish/post-install hooks are added", () => {

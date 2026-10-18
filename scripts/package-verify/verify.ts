@@ -72,6 +72,15 @@ export const EXPECTED_LICENSE = "MIT";
 export const EXPECTED_DESCRIPTION =
 	"SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.";
 export const EXPECTED_KEYWORDS = ["opencode", "opencode-plugin", "tui", "session", "checkpoint", "restore", "encryption"];
+/**
+ * Reviewed GitHub identity for OIDC trusted publishing (CI-02). The manifest
+ * must declare exactly this object; any other or malformed repository metadata
+ * is rejected. Publishing itself stays outside this verifier.
+ */
+export const EXPECTED_REPOSITORY = {
+	type: "git",
+	url: "git+https://github.com/maivand-rahmani/opencode-session-port.git",
+} as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
 export const EXPECTED_EXPORTS = { "./tui": "./dist/tui.js" } as const;
 /** Compiled bundle produced by `build:tui` (prepack) and shipped via `exports["./tui"]`. */
@@ -135,7 +144,7 @@ export const FORBIDDEN_PACKED_PREFIXES = [
 ];
 export const FORBIDDEN_MANIFEST_FIELDS = [
 	"publishConfig",
-	"repository",
+	// "repository" is approved infra (EXPECTED_REPOSITORY, validated exactly).
 	"author",
 	"contributors",
 	"homepage",
@@ -542,6 +551,17 @@ export function checkManifest(manifest: Record<string, unknown>): string[] {
 	expect(manifest.license === EXPECTED_LICENSE, `manifest license must stay "${EXPECTED_LICENSE}" (got ${String(manifest.license)})`);
 	expect(manifest.description === EXPECTED_DESCRIPTION, `manifest description must stay "${EXPECTED_DESCRIPTION}" (got ${String(manifest.description)})`);
 	expect(sameJson(manifest.keywords, [...EXPECTED_KEYWORDS]), `manifest keywords must stay ${JSON.stringify(EXPECTED_KEYWORDS)}`);
+	const repository = manifest.repository;
+	const repositoryRecord =
+		repository !== null && typeof repository === "object" && !Array.isArray(repository) ? (repository as Record<string, unknown>) : null;
+	const repositoryKeys = repositoryRecord === null ? [] : Object.keys(repositoryRecord).sort();
+	expect(
+		repositoryRecord !== null &&
+			sameJson(repositoryKeys, ["type", "url"]) &&
+			repositoryRecord.type === EXPECTED_REPOSITORY.type &&
+			repositoryRecord.url === EXPECTED_REPOSITORY.url,
+		`manifest repository must be exactly ${JSON.stringify(EXPECTED_REPOSITORY)} with no other keys`,
+	);
 	expect(sameJson(manifest.exports, EXPECTED_EXPORTS), `exports must stay exactly ${JSON.stringify(EXPECTED_EXPORTS)}`);
 	expect(sameJson(manifest.files, [...PACKAGE_FILES_ALLOWLIST]), `files must stay exactly ${JSON.stringify(PACKAGE_FILES_ALLOWLIST)}`);
 	expect(sameJson(manifest.dependencies, EXPECTED_DEPENDENCIES), "dependency pins must stay unchanged");
@@ -843,13 +863,28 @@ async function bunDryRunListing(repoRoot: string, problems: string[], notes: str
 	return files;
 }
 
-const PROBE_SOURCE = `// Synthetic package-verification probe (generated; no secrets, no host/UI/setup calls).
+export const PROBE_SOURCE = `// Synthetic package-verification probe (generated; no secrets, no host/UI/setup calls).
 import path from "node:path";
 import { readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
 import { pathToFileURL } from "node:url";
 
 const [mode, arg1, arg2, arg3] = process.argv.slice(2);
 const facts = { mode };
+
+/**
+ * A package dependency is any specifier that must resolve through
+ * node_modules. Relative/absolute/file: specifiers are local, and Node
+ * builtins (bare like \`fs/promises\` or \`node:\`-prefixed, including
+ * subpaths) are runtime-provided: neither is a package dependency.
+ * isBuiltin is the authoritative builtin check, so lookalike package names
+ * (fs-extra, stream-browserify, scoped names, builtin-like subpaths) are
+ * not suppressed and unknown/unresolvable ones still surface as absent.
+ */
+const isDependencySpecifier = (specifier) => {
+	if (!specifier || specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("node:") || specifier.startsWith("file:")) return false;
+	return !isBuiltin(specifier);
+};
 
 async function load(specifier) {
 	try {
@@ -960,7 +995,7 @@ if (mode === "resolve") {
 			}
 			for (const imported of imports) {
 				const specifier = imported.path;
-				if (!specifier || specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("node:") || specifier.startsWith("file:")) continue;
+				if (!isDependencySpecifier(specifier)) continue;
 				try {
 					const resolved = Bun.resolveSync(specifier, path.dirname(item.file));
 					bare.set(specifier, { resolved, insideConsumer: insideConsumerFor(resolved) });

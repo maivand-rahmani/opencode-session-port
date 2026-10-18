@@ -4,6 +4,10 @@
   "private": false,
   "license": "MIT",
   "description": "SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maivand-rahmani/opencode-session-port.git"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
