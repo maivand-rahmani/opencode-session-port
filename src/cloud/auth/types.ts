@@ -299,8 +299,16 @@ export interface DeviceAuthorization {
  * the caller must pass it to the client's storeCredential API to commit it.
  */
 export type PollAuthorizationResult =
-	| { readonly status: "pending" }
-	| { readonly status: "slow-down" }
+	| {
+			readonly status: "pending";
+			/** Sanitized server Retry-After seconds, when one was supplied. */
+			readonly retryAfterSeconds?: number;
+	  }
+	| {
+			readonly status: "slow-down";
+			/** Required sanitized Retry-After; never replaced by a default. */
+			readonly retryAfterSeconds: number;
+	  }
 	| {
 			readonly status: "approved";
 			readonly credential: TokenCredential;

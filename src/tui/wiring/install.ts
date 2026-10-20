@@ -17,13 +17,18 @@
  *   setup before any command is registered.
  * - Native commands are registered through the existing component-scoped
  *   `installSessionPortCommands` (E39: the keymap layer must live inside the
- *   app-slot component scope). The slot disposer is returned unchanged so the
- *   host can clean up its contribution as the host contract permits; command
+ *   app-slot component scope). The returned cleanup is composite and
+ *   idempotent: it cancels cloud login and disposes the slot immediately, then
+ *   starts controller disposal without making host teardown wait; command
  *   handlers own their errors and report sanitized copy, so a handler never
  *   throws raw host data at the host.
  * - Completed non-empty restore executions are presented through the
  *   designer-owned `showRestoreReportDialog` (aggregate/per-session facts only);
  *   empty results and dialog-display failures keep sanitized toast copy.
+ * - The optional `/sync` command composes the designer-owned cloud-auth flow.
+ *   Its controller, options value, owner lock, keyring, and vault are created
+ *   only on a user action; absent/malformed configuration cannot block
+ *   checkpoint/restore registration.
  *
  * This module statically imports the designer-owned UI modules (password modal
  * and restore report dialog), which import the optional UI peers
@@ -46,6 +51,10 @@ import { requestPassword as showPasswordDialog } from "../ui/password-dialog.tsx
 import { showRestoreReportDialog } from "../ui/restore-report-dialog.tsx";
 import { installSessionPortCommands } from "../ui/sessionport-commands.tsx";
 import { createSessionPortHandlers, type SessionPortPasswordProvider } from "./composition.ts";
+import {
+	createSessionPortCloudAuth,
+	type SessionPortCloudAuthHandlers,
+} from "./cloud-auth.ts";
 import { EXPERIMENTAL_CRYPTO_POLICY_DEFINITION } from "./experimental-profile.ts";
 
 /** Test-only seams; production omits every field. */
@@ -58,6 +67,10 @@ export interface SessionPortInstallOptions {
 	readonly createIdDeriver?: () => Promise<RemappedIdDeriver>;
 	/** Password-provider seam; the default is the designer-owned masked TUI modal. */
 	readonly requestPassword?: SessionPortPasswordProvider;
+	/** Cloud-auth seam; production uses the lazy controller/UI composition. */
+	readonly createCloudAuth?: (
+		context: Plugin.Context,
+	) => SessionPortCloudAuthHandlers;
 }
 
 /** Explicit platform allowlist; unsupported platforms fail closed before any host access. */
@@ -72,7 +85,7 @@ const SUPPORTED_PLATFORMS: readonly string[] = ["win32", "darwin", "linux"];
 export async function installSessionPortWiring(
 	context: Plugin.Context,
 	options: SessionPortInstallOptions = {},
-): Promise<(() => void) | undefined> {
+): Promise<Plugin.Cleanup | undefined> {
 	// Explicit allowlist gate: no registration and no host access on unsupported platforms.
 	if (!SUPPORTED_PLATFORMS.includes(options.platform ?? process.platform)) return undefined;
 
@@ -104,9 +117,72 @@ export async function installSessionPortWiring(
 		readEncryptedArtifact,
 	});
 
+	// Cloud auth is optional: its handlers are cheap closures. The runtime
+	// options value, controller, owner lock, keyring, and vault stay untouched
+	// until the user invokes `/sync`.
+	const cloudAuth = (options.createCloudAuth ?? createSessionPortCloudAuth)(
+		context,
+	);
+
 	// E39: registration must stay inside the existing app-slot/keymap
-	// component scope; the slot disposer is returned unchanged.
-	return installSessionPortCommands(context, handlers);
+	// component scope. Cleanup is composite: cancel any login and dispose the
+	// slot immediately, then await controller-owned resource release. The host
+	// supports an async Cleanup, so every caller waits for the same release
+	// attempt and a failed release is never reported as success.
+	const slotDispose = installSessionPortCommands(context, {
+		checkpoint: handlers.checkpoint,
+		restore: handlers.restore,
+		sync: cloudAuth.sync,
+	});
+
+	let cleanupPromise: Promise<void> | undefined;
+	return (): Promise<void> => {
+		if (cleanupPromise !== undefined) return cleanupPromise;
+
+		// Construct the shared promise before any host/controller call so a
+		// reentrant cleanup (for example from dialog close) cannot start a
+		// second release attempt.
+		let resolveCleanup!: () => void;
+		let rejectCleanup!: (error: unknown) => void;
+		const promise = new Promise<void>((resolve, reject) => {
+			resolveCleanup = resolve;
+			rejectCleanup = reject;
+		});
+		cleanupPromise = promise;
+
+		void performCleanup().then(resolveCleanup, rejectCleanup);
+		return promise;
+	};
+
+	async function performCleanup(): Promise<void> {
+		// Both immediate cleanup steps run even if the other throws.
+		try {
+			cloudAuth.cancel();
+		} catch {
+			// Cancellation is contained; release still runs below.
+		}
+		let slotFailure = false;
+		try {
+			slotDispose();
+		} catch {
+			slotFailure = true;
+		}
+
+		let releaseFailure = false;
+		try {
+			await cloudAuth.dispose();
+		} catch {
+			releaseFailure = true;
+		}
+
+		if (releaseFailure) {
+			// Fail closed: owner release was not proven. Fixed, sanitized copy.
+			throw new Error("Cloud sign-in cleanup failed.");
+		}
+		if (slotFailure) {
+			throw new Error("SessionPort cleanup failed.");
+		}
+	}
 }
 
 /**

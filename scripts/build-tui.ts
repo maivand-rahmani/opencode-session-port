@@ -9,6 +9,7 @@
  * and fails nonzero on any build error or missing output.
  *
  * External specifiers stay unbundled so the host runtime resolves them:
+ * `@napi-rs/keyring` (native OS credential binding; never bundled),
  * `@opencode/plugin` (host plugin API), `@opentui/core` and `@opentui/solid`
  * (host-supplied UI peers), and `solid-js` (host-supplied peer). Runtime
  * dependencies (`libsodium-wrappers-sumo`, `pako`) are intentionally bundled
@@ -36,6 +37,8 @@ const result = await Bun.build({
 	target: "bun",
 	plugins: [solidPlugin],
 	external: [
+		"@napi-rs/keyring",
+		"@napi-rs/keyring/*",
 		"@opencode/plugin",
 		"@opencode/plugin/*",
 		"@opentui/core",

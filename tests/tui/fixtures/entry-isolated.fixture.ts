@@ -149,7 +149,7 @@ describe("SessionPort plugin entrypoint", () => {
 				slotClaim?.render?.({});
 				expect(layerCalls).toBe(1);
 				expect(layerMode).toBe("global");
-				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore"]);
+				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore", "sessionport.sync"]);
 
 				(cleanup as () => void)();
 				expect(disposed).toBe(1);

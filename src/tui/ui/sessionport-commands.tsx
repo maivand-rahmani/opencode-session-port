@@ -3,11 +3,14 @@ import type { Plugin } from "@opencode/plugin/tui";
 export const SESSIONPORT_COMMAND_IDS = {
 	checkpoint: "sessionport.checkpoint",
 	restore: "sessionport.restore",
+	sync: "sessionport.sync",
 } as const;
 
 export interface SessionPortCommandHandlers {
 	readonly checkpoint: (rawInput: string | undefined) => Promise<void>;
 	readonly restore: (rawInput: string | undefined) => Promise<void>;
+	/** Optional in the base seam so existing checkpoint/restore composition stays compatible. */
+	readonly sync?: (rawInput: string | undefined) => Promise<void>;
 }
 
 /** The host APIs this registration seam uses. */
@@ -59,6 +62,19 @@ export function installSessionPortCommands(
 						slash: { name: "restore", arguments: true },
 						run: async (rawInput) => {
 							await handlers.restore(rawInput);
+						},
+					},
+					{
+						id: SESSIONPORT_COMMAND_IDS.sync,
+						title: "Cloud sign-in",
+						description:
+							"Sign in to SessionPort cloud on this device.",
+						group: "SessionPort",
+						bind: false,
+						palette: true,
+						slash: { name: "sync", arguments: true },
+						run: async (rawInput) => {
+							await handlers.sync?.(rawInput);
 						},
 					},
 				],

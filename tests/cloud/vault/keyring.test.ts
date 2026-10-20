@@ -16,6 +16,9 @@ interface FakeOptions {
 	setError?: Error;
 	getError?: Error;
 	deleteError?: Error;
+	setErrorAfterApply?: Error;
+	deleteErrorAfterApply?: Error;
+	constructionError?: Error;
 	getResult?: (key: string) => unknown;
 }
 
@@ -31,6 +34,9 @@ class FakeBackend {
 	setError?: Error;
 	getError?: Error;
 	deleteError?: Error;
+	setErrorAfterApply?: Error;
+	deleteErrorAfterApply?: Error;
+	constructionError?: Error;
 	getResult?: (key: string) => unknown;
 	readonly AsyncEntry: KeyringAsyncEntryConstructor;
 
@@ -40,11 +46,15 @@ class FakeBackend {
 		this.setError = options.setError;
 		this.getError = options.getError;
 		this.deleteError = options.deleteError;
+		this.setErrorAfterApply = options.setErrorAfterApply;
+		this.deleteErrorAfterApply = options.deleteErrorAfterApply;
+		this.constructionError = options.constructionError;
 		this.getResult = options.getResult;
 		const backend = this;
 		this.AsyncEntry = class {
 			private readonly key: string;
 			constructor(service: string, account: string, entryOptions?: KeyringEntryOptions) {
+				if (backend.constructionError !== undefined) throw backend.constructionError;
 				backend.constructed.push({ service, account, options: entryOptions });
 				this.key = JSON.stringify([service, account]);
 			}
@@ -53,6 +63,10 @@ class FakeBackend {
 				backend.events.push(`set-start-${call}`);
 				await backend.beforeSet?.(call);
 				backend.events.push(`set-write-${call}`);
+				if (backend.setErrorAfterApply !== undefined) {
+					backend.store.set(this.key, new Uint8Array(secret));
+					throw backend.setErrorAfterApply;
+				}
 				if (backend.setError !== undefined) throw backend.setError;
 				backend.store.set(this.key, new Uint8Array(secret));
 				backend.events.push(`set-end-${call}`);
@@ -69,6 +83,10 @@ class FakeBackend {
 				const call = (backend.deleteCalls += 1);
 				backend.events.push(`delete-start-${call}`);
 				await backend.beforeDelete?.(call);
+				if (backend.deleteErrorAfterApply !== undefined) {
+					backend.store.delete(this.key);
+					throw backend.deleteErrorAfterApply;
+				}
 				if (backend.deleteError !== undefined) throw backend.deleteError;
 				const existed = backend.store.delete(this.key);
 				backend.events.push(`delete-end-${call}`);
@@ -147,8 +165,8 @@ describe("keyring SecureVault adapter", () => {
 
 		backend.setError = new Error(sentinel);
 		const writeError = await rejection(vault.write(ENTRY, new Uint8Array([1])));
-		expect(writeError.code).toBe("unavailable");
-		expect(writeError.message).toBe("The vault is unavailable.");
+		expect(writeError.code).toBe("outcome-uncertain");
+		expect(writeError.message).toBe("The vault mutation outcome could not be verified.");
 		expect(writeError.message).not.toContain(sentinel);
 		expect(writeError.cause).toBeUndefined();
 
@@ -168,6 +186,78 @@ describe("keyring SecureVault adapter", () => {
 		expect((await rejection(vault.read(ENTRY))).code).toBe("invalid-native-response");
 		backend.getResult = () => [1, 2, 3, 4, 5];
 		expect((await rejection(vault.read(ENTRY))).code).toBe("too-large");
+	});
+
+	test("a rejected set after the mutation actually applied is outcome-uncertain with one exact readback", async () => {
+		const sentinel = "raw-native-applied-set-failure";
+		const backend = new FakeBackend({ setErrorAfterApply: new Error(sentinel) });
+		const vault = createKeyringVault(backend.AsyncEntry, { maxSecretBytes: 8, platform: "win32" });
+
+		const error = await rejection(vault.write(ENTRY, new Uint8Array([4, 5])));
+		expect(error.code).toBe("outcome-uncertain");
+		expect(error.message).toBe("The vault mutation outcome could not be verified.");
+		expect(error.message).not.toContain(sentinel);
+		expect(error.cause).toBeUndefined();
+		expect(backend.setCalls).toBe(1);
+		expect(backend.getCalls).toBe(1);
+		expect(Array.from(backend.store.values().next().value as Uint8Array)).toEqual([4, 5]);
+		expect(
+			backend.constructed.every(
+				(entry) => entry.service === ENTRY.service && entry.account === ENTRY.account,
+			),
+		).toBe(true);
+	});
+
+	test("a failed exact readback after a rejected set remains outcome-uncertain and does not retry", async () => {
+		const sentinel = "raw-native-readback-failure";
+		const backend = new FakeBackend({ setErrorAfterApply: new Error("applied") });
+		const vault = createKeyringVault(backend.AsyncEntry, { maxSecretBytes: 8, platform: "win32" });
+		backend.getError = new Error(sentinel);
+
+		const error = await rejection(vault.write(ENTRY, new Uint8Array([6])));
+		expect(error.code).toBe("outcome-uncertain");
+		expect(error.message).not.toContain(sentinel);
+		expect(backend.setCalls).toBe(1);
+		expect(backend.getCalls).toBe(1);
+	});
+
+	test("a rejected delete after the credential was actually removed is outcome-uncertain with one exact readback", async () => {
+		const sentinel = "raw-native-applied-delete-failure";
+		const backend = new FakeBackend();
+		const vault = createKeyringVault(backend.AsyncEntry, { maxSecretBytes: 8, platform: "win32" });
+		await vault.write(ENTRY, new Uint8Array([9]));
+		backend.constructed.length = 0;
+		backend.getCalls = 0;
+		backend.deleteErrorAfterApply = new Error(sentinel);
+
+		const error = await rejection(vault.remove(ENTRY));
+		expect(error.code).toBe("outcome-uncertain");
+		expect(error.message).toBe("The vault mutation outcome could not be verified.");
+		expect(error.message).not.toContain(sentinel);
+		expect(error.cause).toBeUndefined();
+		expect(backend.deleteCalls).toBe(1);
+		expect(backend.getCalls).toBe(1);
+		expect(backend.store.has(JSON.stringify([ENTRY.service, ENTRY.account]))).toBe(false);
+		expect(
+			backend.constructed.every(
+				(entry) => entry.service === ENTRY.service && entry.account === ENTRY.account,
+			),
+		).toBe(true);
+	});
+
+	test("a constructor failure before mutation stays unavailable and starts no write or delete", async () => {
+		const sentinel = "raw-native-constructor-failure";
+		const backend = new FakeBackend({ constructionError: new Error(sentinel) });
+		const vault = createKeyringVault(backend.AsyncEntry, { maxSecretBytes: 8, platform: "win32" });
+
+		const writeError = await rejection(vault.write(ENTRY, new Uint8Array([1])));
+		expect(writeError.code).toBe("unavailable");
+		expect(writeError.message).not.toContain(sentinel);
+		const removeError = await rejection(vault.remove(ENTRY));
+		expect(removeError.code).toBe("unavailable");
+		expect(backend.setCalls).toBe(0);
+		expect(backend.deleteCalls).toBe(0);
+		expect(backend.getCalls).toBe(0);
 	});
 
 	test("validates config, entries, signals, and the write byte ceiling before mutation", async () => {

@@ -22,7 +22,8 @@ import {
  * the approved L2A dependencies, exact-pinned S3 runtime pins, Prisma
  * client/adapter/tooling, the exact Better Auth runtime pins, and Node test
  * tooling; the web member carries only the exact Next/React pins and their
- * TypeScript tooling. Cloud sources remain outside the 58-file plugin tarball.
+ * TypeScript tooling. Intentional M3 cloud/native sources are shipped inside
+ * the plugin tarball while the cloud/api and cloud/web workspaces stay outside.
  * This is programmatic manifest/config/discovery proof only; no live pack,
  * install, build, network, or runtime listener is exercised here.
  */

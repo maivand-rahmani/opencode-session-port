@@ -82,12 +82,15 @@ export const EXPECTED_REPOSITORY = {
 	url: "git+https://github.com/maivand-rahmani/opencode-session-port.git",
 } as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
+/** Measured `npm pack --dry-run --ignore-scripts --json` file count after intentional cloud/native shipping. */
+export const EXPECTED_PACKED_FILE_COUNT = 69;
 export const EXPECTED_EXPORTS = { "./tui": "./dist/tui.js" } as const;
 /** Compiled bundle produced by `build:tui` (prepack) and shipped via `exports["./tui"]`. */
 export const BUILT_ENTRY_PATH = "dist/tui.js";
 /** External specifiers the compiled bundle must keep unbundled for the host runtime. */
 export const REQUIRED_EXTERNAL_IMPORTS = ["@opencode/plugin", "@opentui/solid", "solid-js"] as const;
 export const EXPECTED_DEPENDENCIES: Record<string, string> = {
+	"@napi-rs/keyring": "2.1.2",
 	"@opencode/plugin": "2.0.22",
 	"libsodium-wrappers-sumo": "0.8.4",
 	pako: "3.0.2",
@@ -107,7 +110,7 @@ export const EXPECTED_DEV_DEPENDENCIES: Record<string, string> = {
 /** Host-supplied UI peers (required; resolved by the host runtime in real installs). */
 export const HOST_PEER_ALLOWLIST = ["solid-js", "@opentui/core", "@opentui/solid", "@opencode/theme"];
 /** Product runtime dependencies that must always resolve from a clean install. */
-export const RUNTIME_DEPENDENCIES = ["@opencode/plugin", "libsodium-wrappers-sumo", "pako"];
+export const RUNTIME_DEPENDENCIES = ["@napi-rs/keyring", "@opencode/plugin", "libsodium-wrappers-sumo", "pako"];
 export const REQUIRED_PACKED_PATHS = [
 	"package.json",
 	"README.md",
@@ -119,6 +122,19 @@ export const REQUIRED_PACKED_PATHS = [
 	// present in every packed tarball (they are reached through src/**).
 	"src/core/sessions/dependencies.ts",
 	"src/core/sessions/references.ts",
+	// M3 native cloud-auth surface is intentionally shipped source (no nested
+	// .npmignore); the compiled entry imports its wiring.
+	"src/tui/wiring/cloud-auth.ts",
+	"src/tui/ui/cloud-auth-flow.ts",
+	"src/tui/ui/cloud-auth-dialog.tsx",
+	"src/cloud/auth/client.ts",
+	"src/cloud/auth/configuration.ts",
+	"src/cloud/auth/controller.ts",
+	"src/cloud/auth/credential-store.ts",
+	"src/cloud/auth/session-owner.ts",
+	"src/cloud/auth/types.ts",
+	"src/cloud/vault/keyring.ts",
+	"src/cloud/vault/types.ts",
 	BUILT_ENTRY_PATH,
 	"tsconfig.json",
 ];
@@ -931,7 +947,7 @@ if (mode === "resolve") {
 	facts.exportTui = resolveFrom("${EXPECTED_PACKAGE_NAME}/tui");
 	facts.rootTui = resolveFrom(path.resolve(installed, "tui"));
 	facts.dependencyLocations = Object.fromEntries(
-		["@opencode/plugin", "libsodium-wrappers-sumo", "pako"].map((name) => [name, locate(name)]),
+		["@napi-rs/keyring", "@opencode/plugin", "libsodium-wrappers-sumo", "pako"].map((name) => [name, locate(name)]),
 	);
 	const host = await import(pathToFileURL(resolveFrom("@opencode/plugin/host")).href);
 	const entries = (() => {

@@ -4,10 +4,16 @@
  * There is no memory/disk/environment fallback.
  *
  * Abort only gates operation start. The inspected evidence does not establish
- * the native AbortSignal placement, so no signal is forwarded. An abort during
- * a native write/delete awaits settlement and one exact readback, then reports
- * `outcome-uncertain` unless the final state is proven. Per adapter instance,
- * one queue serializes each service/account; abort never detaches work.
+ * the native AbortSignal placement, so no signal is forwarded. Once a native
+ * set/delete has started, any rejection is `outcome-uncertain`: the call may
+ * have applied even when it rejected. The adapter performs one best-effort
+ * exact-entry readback that never changes the verdict, then fails closed.
+ * Mutations are never retried and no cleanup write is attempted, so a future
+ * controller must not perform a dangerous rewrite on `outcome-uncertain`.
+ * An abort after a successful mutation awaits settlement and one exact
+ * readback, then reports `outcome-uncertain` unless the final state is proven.
+ * Per adapter instance, one queue serializes each service/account; abort never
+ * detaches work.
  */
 import { VaultError, validateVaultEntry } from "./types.ts";
 import type { SecureVault, VaultEntry, VaultOperationOptions } from "./types.ts";
@@ -120,12 +126,11 @@ class KeyringVault implements SecureVault {
 			try {
 				await native.setSecret(copy);
 			} catch {
-				if (signal?.aborted) {
-					await this.assertWritten(ref, copy);
-					// Native failed after a mutation that may have applied.
-					throw new VaultError("outcome-uncertain");
-				}
-				throw new VaultError("unavailable");
+				// The set started and rejected, so it may have applied. One exact
+				// read-only observation is allowed; the mutation is never retried
+				// and the result cannot turn a rejected native call into success.
+				await this.observeExactEntry(ref);
+				throw new VaultError("outcome-uncertain");
 			}
 			if (signal?.aborted) await this.assertWritten(ref, copy);
 		});
@@ -143,11 +148,10 @@ class KeyringVault implements SecureVault {
 			try {
 				deleted = await native.deleteCredential();
 			} catch {
-				if (signal?.aborted) {
-					await this.readAfterDelete(ref);
-					throw new VaultError("outcome-uncertain");
-				}
-				throw new VaultError("unavailable");
+				// The delete started and rejected, so the entry may already be gone.
+				// Observe the exact entry once, never retry, and fail closed.
+				await this.observeExactEntry(ref);
+				throw new VaultError("outcome-uncertain");
 			}
 			if (typeof deleted !== "boolean") throw new VaultError("outcome-uncertain");
 			if (signal?.aborted) {
@@ -192,6 +196,19 @@ class KeyringVault implements SecureVault {
 			throw new VaultError("unavailable");
 		}
 		return decodeSecret(raw, this.maxSecretBytes);
+	}
+
+	/**
+	 * Best-effort exact-entry read after a rejected mutation. The observation
+	 * is read-only and its failure is swallowed; the caller still reports
+	 * `outcome-uncertain` because a rejected native mutation cannot be trusted.
+	 */
+	private async observeExactEntry(ref: VaultEntry): Promise<void> {
+		try {
+			await this.readNative(ref);
+		} catch {
+			// The verdict remains outcome-uncertain regardless of readback.
+		}
 	}
 
 	private async assertWritten(ref: VaultEntry, expected: Uint8Array): Promise<void> {

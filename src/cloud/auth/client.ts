@@ -74,6 +74,8 @@ export interface NativeAuthRequestOptions {
 interface WireResponse {
 	readonly status: number;
 	readonly text: string;
+	/** Sanitized positive integer Retry-After; null when absent or invalid. */
+	readonly retryAfterSeconds: number | null;
 }
 
 const MAX_ORIGIN_LENGTH = 2048;
@@ -216,6 +218,25 @@ export class NativeAuthClient {
 				const code = readWireErrorCode(response.text);
 				if (code !== null) {
 					const status = POLL_STATUS[code];
+					if (status === "pending") {
+						return response.retryAfterSeconds === null
+							? Object.freeze({ status })
+							: Object.freeze({
+									status,
+									retryAfterSeconds: response.retryAfterSeconds,
+								});
+					}
+					if (status === "slow-down") {
+						// A slow-down without a usable server Retry-After is a
+						// protocol failure, not permission to poll on a default.
+						if (response.retryAfterSeconds === null) {
+							throw new NativeAuthError("invalid-response");
+						}
+						return Object.freeze({
+							status,
+							retryAfterSeconds: response.retryAfterSeconds,
+						});
+					}
 					if (status !== undefined) {
 						return Object.freeze({ status });
 					}
@@ -579,7 +600,13 @@ export class NativeAuthClient {
 					this.maxResponseBytes,
 					controller.signal,
 				);
-				return { status: response.status, text };
+				return {
+					status: response.status,
+					text,
+					retryAfterSeconds: readRetryAfterSeconds(
+						response.headers,
+					),
+				};
 			})();
 
 			return await raceWithAbort(operation, controller.signal);
@@ -885,7 +912,12 @@ function readAllowLoopback(value: unknown): boolean {
 	return value;
 }
 
-function readCanonicalOrigin(
+/**
+ * Canonical origin parser shared with optional configuration validation.
+ * Accepts only an exact HTTPS origin, unless the caller explicitly enables
+ * HTTP on a concrete loopback hostname. No Host/env/default URL is consulted.
+ */
+export function readCanonicalOrigin(
 	value: unknown,
 	allowLoopbackHttp: boolean,
 ): string {
@@ -964,6 +996,13 @@ function isLoopbackHostname(hostname: string): boolean {
 				/^[0-9]{1,3}$/.test(octet) && Number(octet) <= 255,
 		)
 	);
+}
+
+function readRetryAfterSeconds(headers: Headers): number | null {
+	const raw = headers.get("retry-after");
+	if (raw === null || !/^[1-9][0-9]*$/.test(raw)) return null;
+	const seconds = Number(raw);
+	return isPositiveSafeInteger(seconds) ? seconds : null;
 }
 
 function isCredentialStore(

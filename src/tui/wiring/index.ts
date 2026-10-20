@@ -33,6 +33,14 @@ export type {
 export { installSessionPortWiring } from "./install.ts";
 export type { SessionPortInstallOptions } from "./install.ts";
 export {
+	createSessionPortCloudAuth,
+	parseCloudAuthSyncAction,
+} from "./cloud-auth.ts";
+export type {
+	CloudAuthSyncAction,
+	SessionPortCloudAuthHandlers,
+} from "./cloud-auth.ts";
+export {
 	EXPERIMENTAL_COLLECTION_POLICY,
 	EXPERIMENTAL_CRYPTO_POLICY,
 	EXPERIMENTAL_CRYPTO_POLICY_DEFINITION,

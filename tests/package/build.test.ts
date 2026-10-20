@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import {
 	bunCommand,
@@ -38,6 +38,15 @@ describe("compiled TUI bundle", () => {
 		expect(checkBuiltEntry(source)).toEqual([]);
 		expect(source).not.toMatch(/from\s+["']react/);
 		expect(source).not.toContain("jsx-runtime");
+	});
+
+	test("native keyring stays external and no .node binary is bundled or copied", async () => {
+		const source = readFileSync(builtEntry, "utf8");
+		expect(source).toContain("@napi-rs/keyring");
+		expect(readdirSync(path.dirname(builtEntry)).filter((name) => name.endsWith(".node"))).toEqual([]);
+		const buildScript = await Bun.file(path.join(REPO_ROOT, "scripts", "build-tui.ts")).text();
+		expect(buildScript).toContain('"@napi-rs/keyring"');
+		expect(buildScript).toContain('"@napi-rs/keyring/*"');
 	});
 
 	test("./tui export and root shim both target the compiled bundle", async () => {

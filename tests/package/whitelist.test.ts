@@ -7,8 +7,10 @@ import {
 	classifyPackedPath,
 	parseBunPackListing,
 	parseNpmPackJson,
+	EXPECTED_PACKED_FILE_COUNT,
 	PACK_TIMEOUT_MS,
 	REPO_ROOT,
+	REQUIRED_PACKED_PATHS,
 	runCommand,
 } from "../../scripts/package-verify/verify.ts";
 
@@ -65,13 +67,7 @@ describe("packed path classification", () => {
 	test("checkPackedListing reports missing required paths and forbidden entries", () => {
 		expect(
 			checkPackedListing([
-				"tui.ts",
-				"src/tui.ts",
-				"src/tui/wiring/index.ts",
-				"src/core/sessions/dependencies.ts",
-				"src/core/sessions/references.ts",
-				"dist/tui.js",
-				"tsconfig.json",
+				...REQUIRED_PACKED_PATHS,
 				"package.json",
 				"README.md",
 				"LICENSE",
@@ -110,10 +106,9 @@ describe("live dry-run pack listings", () => {
 		expect(files).toContain("LICENSE");
 		expect(files).toContain("dist/tui.js");
 		expect(files).toContain("src/tui.ts");
-		// 58 whitelist-only files: 56-file 0.1.5 baseline plus the two new core
-		// dependency-closure modules (src/core/sessions/dependencies.ts,
-		// src/core/sessions/references.ts).
-		expect(files.length).toBe(58);
+		// Intentional M3 tarball: prior whitelist plus the shipped cloud-auth
+		// source, native wiring, and designer UI source. Measured before pinning.
+		expect(files.length).toBe(EXPECTED_PACKED_FILE_COUNT);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
 		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.7.tgz"))).toBe(false);
@@ -128,7 +123,7 @@ describe("live dry-run pack listings", () => {
 		expect(files).toContain("tui.ts");
 		expect(files).toContain("LICENSE");
 		expect(files).toContain("dist/tui.js");
-		expect(files.length).toBe(58);
+		expect(files.length).toBe(EXPECTED_PACKED_FILE_COUNT);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
 		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.7.tgz"))).toBe(false);

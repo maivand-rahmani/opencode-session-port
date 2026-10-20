@@ -128,14 +128,22 @@ class FakeFetch {
 	};
 }
 
-function json(body: unknown, status = 200): Response {
+function json(
+	body: unknown,
+	status = 200,
+	headers: Record<string, string> = {},
+): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...headers },
 	});
 }
 
-function errorEnvelope(code: string, status = 400): Response {
+function errorEnvelope(
+	code: string,
+	status = 400,
+	headers: Record<string, string> = {},
+): Response {
 	return json(
 		{
 			error: {
@@ -146,6 +154,7 @@ function errorEnvelope(code: string, status = 400): Response {
 			},
 		},
 		status,
+		headers,
 	);
 }
 
@@ -933,9 +942,17 @@ describe("native device authorization polling", () => {
 		];
 
 		for (const [code, status] of cases) {
-			const { client, fake } = setup(() => errorEnvelope(code));
+			const { client, fake } = setup(() =>
+				code === "slow-down"
+					? errorEnvelope(code, 400, { "retry-after": "7" })
+					: errorEnvelope(code),
+			);
 			const result = await client.pollAuthorization(DEVICE_CODE);
-			expect(result).toEqual({ status });
+			expect(result).toEqual(
+				code === "slow-down"
+					? { status, retryAfterSeconds: 7 }
+					: { status },
+			);
 			expect(fake.calls).toHaveLength(1);
 			expect(fake.calls[0]!.url).toBe(
 				`${ORIGIN}/api/native/v1/token`,
@@ -946,6 +963,70 @@ describe("native device authorization polling", () => {
 			});
 			expect(fake.calls).toHaveLength(1);
 		}
+	});
+
+	test("preserves sanitized Retry-After for pending and slow-down", async () => {
+		const { client, fake } = setup((call) =>
+			call === 1
+				? errorEnvelope("authorization-pending", 400, {
+						"retry-after": "2",
+					})
+				: errorEnvelope("slow-down", 400, {
+						"retry-after": "7",
+					}),
+		);
+
+		expect(await client.pollAuthorization(DEVICE_CODE)).toEqual({
+			status: "pending",
+			retryAfterSeconds: 2,
+		});
+		expect(await client.pollAuthorization(DEVICE_CODE)).toEqual({
+			status: "slow-down",
+			retryAfterSeconds: 7,
+		});
+		expect(fake.calls).toHaveLength(2);
+	});
+
+	test("rejects a slow-down without a canonical Retry-After", async () => {
+		const invalidHeaders: Array<string | undefined> = [
+			undefined,
+			"0",
+			"-1",
+			"1.5",
+			"01",
+			"+2",
+			"abc",
+			"Wed, 21 Oct 2015 07:28:00 GMT",
+			"9".repeat(40),
+		];
+
+		for (const retryAfter of invalidHeaders) {
+			const { client, fake } = setup(() =>
+				errorEnvelope(
+					"slow-down",
+					400,
+					retryAfter === undefined
+						? {}
+						: { "retry-after": retryAfter },
+				),
+			);
+			await expectError(
+				client.pollAuthorization(DEVICE_CODE),
+				"invalid-response",
+			);
+			expect(fake.calls).toHaveLength(1);
+		}
+	});
+
+	test("ignores a non-canonical Retry-After on a pending response", async () => {
+		const { client } = setup(() =>
+			errorEnvelope("authorization-pending", 400, {
+				"retry-after": "1.5",
+			}),
+		);
+		expect(await client.pollAuthorization(DEVICE_CODE)).toEqual({
+			status: "pending",
+		});
 	});
 
 	test("returns an approved credential without persisting it", async () => {

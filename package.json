@@ -39,6 +39,7 @@
     "prepack": "bun run build:tui"
   },
   "dependencies": {
+    "@napi-rs/keyring": "2.1.2",
     "@opencode/plugin": "2.0.22",
     "libsodium-wrappers-sumo": "0.8.4",
     "pako": "3.0.2"
