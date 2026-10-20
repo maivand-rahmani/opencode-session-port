@@ -1,0 +1,9 @@
+# Hash-pinned vendor/auth artifacts must keep their exact bytes on checkout.
+# `-text` disables Git's text/EOL normalization for these paths only; it is not
+# a repository-wide formatting policy. Do not replace with `eol=lf`: the vendor
+# .prisma sources contain mixed CRLF/LF line endings, so forcing LF would change
+# checkout bytes and invalidate the recorded content hashes.
+cloud/api/prisma/auth.generated.prisma -text
+cloud/api/prisma/schema.prisma -text
+cloud/api/prisma/drafts/0001_vendor_auth.sql -text
+cloud/api/prisma/migrations/**/migration.sql -text

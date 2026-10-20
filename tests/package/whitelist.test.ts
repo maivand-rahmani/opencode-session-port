@@ -96,6 +96,8 @@ describe("packed path classification", () => {
 
 describe("live dry-run pack listings", () => {
 	const npmAvailable = Bun.which("npm") !== null;
+	// Let the bounded pack command finish (including timeout cleanup) before the test runner stops it.
+	const livePackTestTimeoutMs = PACK_TIMEOUT_MS + 30_000;
 
 	test.skipIf(!npmAvailable)("npm pack --dry-run honors the allowlist, ships dist/tui.js, and writes no tarball", async () => {
 		const result = await runCommand("npm", ["pack", "--dry-run", "--json"], REPO_ROOT, PACK_TIMEOUT_MS);
@@ -114,8 +116,8 @@ describe("live dry-run pack listings", () => {
 		expect(files.length).toBe(58);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.6.tgz"))).toBe(false);
-	});
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.7.tgz"))).toBe(false);
+	}, livePackTestTimeoutMs);
 
 	test("bun pm pack --dry-run honors the allowlist and writes no tarball", async () => {
 		const result = await runCommand(bunCommand(), ["pm", "pack", "--dry-run"], REPO_ROOT, PACK_TIMEOUT_MS);
@@ -129,6 +131,6 @@ describe("live dry-run pack listings", () => {
 		expect(files.length).toBe(58);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
-		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.6.tgz"))).toBe(false);
-	});
+		expect(existsSync(path.join(REPO_ROOT, "opencode-session-port-0.1.7.tgz"))).toBe(false);
+	}, livePackTestTimeoutMs);
 });

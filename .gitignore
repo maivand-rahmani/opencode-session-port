@@ -9,6 +9,16 @@
 
 .package-verify-work
 .vscode
+.playwright-mcp
+
 
 # Temporary staged release output (release CI verify -> publish handoff)
 /release-artifact/
+
+# Cloud workspace generated output (dependencies, API bundle, Next.js build)
+cloud/*/node_modules/
+cloud/api/dist/
+cloud/web/.next/
+
+# Prisma generated client (derived from cloud/api/prisma/schema.prisma)
+cloud/api/prisma/generated/client/

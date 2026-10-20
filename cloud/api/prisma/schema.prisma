@@ -1,0 +1,498 @@
+
+generator client {
+  provider = "prisma-client"
+  output   = "generated/client"
+  moduleFormat = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                 String              @id
+  name               String
+  email              String
+  emailVerified      Boolean             @default(false)
+  image              String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  sessions           Session[]
+  accounts           Account[]
+  oauthclients       OauthClient[]
+  oauthrefreshtokens OauthRefreshToken[]
+  oauthaccesstokens  OauthAccessToken[]
+  oauthconsents      OauthConsent[]
+  projects           Project[]
+  quota              UserQuota?
+  devices            Device[]
+  revisions          Revision[]
+  uploads            Upload[]
+  nativeDeviceGrants NativeDeviceGrant[]
+  nativePendingAuthorizations NativePendingAuthorization[] @relation("NativePendingApprovedUser")
+
+  @@unique([email])
+  @@map("user")
+}
+
+model Session {
+  id                 String              @id
+  expiresAt          DateTime
+  token              String
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  ipAddress          String?
+  userAgent          String?
+  userId             String
+  user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  oauthrefreshtokens OauthRefreshToken[]
+  oauthaccesstokens  OauthAccessToken[]
+
+  @@unique([token])
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model Jwks {
+  id         String    @id
+  publicKey  String
+  privateKey String
+  createdAt  DateTime
+  expiresAt  DateTime?
+  alg        String?
+  crv        String?
+
+  @@map("jwks")
+}
+
+model OauthClient {
+  id                               String                @id
+  clientId                         String
+  clientSecret                     String?
+  clientDiscoveryId                String?
+  disabled                         Boolean?              @default(false)
+  skipConsent                      Boolean?
+  enableEndSession                 Boolean?
+  subjectType                      String?
+  scopes                           String[]
+  clientCredentialsScopes          String[]              @default([])
+  userId                           String?
+  user                             User?                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt                        DateTime?
+  updatedAt                        DateTime?
+  name                             String?
+  uri                              String?
+  icon                             String?
+  contacts                         String[]
+  tos                              String?
+  policy                           String?
+  softwareId                       String?
+  softwareVersion                  String?
+  softwareStatement                String?
+  redirectUris                     String[]
+  postLogoutRedirectUris           String[]
+  backchannelLogoutUri             String?
+  backchannelLogoutSessionRequired Boolean?
+  tokenEndpointAuthMethod          String?
+  applicationType                  String?
+  jwks                             String?
+  jwksUri                          String?
+  grantTypes                       String[]
+  responseTypes                    String[]
+  requirePKCE                      Boolean?
+  dpopBoundAccessTokens            Boolean?              @default(false)
+  referenceId                      String?
+  metadata                         Json?
+  oauthclientresources             OauthClientResource[]
+  oauthrefreshtokens               OauthRefreshToken[]
+  oauthaccesstokens                OauthAccessToken[]
+  oauthconsents                    OauthConsent[]
+
+  @@unique([clientId])
+  @@index([userId])
+  @@map("oauthClient")
+}
+
+model OauthResource {
+  id                            String                @id
+  identifier                    String
+  name                          String
+  accessTokenTtl                Int?
+  refreshTokenTtl               Int?
+  signingAlgorithm              String?
+  signingKeyId                  String?
+  allowedScopes                 String[]
+  customClaims                  Json?
+  dpopBoundAccessTokensRequired Boolean?              @default(false)
+  disabled                      Boolean?              @default(false)
+  createdAt                     DateTime?
+  updatedAt                     DateTime?
+  policyVersion                 Int?                  @default(1)
+  metadata                      Json?
+  oauthclientresources          OauthClientResource[]
+
+  @@unique([identifier])
+  @@map("oauthResource")
+}
+
+model OauthClientResource {
+  id            String        @id
+  clientId      String
+  oauthclient   OauthClient   @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  resourceId    String
+  oauthresource OauthResource @relation(fields: [resourceId], references: [identifier], onDelete: Cascade)
+  metadata      Json?
+  createdAt     DateTime?
+
+  @@unique([clientId, resourceId], map: "oauthClientResource_clientId_resourceId_uidx")
+  @@index([clientId])
+  @@index([resourceId])
+  @@map("oauthClientResource")
+}
+
+model OauthRefreshToken {
+  id                      String             @id
+  token                   String
+  clientId                String
+  oauthclient             OauthClient        @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  sessionId               String?
+  session                 Session?           @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  userId                  String
+  user                    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  authorizationCodeId     String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  expiresAt               DateTime
+  createdAt               DateTime
+  revoked                 DateTime?
+  rotatedAt               DateTime?
+  rotationReplayResponse  String?
+  rotationReplayExpiresAt DateTime?
+  authTime                DateTime?
+  confirmation            Json?
+  scopes                  String[]
+  oauthaccesstokens       OauthAccessToken[]
+
+  @@unique([token])
+  @@index([clientId])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([authorizationCodeId])
+  @@map("oauthRefreshToken")
+}
+
+model OauthAccessToken {
+  id                      String             @id
+  token                   String
+  clientId                String
+  oauthclient             OauthClient        @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  sessionId               String?
+  session                 Session?           @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  userId                  String?
+  user                    User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  authorizationCodeId     String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  refreshId               String?
+  oauthrefreshtoken       OauthRefreshToken? @relation(fields: [refreshId], references: [id], onDelete: Cascade)
+  expiresAt               DateTime
+  createdAt               DateTime
+  revoked                 DateTime?
+  confirmation            Json?
+  scopes                  String[]
+
+  @@unique([token])
+  @@index([clientId])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([authorizationCodeId])
+  @@index([refreshId])
+  @@map("oauthAccessToken")
+}
+
+model OauthConsent {
+  id                      String      @id
+  clientId                String
+  oauthclient             OauthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  userId                  String?
+  user                    User?       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  scopes                  String[]
+  createdAt               DateTime
+  updatedAt               DateTime
+
+  @@index([clientId])
+  @@index([userId])
+  @@map("oauthConsent")
+}
+
+model OauthClientAssertion {
+  id        String   @id
+  expiresAt DateTime
+
+  @@map("oauthClientAssertion")
+}
+
+model DeviceCode {
+  id              String    @id
+  deviceCode      String
+  userCode        String
+  userId          String?
+  expiresAt       DateTime
+  status          String
+  lastPolledAt    DateTime?
+  pollingInterval Int?
+  clientId        String?
+  scope           String?
+  resources       String[]
+  oauthClientId   String?
+
+  @@unique([deviceCode], map: "deviceCode_deviceCode_uidx")
+  @@unique([userCode], map: "deviceCode_userCode_uidx")
+  @@map("deviceCode")
+}
+
+enum ProjectState {
+  active
+  purged
+}
+
+model Project {
+  projectID      String       @id @db.Uuid
+  userID         String
+  user           User         @relation(fields: [userID], references: [id], onDelete: Restrict)
+  encryptedLabel Bytes?
+  state          ProjectState @default(active)
+  nextSeq        BigInt       @default(1)
+  createdAt      DateTime     @default(now())
+
+  revisions Revision[]
+  heads     ProjectHead[]
+  uploads   Upload[]
+
+  @@index([userID, state])
+}
+
+model UserQuota {
+  userID        String   @id
+  user          User     @relation(fields: [userID], references: [id], onDelete: Restrict)
+  limitBytes    BigInt
+  usedBytes     BigInt   @default(0)
+  reservedBytes BigInt   @default(0)
+  updatedAt     DateTime @updatedAt
+}
+
+enum UploadState {
+  uploading
+  finalizing
+  ready
+  deleting
+  deleted
+  expired
+}
+
+model Device {
+  id         String   @id @db.Uuid
+  userID     String
+  user       User     @relation(fields: [userID], references: [id], onDelete: Restrict)
+  grantID    String   @unique @db.Uuid
+  grant      NativeDeviceGrant @relation(fields: [grantID], references: [id], onDelete: Restrict)
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime?
+
+  revisions Revision[]
+  uploads   Upload[]
+
+  @@index([userID])
+}
+
+enum NativeGrantState {
+  active
+  revoked
+}
+
+model NativeDeviceGrant {
+  id        String           @id @db.Uuid
+  userID    String
+  user      User             @relation(fields: [userID], references: [id], onDelete: Restrict)
+  status    NativeGrantState @default(active)
+  audience  String
+  resource  String
+  scopes    String[]
+  createdAt DateTime         @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  device       Device?
+  accessTokens NativeAccessToken[]
+  refreshTokens NativeRefreshToken[]
+
+  @@index([userID, status])
+  @@index([status, expiresAt])
+}
+
+enum NativeAuthorizationState {
+  pending
+  approved
+  denied
+  consumed
+}
+
+model NativePendingAuthorization {
+  id                    String                   @id @db.Uuid
+  deviceCodeFingerprint String                   @unique
+  humanCodeDigest       Bytes
+  humanCodeKeyID        String
+  status                NativeAuthorizationState @default(pending)
+  approvedUserID        String?
+  approvedUser          User?                    @relation("NativePendingApprovedUser", fields: [approvedUserID], references: [id], onDelete: Restrict)
+  audience              String
+  resource              String
+  scopes                String[]
+  createdAt             DateTime                 @default(now())
+  expiresAt             DateTime
+  lastPolledAt          DateTime?
+  nextPollAt            DateTime?
+  pollIntervalSeconds   Int
+  consumedAt            DateTime?
+
+  @@unique([humanCodeKeyID, humanCodeDigest])
+  @@index([status, expiresAt])
+  @@index([expiresAt])
+}
+
+model NativeAccessToken {
+  id          String            @id @db.Uuid
+  fingerprint String            @unique
+  grantID     String            @db.Uuid
+  grant       NativeDeviceGrant @relation(fields: [grantID], references: [id], onDelete: Restrict)
+  createdAt   DateTime          @default(now())
+  expiresAt   DateTime
+
+  @@index([grantID])
+  @@index([expiresAt])
+}
+
+model NativeRefreshToken {
+  id          String             @id @db.Uuid
+  fingerprint String             @unique
+  grantID     String             @db.Uuid
+  grant       NativeDeviceGrant  @relation(fields: [grantID], references: [id], onDelete: Restrict)
+  createdAt   DateTime           @default(now())
+  expiresAt   DateTime
+  spentAt     DateTime?
+  successorID String?            @unique @db.Uuid
+  successor   NativeRefreshToken? @relation("NativeRefreshRotation", fields: [successorID], references: [id], onDelete: Restrict)
+  predecessor NativeRefreshToken? @relation("NativeRefreshRotation")
+
+  @@index([grantID])
+  @@index([expiresAt])
+}
+
+model Revision {
+  revisionID       String    @id @db.Uuid
+  projectID        String    @db.Uuid
+  project          Project   @relation(fields: [projectID], references: [projectID], onDelete: Restrict)
+  userID           String
+  user             User      @relation(fields: [userID], references: [id], onDelete: Restrict)
+  parentRevisionID String?   @db.Uuid
+  parentRevision   Revision? @relation("RevisionParent", fields: [parentRevisionID], references: [revisionID], onDelete: Restrict)
+  childRevisions   Revision[] @relation("RevisionParent")
+  seq              BigInt
+  deviceID         String    @db.Uuid
+  device           Device    @relation(fields: [deviceID], references: [id], onDelete: Restrict)
+  keyEpoch         Int
+  sizeBytes        BigInt
+  ciphertextSha256 Bytes
+  storageObjectKey String    @unique
+  storageUpload    Upload    @relation("RevisionStorageObject", fields: [storageObjectKey], references: [finalKey], onDelete: Restrict)
+  createdAt        DateTime  @default(now())
+
+  heads            ProjectHead[]
+  dependentUploads Upload[]    @relation("UploadParentRevision")
+
+  @@unique([projectID, seq])
+  @@index([parentRevisionID])
+  @@index([userID])
+  @@index([deviceID])
+}
+
+model ProjectHead {
+  projectID  String   @db.Uuid
+  revisionID String   @db.Uuid
+  project    Project  @relation(fields: [projectID], references: [projectID], onDelete: Restrict)
+  revision   Revision @relation(fields: [revisionID], references: [revisionID], onDelete: Restrict)
+
+  @@id([projectID, revisionID])
+  @@index([revisionID])
+}
+
+model Upload {
+  uploadID         String       @id @db.Uuid
+  userID           String
+  user             User         @relation(fields: [userID], references: [id], onDelete: Restrict)
+  projectID        String       @db.Uuid
+  project          Project      @relation(fields: [projectID], references: [projectID], onDelete: Restrict)
+  deviceID         String       @db.Uuid
+  device           Device       @relation(fields: [deviceID], references: [id], onDelete: Restrict)
+  revisionID       String       @db.Uuid
+  parentRevisionID String?      @db.Uuid
+  parentRevision   Revision?    @relation("UploadParentRevision", fields: [parentRevisionID], references: [revisionID], onDelete: Restrict)
+  keyEpoch         Int
+  stagingKey       String       @unique
+  finalKey         String?      @unique
+  state            UploadState  @default(uploading)
+  sizeBytes        BigInt
+  ciphertextSha256 Bytes
+  leaseToken       BigInt       @default(0)
+  leaseOwner       String?
+  leaseExpiresAt   DateTime?
+  expiresAt        DateTime
+  graceExpiresAt   DateTime?
+  createdAt        DateTime     @default(now())
+  completedAt      DateTime?
+
+  committedRevision Revision? @relation("RevisionStorageObject")
+
+  @@index([userID, state])
+  @@index([projectID, revisionID])
+  @@index([state, expiresAt])
+  @@index([state, leaseExpiresAt])
+}

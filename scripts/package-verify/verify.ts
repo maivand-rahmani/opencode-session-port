@@ -67,7 +67,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const REPO_ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 export const SCRATCH_DIR_NAME = ".package-verify-work";
 export const EXPECTED_PACKAGE_NAME = "opencode-session-port";
-export const EXPECTED_VERSION = "0.1.6";
+export const EXPECTED_VERSION = "0.1.7";
 export const EXPECTED_LICENSE = "MIT";
 export const EXPECTED_DESCRIPTION =
 	"SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.";
