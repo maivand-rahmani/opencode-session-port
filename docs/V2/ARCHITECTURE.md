@@ -3,9 +3,11 @@
 > **DRAFT -- awaiting owner approval. Architectural reference; local source implementation exists, but no deployment or runtime acceptance is claimed.**
 > SessionPort 0.2.0 (optional cloud sync/continuity) remains a proposed design. The local
 > checkpoint/restore engine described by the archived V1 record exists in this repository. Bounded
-> M1–M3 cloud source now exists locally (`cloud/api`, `cloud/web`, and an unwired client/vault seam),
-> but no milestone is accepted complete, auth is not enabled, and no application-database,
-> storage/upload, host, platform, or deployment proof exists. Values marked candidate/proposed are
+> M1–M3 cloud source now exists locally (`cloud/api`, `cloud/web`, the wired native client/vault, and
+> the `/sync` TUI surface), but no milestone is accepted complete, auth is not enabled, and no
+> application-database, storage/upload, host, platform, or deployment proof exists. Actual host
+> rendering/focus/Esc, live OAuth/API login, authoritative session/CSRF behavior, and real
+> host/OAuth/API/vault end-to-end flows remain unverified. Values marked candidate/proposed are
 > inputs to their gates, not defaults or promises. Standing safety constraints in `AGENTS.md` remain
 > in force.
 > Companion documents: [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md), [SECURITY.md](SECURITY.md),
@@ -80,16 +82,16 @@ Existing (unchanged by this design):
 | Path | Role | Status |
 | --- | --- | --- |
 | `src/core/**` | Local engine: collector, dependency closure, container, restore planner, identity derivation | Existing; local engine stays untouched |
-| `src/tui/**` | TUI wiring: command registration, adapters, orchestration, artifacts, reports | Existing; cloud client seam is intentionally not wired in yet |
+| `src/tui/**` | TUI wiring: command registration, adapters, orchestration, artifacts, reports | Existing; cloud native surface is wired through `/sync` and optional configuration |
 | `src/tui/wiring/experimental-profile.ts` | Experimental crypto/collection profile (`sessionport-experimental-win-v1`) | Existing; values reused as candidates, not inherited approvals |
 | `.package-verify-work` and package allowlist | Publication packaging | Existing; pack allowlist must be preserved |
 
-Local source (implemented, intentionally unwired from the TUI; runtime acceptance pending):
+Local source (implemented and wired into the native TUI surface; runtime acceptance pending):
 
 | Path | Role | Status |
 | --- | --- | --- |
-| `src/cloud/auth` | Native device-authorization client and credential-store port; no plaintext fallback | Local source; 60 fake-client tests; no live network, TUI wiring, or cross-process lock |
-| `src/cloud/vault` | Injectable keyring adapter; fails closed when unavailable | Local source; 13 fake tests; OS binding not installed and no OS-store proof |
+| `src/cloud/auth` | Native device-authorization client and credential-store port; no plaintext fallback | Local source; 60 fake-client tests; native TUI wiring via `/sync`; cooperative cross-process owner lock; live network/OAuth and server session/CSRF runtime unverified |
+| `src/cloud/vault` | Injectable keyring adapter; fails closed when unavailable | Local source; 13 fake tests; exact external `@napi-rs/keyring@2.1.2` pin; Windows synthetic probe passed (one UUID entry, 32-byte read/delete, final absent); no locked-store, restart, macOS/Linux, or general AUTH-02 proof |
 | `cloud/api` | Fastify/Prisma service source; health-only by default, cloud mode explicit | Local source; no deployment, application DB, enabled auth, or storage mount |
 | `cloud/web` | Next.js App Router thin adapters over `_app/_pages/widgets/features/entities/shared` | Local source; minimal login/device/devices surface; no dashboard |
 
@@ -116,8 +118,9 @@ generic packages, no Redis, no queue, no websockets):
 | `cloud/web` | Next.js app on Vercel; thin same-origin BFF to the API; GitHub OAuth callback target; no independent business logic | Local FSD source; 31 tests + Next 16.4.2 build; browser QA synthetic only |
 
 Workspace mechanics: `cloud/api` and `cloud/web` are npm workspaces while Bun remains the root
-plugin toolchain. The root plugin's published pack allowlist (`files` in `package.json`) is preserved;
-cloud code is excluded from the plugin tarball (REPO-01, completed).
+plugin toolchain. The published 0.1.6 pack allowlist remains 58 files; the owner-approved 0.1.7
+candidate boundary intentionally updates to 69 files for M3, so cloud source ships intentionally
+(`src/cloud/.npmignore` deleted), with no `.node` binary and no plaintext tokens (REPO-01 completed).
 
 ## 4. Data flows
 
@@ -288,7 +291,7 @@ The ROADMAP document is authoritative for these IDs; this table mirrors the agre
 | PREP-01 | Owner review of the 0.2.0 direction and these references | All 0.2.0 implementation |
 | HOST-01 | Host release gate: same-ID semantics, failed/partial writes, concurrency, restart ambiguity, reference mapping, commands/events contract (source-bound; live-only; re-subscribe + reconcile), and safe native APIs (missing-session import first, then validated conditional update for existing sessions); no cloud native import or update before the gate | All cloud native imports/updates; automatic continuity; the 0.2.0 release |
 | CRYPTO-01 | Cloud crypto policy selection and resource/review gate (KDF profile, caps including the small key-wrapper payload, per-object KDF overhead measurement, no new cipher core) | Sealing cloud payloads and the key bundle |
-| REPO-01 | Workspace/package mechanics: `cloud/api` + `cloud/web` npm workspaces with the root plugin pack allowlist preserved | Cloud code excluded from the plugin tarball |
+| REPO-01 | Workspace/package mechanics: `cloud/api` + `cloud/web` npm workspaces with the published 0.1.6 pack allowlist preserved and the owner-approved 69-file M3 candidate boundary intentional | Cloud source intentionally shipped in the candidate (no `.node`, no plaintext tokens); published 0.1.6 boundary preserved |
 | AUTH-01 | Library/provider feasibility: BetterAuth + `@better-auth/oauth-provider` pinned versions, migrations, canonical issuer, grants | Device login |
 | AUTH-02 | Device + vault: credential-store dependency, encrypted state/outbox keys, fail-closed behavior when unavailable; the encrypted outbox is covered under SYNC-01 | Credential durability and outbox safety |
 | STORE-01 | Storage provider capability validation: Post Policy content-length range + checksum, HEAD, conditional copy, immutable per-lease final keys; unsupported providers blocked, never silently weakened | Uploads |
@@ -305,7 +308,7 @@ The ROADMAP document is authoritative for these IDs; this table mirrors the agre
 | Project-scoped collection, recursive `parentID`/`fork.sessionID` dependency closure, full histories, unsettled rejection | Existing local code; synthetic tests only | `src/core/sessions/collector.ts`, `src/core/sessions/dependencies.ts`, `src/core/sessions/unsettled.ts`, `src/core/sessions/references.ts`; archived decision-log 2026-10-18 entries | - |
 | Restore planner: conflict remap, never overwrite, sequential import, partial-failure reporting, feature detection | Existing local code; synthetic tests only; bounded host observations for import callability | `src/core/restore/planner.ts`, `src/core/restore/identity.ts`, `src/tui/adapters/session-import.ts`, `src/tui/orchestration/restore-execution.ts`; archived decision-log O-05/O-06/O-12/O-16/O-22 | HOST-01 for apply semantics |
 | Crypto container: libsodium Argon2id13, 16-byte salt, XChaCha20-Poly1305 secretstream, gzip | Existing local code; experimental profile only; no production validation | `src/core/crypto/{container,envelope,kdf,gzip-stream,policy}.ts`; `src/tui/wiring/experimental-profile.ts`; archived decision-log T-09/T-11, O-01/O-02/O-03 | CRYPTO-01 |
-| Cloud API/web and native-auth/browser source | Local source; partial M1–M3; no deployment or runtime acceptance | `cloud/api`, `cloud/web`, `src/cloud/auth`, `src/cloud/vault`; [M1–M3 contract](../evidence/m1-m3-schema-contract.md) | API-01..03, AUTH-01/02, WEB-01 |
+| Cloud API/web and native-auth/browser source | Local source; partial M1–M3; M3 TUI wired; no deployment or runtime acceptance | `cloud/api`, `cloud/web`, `src/cloud/auth`, `src/cloud/vault`, `src/tui`; [M3 evidence](../evidence/m3-native-source-20261020.md), [M1–M3 contract](../evidence/m1-m3-schema-contract.md) | API-01..03, AUTH-01/02, WEB-01 |
 | Cloud crypto/state/sync/host | Proposed; not created | This document and companions | CRYPTO-01, SYNC-01..04 |
 | M4 upload/download/key-bundle | Local fail-closed source; routes not mounted; provider capability unproven | Upload service/repository source | STORE-01/02 |
 | Automatic continuity | Blocked | Section 8 | HOST-01 |

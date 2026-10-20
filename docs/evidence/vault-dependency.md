@@ -1,10 +1,24 @@
 # AUTH-02 Vault Dependency — Preparation-Only Candidate Inspection
 
-Status: **IN PROGRESS — PREPARATION ONLY. CANDIDATE INSPECTED READ-ONLY; NOT SELECTED OR PINNED. NO NATIVE BINDING LOADED, NO OS CREDENTIAL STORE READ/WRITTEN, NO AUTH-02 PASS, NO SECURE-VAULT VALIDATION CLAIM.**
+Status: **IN PROGRESS — CANDIDATE NOW PINNED FOR BOUNDED EXPERIMENTAL M3 SOURCE AFTER A WINDOWS SYNTHETIC PROBE PASS; NO AUTH-02 PASS, CROSS-PLATFORM, LOCKED-STORE, RESTART, OR SUPPORT CLAIM.**
 
-Recorded: 2026-10-19. Validation owner: orchestrator. This record captures the accepted
-read-only, source/metadata inspection of a possible keyring-class dependency for AUTH-02. It
-does not record an install, native binding load, OS credential-store query, synthetic
+> **Current amendment (2026-10-20):** `@napi-rs/keyring@2.1.2` is now selected and pinned as an
+> exact external dependency for the bounded experimental M3 source, after a Windows x64 / Bun
+> 1.3.10 synthetic probe passed: one exact UUID-derived entry, precheck absent, 32-byte readback
+> matched, delete settled, final read absent, no retry or manual cleanup. PowerShell returned a
+> null process `ExitCode` for the probe; the structured source-path result was `outcome=pass`, but
+> exit zero was **not directly observed as an OS process exit code**. This is not a general
+> AUTH-02 pass, cross-platform or support proof, locked-store/restart/persistence proof, or
+> production-credential proof. See [vault-windows-synthetic-20261020.md](vault-windows-synthetic-20261020.md).
+> Cross-process cooperating SessionPort owner locking is now implemented and was exercised with 14
+> actual Windows child invocations (27 focused tests, 1 POSIX-only skip initially); it does not
+> fence non-cooperative actors and has no automatic crash-stale break, and the existing
+> private-ACL/symlink limits remain explicit. The dated preparation-only record below is retained
+> as historical, not rewritten.
+
+Recorded: 2026-10-19 (preparation-only sections). Current amendment: 2026-10-20. Validation owner: orchestrator. The dated 2026-10-19 record below captures the accepted
+read-only, source/metadata inspection of a possible keyring-class dependency for AUTH-02. That
+inspection did not record an install, native binding load, OS credential-store query, synthetic
 credential write, runtime platform/Bun probe, or end-to-end device-auth flow. The broad
 2026-10-19 local-work authorization does not authorize production credentials or actual OS
 store access while the owner is away, and it does not turn this preparation into AUTH-02
@@ -101,7 +115,7 @@ source capture or quoted implementation code.
   enumeration is not an acceptable recovery mechanism. Actual NAPI-internal cancellation
   behavior remains unresolved.
 
-## 4. Runtime evidence not obtained
+## 4. Runtime evidence not obtained (dated 2026-10-19; superseded by the current amendment)
 
 The following are intentionally **not** claimed because no runtime probe was performed:
 
@@ -167,7 +181,9 @@ uncertain outcome is not a probe-auth success and must not be converted into a p
 
 ## 6. Open evidence boundaries and decisions
 
-- Candidate selection and exact dependency pinning are **not** decided.
+- Candidate selection and exact dependency pinning were not decided on 2026-10-19; the exact
+  `2.1.2` pin was selected on 2026-10-20 for the bounded experimental M3 source only (see the
+  current amendment above). It is not a general AUTH-02 or cross-platform selection.
 - Windows, macOS, Linux, and Bun runtime compatibility are unverified.
 - Linux Secret Service persistence/availability versus the non-persistent `keyutils` default
   requires an explicit product decision; no default is promoted here.
