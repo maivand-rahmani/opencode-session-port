@@ -7,7 +7,7 @@
  * value below.
  *
  * These are the explicitly selected, owner-authorized experimental values
- * recorded in `docs/v1/decision-log.md` (2026-10-11 entries) for the Windows
+ * recorded in `docs/archive/v1/decision-log.md` (2026-10-11 entries) for the Windows
  * experimental build; they now apply unchanged to the experimental macOS/Linux
  * enablement, which is NOT host-tested. They are NOT a production approval, not
  * a format freeze, and not a general memory budget, compatibility, or support

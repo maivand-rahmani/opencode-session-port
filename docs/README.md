@@ -1,46 +1,45 @@
-# SessionPort Docs — V1 Implementation Baseline
+# SessionPort Documentation
 
-> **APPROVED FOR IMPLEMENTATION — NOT FROZEN.**
+> **V1 documentation is archived.** V1 is a historical record, not the active V2 specification. V2 documentation remains a proposed draft (full owner review unrecorded), with local source implementation for bounded M1–M3 slices and no deployment or runtime acceptance.
 
-The owner approved the V1 implementation baseline on 2026-10-09. The workspace [README](../README.md) gives the project summary; this page indexes the set and records approval/freeze status. PROPOSED and OPEN technical decisions remain subject to their implementation-phase gates.
+The workspace [README](../README.md) gives the project summary.
 
-## Index
+## Current status
 
-| Path | Purpose | Status |
+- **V1 is archived at [`archive/v1/`](archive/v1/)** and is a historical record only. Original decisions, approval lines, and evidence were retained unchanged; each file carries an archived-record banner.
+- **V2 documentation remains a proposed planning package** (see the [V2 navigation](#v2-in-progress--proposed-awaiting-owner-approval)). The owner authorized M0 release-CI implementation and later independent local work; full-package review (PREP-01) remains pending. **M0 status (recorded 2026-10-18): CI-01 completed; CI-02 in progress.** CI-01's hosted Windows CI succeeded on commit `5c1d89e` ([run 39153256919](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/39153256919): frozen install, typecheck, full suite 648 pass/0 fail, package verification, artifact upload; the prior run on `b77e38f` failed on a test-isolation leak and remains a retained historical record). CI-02 local source work is complete (after a bounded builtin-boundary fix, the changed-input verifier recheck and a real stage→validate passed locally, and the final post-remediation review returned GO), and the GitHub protections are applied and read-back verified (protected `npm-release` environment; active `v*` tag ruleset), but the npm trusted-publisher mapping is owner-reported configured (2026-10-19; independently unverified), the release variables were absent at the last check, and there is no hosted release run, OIDC publish, tag, or version bump — CI-01's hosted success is not release proof. M0 is not operationally complete. A local cloud source foundation exists (`cloud/api`, `cloud/web`, and an intentionally unwired native client/vault seam), but there is no deployment, application-database apply, enabled production auth, storage/upload mount, or runtime acceptance; the isolated `session_port_validation` apply is owner/server-reported, and migration `0003` remains prepared but unapplied. Do not infer V2 design, crypto parameters, caps, or compatibility claims from the V1 archive or from unratified V2 drafts.
+- **V1 safety constraints remain in force** until explicitly superseded by owner instructions: the plugin never runs Git commands, checkpoint/restore makes no LLM calls and never replays historical tools, there are no direct OpenCode-database writes, and encryption is mandatory (no plaintext fallback). See [AGENTS.md](../AGENTS.md).
+
+## Archived V1 index (historical)
+
+| Path | Purpose | Archived status |
 | --- | --- | --- |
-| [v1/product-spec.md](v1/product-spec.md) | Product goals/non-goals, users, `/checkpoint` and `/restore` UX, defaults, platforms | Approved baseline |
-| [v1/technical-design.md](v1/technical-design.md) | Architecture, checkpoint data flow, artifact envelope direction, restore/import, conflicts, compatibility, OMO Slim | Approved baseline; details gated |
-| [v1/security-and-privacy.md](v1/security-and-privacy.md) | Protection scope and non-claims, password handling, crypto requirements vs open choices, untrusted input | Approved baseline; crypto OPEN |
-| [v1/validation-and-open-questions.md](v1/validation-and-open-questions.md) | Spike baseline, tested evidence, untested areas, open questions | Approved evidence baseline |
-| [v1/decision-log.md](v1/decision-log.md) | Product decisions, proposed technical decisions, open decisions | Authoritative status |
+| [archive/v1/product-spec.md](archive/v1/product-spec.md) | Product goals/non-goals, users, `/checkpoint` and `/restore` UX, defaults, platforms | Archived V1 record |
+| [archive/v1/technical-design.md](archive/v1/technical-design.md) | Architecture, checkpoint data flow, artifact envelope direction, restore/import, conflicts, compatibility, OMO Slim | Archived V1 record |
+| [archive/v1/security-and-privacy.md](archive/v1/security-and-privacy.md) | Protection scope and non-claims, password handling, crypto requirements vs open choices, untrusted input | Archived V1 record |
+| [archive/v1/validation-and-open-questions.md](archive/v1/validation-and-open-questions.md) | Spike baseline, tested evidence, untested areas, open questions | Archived V1 record |
+| [archive/v1/decision-log.md](archive/v1/decision-log.md) | Product decisions, proposed technical decisions, open decisions | Archived V1 record (authoritative for V1 only) |
 
-## Approval and freeze status
+## Archived V1 context (historical)
 
-- V1 scope is **approved for implementation** as of 2026-10-09.
-- Documentation is **not frozen**; implementation-phase decisions remain PROPOSED/OPEN and must be validated before dependent behavior is finalized.
-- Final documentation freeze remains a separate gate after implementation evidence and OPEN decisions are reconciled.
+- The owner approved the V1 implementation baseline on 2026-10-09; documentation was never frozen, and PROPOSED/OPEN items remain unresolved exactly as recorded. Archiving closes nothing.
+- Status labels used inside the archived docs: **DECIDED** / **PROPOSED** / **OPEN** / **(CANDIDATE)** / **SUPERSEDED** — preserved as originally recorded.
+- Validation baseline as originally recorded: OpenCode **v2.0.22 (2026-10-09)**, Windows only, synthetic data, disposable environment; **not** a universal compatibility promise. Later evidence and platform limits (Linux untested; cross-OS artifact interchange unverified) remain exactly as recorded in the archived documents; archiving preserves evidence and does not upgrade any claim.
 
-### Proposed freeze criteria (PROPOSED — also draft content)
+## V2 (in progress — proposed, awaiting owner approval)
 
-1. Every OPEN item in [v1/validation-and-open-questions.md](v1/validation-and-open-questions.md) is resolved before freeze. This draft defines no DEFERRED status or exception path; postponing an item does not change its OPEN status or satisfy this gate.
-2. Security/format choices (algorithms, KDF parameters, header layout, version policy, limits, password UX) are decided and consistent across documents.
-3. A cross-platform implementation/testing plan exists (currently missing).
-4. Owner sign-off is recorded for each document.
+The `docs/V2/` set describes the proposed SessionPort 0.2.0 cloud/continuity direction. Full-package approval remains pending; the narrow M0 and later local-implementation directions do not approve cloud design, crypto parameters, caps, or compatibility claims. Local source exists for M1–M3 slices, but no cloud deployment or runtime acceptance exists, and no milestone is complete.
 
-## Status labels
+| Page | Purpose |
+| --- | --- |
+| [V2/README.md](V2/README.md) | V2 index and navigation |
+| [V2/PRODUCT_SPEC.md](V2/PRODUCT_SPEC.md) | Requirements, journeys, features, acceptance criteria |
+| [V2/ARCHITECTURE.md](V2/ARCHITECTURE.md) | Architecture, components, gates |
+| [V2/SYNC_PROTOCOL.md](V2/SYNC_PROTOCOL.md) | Revision DAG and sync protocol |
+| [V2/SECURITY.md](V2/SECURITY.md) | Threat model, E2EE, and auth security |
+| [V2/API_AND_DATA.md](V2/API_AND_DATA.md) | API surface, data model, quotas |
+| [V2/DEPLOYMENT.md](V2/DEPLOYMENT.md) | Deployment topology and operations |
+| [V2/ROADMAP.md](V2/ROADMAP.md) | Gates and mutable status |
+| [V2/AGENT_RULES.md](V2/AGENT_RULES.md) | Working rules for this repository |
 
-- **DECIDED** — owner-approved V1 scope/direction; not a substitute for unresolved implementation details.
-- **PROPOSED** — recommended, not agreed.
-- **OPEN** — unresolved; do not infer an answer. Resolve before the dependent behavior is finalized/released; unrelated lanes may proceed.
-- **(CANDIDATE)** — research-only reference; not selected, not validated.
-- **SUPERSEDED** — retained for provenance; replaced by a later decision-log entry; not a current direction.
-
-## Validation baseline
-
-OpenCode **v2.0.22 (2026-10-09)**, Windows only, synthetic data, disposable environment. Evidence is summarized in [v1/validation-and-open-questions.md](v1/validation-and-open-questions.md) and is **not** a universal compatibility promise. Source references in these docs are pinned to the OpenCode repository tag `v2.0.22` where noted.
-
-## Boundaries of authority
-
-- These documents authorize implementation within the owner-approved V1 scope; they do not authorize automatic Git operations or silently settle PROPOSED/OPEN technical choices.
-- Anything not labeled DECIDED or explicitly listed in [v1/decision-log.md](v1/decision-log.md) remains open for discussion.
-- Decision status is authoritative in [v1/decision-log.md](v1/decision-log.md); other documents defer to it.
+All nine pages listed above exist. The full planning package remains draft pending owner review; M0 progress (CI-01 completed with hosted Windows evidence; CI-02 in progress) and outstanding external setup are tracked in [V2/ROADMAP.md](V2/ROADMAP.md) and [V2/DEPLOYMENT.md](V2/DEPLOYMENT.md#2-plugin-release-ci-first--plan-only).

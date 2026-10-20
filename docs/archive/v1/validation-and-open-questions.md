@@ -1,5 +1,7 @@
 # SessionPort V1 — Validation Baseline and Open Questions
 
+> **Archived V1 historical record.** Not the active V2 specification; original decisions/evidence retained.
+
 > **APPROVED FOR IMPLEMENTATION — NOT FROZEN.**
 > This document records bounded spike evidence and unresolved items; it is not a compatibility promise or security validation.
 

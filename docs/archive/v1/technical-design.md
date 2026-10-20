@@ -1,5 +1,7 @@
 # SessionPort V1 — Technical Design
 
+> **Archived V1 historical record.** Not the active V2 specification; original decisions/evidence retained.
+
 > **APPROVED FOR IMPLEMENTATION — NOT FROZEN.**
 > This is the owner-approved implementation baseline; PROPOSED/OPEN choices remain subject to phase gates. Baseline: OpenCode v2.0.22 (2026-10-09). Source references are pinned to the OpenCode repository tag `v2.0.22` unless noted. Decision status is authoritative in [decision-log.md](decision-log.md).
 

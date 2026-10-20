@@ -1,5 +1,7 @@
 # SessionPort V1 — Security and Privacy
 
+> **Archived V1 historical record.** Not the active V2 specification; original decisions/evidence retained.
+
 > **APPROVED FOR IMPLEMENTATION — NOT FROZEN.** The crypto suite remains PROPOSED and unvalidated; see [decision-log.md](decision-log.md).
 > Baseline: OpenCode v2.0.22 (2026-10-09). Decision status is authoritative in [decision-log.md](decision-log.md).
 

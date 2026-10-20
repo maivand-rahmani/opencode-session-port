@@ -23,7 +23,7 @@ import { Plugin } from "@opencode/plugin/tui"
  * are owner-approved experimental targets enabled here but NOT host-tested, and
  * cross-OS artifact interchange is UNVERIFIED. Command handlers own their
  * errors and report sanitized copy; no raw host error crosses to the host. The
- * active experimental defaults are recorded in `docs/v1/decision-log.md`; this
+ * active experimental defaults are recorded in `docs/archive/v1/decision-log.md`; this
  * is not a production approval or format freeze.
  */
 

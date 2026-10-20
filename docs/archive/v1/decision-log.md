@@ -1,5 +1,7 @@
 # SessionPort V1 — Decision Log
 
+> **Archived V1 historical record.** Not the active V2 specification; original decisions/evidence retained.
+
 > **APPROVED FOR IMPLEMENTATION — NOT FROZEN.**
 > The owner approved the V1 implementation baseline on 2026-10-09. This file is authoritative for which product decisions are approved and which implementation details remain PROPOSED/OPEN.
 

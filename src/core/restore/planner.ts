@@ -9,7 +9,7 @@
  * external references, and returns a parent-before-child import order. It never
  * calls a host API, touches the filesystem, runs an LLM, or performs an import.
  *
- * Policy boundaries (see `docs/v1/decision-log.md` O-04/O-05/O-22):
+ * Policy boundaries (see `docs/archive/v1/decision-log.md` O-04/O-05/O-22):
  * - Canonical comparison is the complete `{info,messages}` record serialized as
  *   JSON with object keys sorted recursively; values, array order, IDs, and
  *   absent-vs-null distinctions are preserved (O-04).

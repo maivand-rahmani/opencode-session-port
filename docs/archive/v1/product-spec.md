@@ -1,5 +1,7 @@
 # SessionPort V1 — Product Specification
 
+> **Archived V1 historical record.** Not the active V2 specification; original decisions/evidence retained.
+
 > **APPROVED FOR IMPLEMENTATION — NOT FROZEN.**
 > The owner approved the V1 baseline on 2026-10-09. PROPOSED/OPEN technical decisions remain gated and are not final. See [decision-log.md](decision-log.md) for authoritative status.
 
