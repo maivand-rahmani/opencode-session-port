@@ -22,3 +22,7 @@ cloud/web/.next/
 
 # Prisma generated client (derived from cloud/api/prisma/schema.prisma)
 cloud/api/prisma/generated/client/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps

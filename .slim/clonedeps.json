@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-10-21",
+  "dependencies": [
+    {
+      "name": "opencode",
+      "resolvedVersion": "2.0.22",
+      "repoUrl": "https://github.com/anomalyco/opencode.git",
+      "ref": "v2.0.22",
+      "commit": "527f0b931d1f9b3ebd34e106c51b31ce5db5b075",
+      "path": ".slim/clonedeps/repos/anomalyco__opencode",
+      "packagePath": "packages/core",
+      "reason": "Read-only investigation of host import, persistence, message application, and UI session routing for SessionPort sync without a custom host build.",
+      "caveats": "Tag verified by git ls-remote and cloned HEAD; correspondence to the installed binary is not independently established. No dependency install, build, or source scripts were run."
+    }
+  ]
+}
