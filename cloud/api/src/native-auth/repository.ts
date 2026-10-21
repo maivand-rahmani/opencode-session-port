@@ -26,7 +26,10 @@
  * `NativeAuthConfig` after the authoritative browser user is bound; the
  * predicate count and existing pending-row lock run in the same SERIALIZABLE
  * transaction so two distinct concurrent approvals cannot both commit past the
- * cap. A Prisma P2034 is reported as a retryable serialization failure and is
+ * cap. A Prisma P2034 and a Prisma 7 driver-adapter transaction conflict
+ * (`DriverAdapterError` with a `TransactionWriteConflict` cause, the documented
+ * PostgreSQL 40001/40P01 mapping, including conflicts surfaced by an
+ * interactive COMMIT) are reported as a retryable serialization failure and are
  * never retried here. This is a source-level concurrency strategy; no real
  * PostgreSQL contention proof is claimed by these tests.
  */
@@ -1414,6 +1417,41 @@ function isPrismaCode(error: unknown, code: string): boolean {
   );
 }
 
+/**
+ * Prisma 7 driver adapters throw a `DriverAdapterError` whose `cause` is the
+ * adapter's documented error payload. For PostgreSQL, adapter-pg maps SQLSTATE
+ * 40001 and 40P01 to `{ kind: 'TransactionWriteConflict' }`; some adapters also
+ * retain `originalCode`. Interactive transaction COMMIT failures can surface
+ * this raw shape instead of a query-normalized Prisma P2034. Match only that
+ * documented conflict shape: unknown errors remain unavailable and no cause
+ * text is exposed. This only classifies the error; no transaction or write is
+ * retried.
+ */
+function isDriverAdapterTransactionConflict(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const candidate = error as {
+    readonly name?: unknown;
+    readonly cause?: unknown;
+  };
+  if (candidate.name !== 'DriverAdapterError') {
+    return false;
+  }
+  if (typeof candidate.cause !== 'object' || candidate.cause === null) {
+    return false;
+  }
+  const cause = candidate.cause as {
+    readonly kind?: unknown;
+    readonly originalCode?: unknown;
+  };
+  return (
+    cause.kind === 'TransactionWriteConflict' ||
+    cause.originalCode === '40001' ||
+    cause.originalCode === '40P01'
+  );
+}
+
 function sanitizeRepositoryError(error: unknown): NativeAuthRepositoryError {
   if (error instanceof NativeAuthRepositoryError) {
     return error;
@@ -1422,6 +1460,9 @@ function sanitizeRepositoryError(error: unknown): NativeAuthRepositoryError {
     return new NativeAuthRepositoryError('unique-collision');
   }
   if (isPrismaCode(error, 'P2034')) {
+    return new NativeAuthRepositoryError('serialization-failure');
+  }
+  if (isDriverAdapterTransactionConflict(error)) {
     return new NativeAuthRepositoryError('serialization-failure');
   }
   return new NativeAuthRepositoryError('unavailable');

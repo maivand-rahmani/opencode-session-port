@@ -92,6 +92,7 @@ interface FakeOptions {
   readonly quota?: readonly string[];
   readonly pendingCreateError?: unknown;
   readonly pendingUpdateError?: unknown;
+  readonly transactionError?: unknown;
   readonly pendingCount?: number;
   readonly serializeTransactions?: boolean;
 }
@@ -439,7 +440,13 @@ class FakePrisma {
     this.transactionOptions.push(options);
     this.order.push(`transaction.begin:${String((options as { isolationLevel?: string } | undefined)?.isolationLevel)}`);
     if (this.options.serializeTransactions === true) {
-      const run = this.chain.then(() => operation(this.tx));
+      const run = this.chain.then(async () => {
+        const value = await operation(this.tx);
+        if (this.options.transactionError !== undefined) {
+          throw this.options.transactionError;
+        }
+        return value;
+      });
       this.chain = run.then(
         () => undefined,
         () => undefined,
@@ -449,6 +456,9 @@ class FakePrisma {
       return result;
     }
     const result = await operation(this.tx);
+    if (this.options.transactionError !== undefined) {
+      throw this.options.transactionError;
+    }
     this.order.push('transaction.commit');
     return result;
   }
@@ -473,6 +483,63 @@ function candidate(
   digest: Uint8Array = DIGEST,
 ): HumanCodeCandidate {
   return { keyID, digest };
+}
+
+const DRIVER_ADAPTER_CANARY = 'driver-adapter-canary-secret';
+
+function driverAdapterError(cause: unknown): Error {
+  return Object.assign(new Error(DRIVER_ADAPTER_CANARY), {
+    name: 'DriverAdapterError',
+    cause,
+  });
+}
+
+function approvalInput() {
+  return {
+    candidates: [candidate()],
+    decision: 'approve' as const,
+    userID: USER_ID,
+    at: NOW,
+  };
+}
+
+async function assertApprovalRejectsUnavailable(
+  transactionError: unknown,
+): Promise<FakePrisma> {
+  const fake = new FakePrisma({ pending: [pendingRow()], transactionError });
+  await assert.rejects(repository(fake).decidePendingAuthorization(approvalInput()), (error: unknown) => {
+    assert.ok(error instanceof NativeAuthRepositoryError);
+    assert.equal(error.code, 'unavailable');
+    assert.ok(!error.message.includes(DRIVER_ADAPTER_CANARY));
+    return true;
+  });
+  assert.equal(fake.pendingUpdates.length, 1);
+  assert.equal(fake.transactionOptions.length, 1);
+  return fake;
+}
+
+async function assertApprovalSerializationConflict(
+  transactionError: unknown,
+): Promise<FakePrisma> {
+  const fake = new FakePrisma({ pending: [pendingRow()], transactionError });
+  await assert.rejects(repository(fake).decidePendingAuthorization(approvalInput()), (error: unknown) => {
+    assert.ok(error instanceof NativeAuthRepositoryError);
+    assert.equal(error.code, 'serialization-failure');
+    assert.equal(
+      error.message,
+      'The pending-authorization transaction could not be serialized.',
+    );
+    assert.ok(!error.message.includes(DRIVER_ADAPTER_CANARY));
+    assert.ok(!('cause' in error));
+    return true;
+  });
+  assert.equal(fake.pendingUpdates.length, 1);
+  assert.equal(fake.transactionOptions.length, 1);
+  assert.equal(
+    fake.order.filter((entry) => entry === 'pending.update').length,
+    1,
+  );
+  return fake;
 }
 
 function pendingRow(
@@ -1063,6 +1130,108 @@ test('approval P2034 is a retryable serialization failure with no automatic retr
   assert.deepEqual(fake.transactionOptions, [
     { isolationLevel: 'Serializable' },
   ]);
+});
+
+test('approval COMMIT DriverAdapterError TransactionWriteConflict is a retryable serialization failure with no retry', async () => {
+  const fake = await assertApprovalSerializationConflict(
+    driverAdapterError({
+      kind: 'TransactionWriteConflict',
+      originalMessage: DRIVER_ADAPTER_CANARY,
+    }),
+  );
+  assert.deepEqual(fake.transactionOptions, [
+    { isolationLevel: 'Serializable' },
+  ]);
+  assert.equal(fake.order.at(-1), 'pending.update');
+});
+
+test('approval COMMIT DriverAdapterError with TransactionWriteConflict and SQLSTATE 40001 is a serialization failure', async () => {
+  const fake = await assertApprovalSerializationConflict(
+    driverAdapterError({
+      kind: 'TransactionWriteConflict',
+      originalCode: '40001',
+    }),
+  );
+  assert.deepEqual(fake.transactionOptions, [
+    { isolationLevel: 'Serializable' },
+  ]);
+});
+
+test('approval COMMIT DriverAdapterError with SQLSTATE 40P01 is a serialization failure', async () => {
+  const fake = await assertApprovalSerializationConflict(
+    driverAdapterError({ originalCode: '40P01' }),
+  );
+  assert.deepEqual(fake.transactionOptions, [
+    { isolationLevel: 'Serializable' },
+  ]);
+});
+
+test('approval query rejection with a DriverAdapterError TransactionWriteConflict is a serialization failure', async () => {
+  const fake = new FakePrisma({
+    pending: [pendingRow()],
+    pendingUpdateError: driverAdapterError({
+      kind: 'TransactionWriteConflict',
+    }),
+  });
+  await assert.rejects(
+    repository(fake).decidePendingAuthorization(approvalInput()),
+    (error: unknown) => {
+      assert.ok(error instanceof NativeAuthRepositoryError);
+      assert.equal(error.code, 'serialization-failure');
+      assert.ok(!error.message.includes(DRIVER_ADAPTER_CANARY));
+      return true;
+    },
+  );
+  assert.equal(fake.pendingUpdates.length, 1);
+  assert.equal(fake.transactionOptions.length, 1);
+});
+
+test('approval COMMIT DriverAdapterError with a non-adapter name stays unavailable', async () => {
+  const fake = await assertApprovalRejectsUnavailable(
+    Object.assign(new Error(DRIVER_ADAPTER_CANARY), {
+      name: 'Error',
+      cause: { kind: 'TransactionWriteConflict' },
+    }),
+  );
+  assert.deepEqual(fake.transactionOptions, [
+    { isolationLevel: 'Serializable' },
+  ]);
+});
+
+test('approval COMMIT DriverAdapterError with a unique-constraint cause stays unavailable', async () => {
+  await assertApprovalRejectsUnavailable(
+    driverAdapterError({
+      kind: 'UniqueConstraintViolation',
+      originalCode: '23505',
+    }),
+  );
+});
+
+test('approval COMMIT DriverAdapterError with a connection cause stays unavailable', async () => {
+  await assertApprovalRejectsUnavailable(
+    driverAdapterError({
+      kind: 'ConnectionClosed',
+      originalCode: '08006',
+    }),
+  );
+});
+
+test('approval COMMIT DriverAdapterError with a string cause stays unavailable', async () => {
+  await assertApprovalRejectsUnavailable(
+    driverAdapterError('TransactionWriteConflict'),
+  );
+});
+
+test('approval COMMIT DriverAdapterError with a null cause stays unavailable', async () => {
+  await assertApprovalRejectsUnavailable(driverAdapterError(null));
+});
+
+test('approval COMMIT error with an inherited non-adapter name stays unavailable', async () => {
+  await assertApprovalRejectsUnavailable(
+    Object.assign(new Error(DRIVER_ADAPTER_CANARY), {
+      cause: { kind: 'TransactionWriteConflict' },
+    }),
+  );
 });
 
 test('denial remains ReadCommitted and has no per-user capacity count', async () => {
