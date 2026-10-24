@@ -112,6 +112,29 @@ flowchart TD
 - The encrypted outbox/state directory is per-user, private, and outside the repository
   (see [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) section 8).
 
+### 5.1 Local-state envelope decision — 2026-10-25
+
+The owner approved a separate random 32-byte vault key and raw-key libsodium
+XChaCha20-Poly1305, delegating the following format, limits, and namespace choices.
+This does not change the checkpoint container or approve its candidate parameters.
+
+- Envelope: ASCII `SPST`, version byte `1`, fresh 24-byte nonce, ciphertext with
+  the 16-byte AEAD tag. Plaintext is capped at 67,108,864 bytes; the envelope at
+  67,108,909 bytes. Exceeding either limit fails closed, without truncation.
+- AAD: the full 29-byte header followed by three UTF-8 fields, each prefixed by
+  its unsigned 32-bit big-endian byte length: `sessionport-local-state`, `1`, and
+  the exact host scope. Scope is nonempty, at most 512 UTF-8 bytes, with no
+  unpaired surrogates or U+0000–U+001F/U+007F controls; it is not normalized.
+- Vault service: `opencode-session-port/local-state-key/v1`; account: lowercase
+  SHA-256 hex of UTF-8 `sessionport-state-vault-account-v1\0${hostScope}`, where
+  `\0` denotes a single NUL separator. This entry is separate from auth tokens.
+- Key creation requires the state owner lock and an absent snapshot. An existing
+  snapshot with a missing key fails closed; uncertain writes are not retried or
+  overwritten. Local logout retains the state key and encrypted outbox.
+- These are implementation decisions, not completed runtime/platform acceptance.
+  File fsync plus rename has no established Windows power-loss durability claim;
+  process-restart recovery is a separate, testable guarantee.
+
 ## 6. Authentication and device authorization (AUTH-01)
 
 Chosen stack: **BetterAuth + `@better-auth/oauth-provider`** with `oauthProvider` +
