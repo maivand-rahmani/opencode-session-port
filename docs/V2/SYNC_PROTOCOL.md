@@ -263,6 +263,9 @@ stateDiagram-v2
 
 - **No remote deletion propagates to native sessions in 0.2.0.** Missing local records are not
   tombstones; a locally missing session is not evidence of deletion.
+- Native replacement cleanup is distinct from remote retention: a proposed synthetic verified
+  delete of the old root (after replacement and checkpoint readback) is an investigation, not
+  remote deletion or retention policy ([decision record](../evidence/m1-verified-delete-decision-20261024.md)).
 - Previously synced records are retained and reused as the baseline inside the next full snapshot.
   True deletion propagation is an explicit future feature, not part of 0.2.0.
 - All committed revisions are retained and count against quota. Quota-full **explicitly blocks
@@ -328,6 +331,12 @@ stateDiagram-v2
   ordinary duplication). Updates are not prohibited forever.
 - Automatic continuity and the 0.2.0 release are not complete until HOST-01 passes. This protocol
   does not replace automatic continuity with a manual restore requirement.
+- **Verified-delete alternative under investigation (2026-10-24, admissibility only):** a synthetic
+  sequence may import a new parentless root and then public-delete the known old graph **after**
+  verifying complete old coverage, logical references, and recoverable encrypted checkpoint
+  readback. It is an alternative acceptance candidate, not a gate pass; the preferred same-ID
+  conditional update remains, and all apply stays blocked. Conditions and open parameters:
+  [decision record](../evidence/m1-verified-delete-decision-20261024.md).
 
 ## 13. Failure cases
 

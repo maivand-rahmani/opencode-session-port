@@ -269,6 +269,26 @@ transaction covering transcript replacement. Therefore:
 - Passing HOST-01 does not authorize direct database writes or force-replace behavior; a future
   task is not permission.
 
+### Verified-delete alternative (admissibility only, 2026-10-24)
+
+An owner-directed **alternative acceptance candidate** is under investigation: import a new
+parentless root, verify the complete old history, the new tail, logical references, and a
+recoverable encrypted checkpoint readback **before** public-deleting only the known old synthetic
+graph. Rationale: an archive-only outcome accumulates archived roots (one per sync). This
+supersedes the prior archive-only probe scope only for that synthetic investigation; it is not a
+gate pass and does not weaken release criteria or erase the preferred same-ID conditional-update
+path.
+
+Admissible only if: all old records are inactive and fully covered, references resolve, a
+recoverable encrypted checkpoint is verified, and only the public delete API is used on the known
+old graph; active/pending/unknown references, unknown closure, or a late edit reject deletion.
+The source-level cascade hazard needs runtime validation, and an ambiguous delete outcome is
+reconciled by readback, never blindly retried. No public CAS exists, so no automatic concurrency
+guarantee is claimed; manual quiescence must not be presented as atomicity. No native-database
+writes, model calls, tool replay, or plaintext temporary files are permitted. Synthetic only;
+local `/checkpoint` and `/restore` remain unaffected. Details and open parameters:
+[verified-delete decision record](../evidence/m1-verified-delete-decision-20261024.md).
+
 HOST-01 evidence matrix (each row needs labeled evidence before release):
 
 | Evidence area | Question to answer | Label |
