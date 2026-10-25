@@ -83,12 +83,14 @@ export const EXPECTED_REPOSITORY = {
 } as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
 /**
- * Measured packed file count after the intentional shipped-source state
- * implementation (src/cloud/state, state-codec, state-key). Measured with both
- * `npm pack --dry-run --json` (79) and `bun pm pack --dry-run` (79); both
- * listings are pinned to this same value by the whitelist tests.
+ * Measured packed file count for the local-first 0.1.7 surface: the former 79
+ * shipped-source files plus the six replacement-flow sources (core restore
+ * replacement, session delete/reference adapters, local restore orchestration,
+ * replacement execution, and the replacement dialog). Re-measured, not
+ * inherited: `npm pack --dry-run --json` (85) and `bun pm pack --dry-run` (85);
+ * both listings are pinned to this same value by the whitelist tests.
  */
-export const EXPECTED_PACKED_FILE_COUNT = 79;
+export const EXPECTED_PACKED_FILE_COUNT = 85;
 export const EXPECTED_EXPORTS = { "./tui": "./dist/tui.js" } as const;
 /** Compiled bundle produced by `build:tui` (prepack) and shipped via `exports["./tui"]`. */
 export const BUILT_ENTRY_PATH = "dist/tui.js";
@@ -127,6 +129,15 @@ export const REQUIRED_PACKED_PATHS = [
 	// present in every packed tarball (they are reached through src/**).
 	"src/core/sessions/dependencies.ts",
 	"src/core/sessions/references.ts",
+	// Local-first 0.1.7 replacement flow: these exact sources are reached
+	// through src/** and must remain in every tarball. Exact paths only, no
+	// wildcards.
+	"src/core/restore/replacement.ts",
+	"src/tui/adapters/session-delete.ts",
+	"src/tui/adapters/session-reference-inventory.ts",
+	"src/tui/orchestration/local-restore.ts",
+	"src/tui/orchestration/newreplacement-execution.ts",
+	"src/tui/ui/restore-replacement-dialog.tsx",
 	// M3 native cloud-auth surface is intentionally shipped source (no nested
 	// .npmignore); the compiled entry imports its wiring.
 	"src/tui/wiring/cloud-auth.ts",
@@ -175,6 +186,19 @@ export const FORBIDDEN_PACKED_PREFIXES = [
 	".git/",
 	"node_modules/",
 	`${SCRATCH_DIR_NAME}/`,
+];
+/**
+ * Binary/native artifacts and sensitive metadata that must never ship inside
+ * the tarball, even under the otherwise allowlisted `src/**`/`dist/**` trees.
+ * Matched case-insensitively against the normalized packed path.
+ */
+export const FORBIDDEN_PACKED_ARTIFACT_PATTERNS: readonly RegExp[] = [
+	/(^|\/)\.(env|npmrc)(\.[^/]*)?$/i,
+	/(^|\/)(credentials?|secrets?|tokens?)(\.[^/]*)?$/i,
+	/(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.[^/]*)?$/i,
+	/(^|\/)profile(\.[^/]*)?$/i,
+	/\.(node|dll|dylib|so|pem|key|p12|pfx|tgz)$/i,
+	/evidence/i,
 ];
 export const FORBIDDEN_MANIFEST_FIELDS = [
 	"publishConfig",
@@ -698,15 +722,21 @@ export function checkBuiltEntry(source: string): string[] {
 
 export function classifyPackedPath(rawPath: string): "allowlisted" | "auto" | "forbidden" | "unexpected" {
 	const normalized = rawPath.replaceAll("\\", "/").replace(/^\.\//, "");
+	// Binary/native artifacts and sensitive metadata are forbidden even when
+	// they sit under the otherwise allowlisted source/dist trees.
+	if (
+		FORBIDDEN_PACKED_FILES.has(normalized) ||
+		FORBIDDEN_PACKED_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ||
+		FORBIDDEN_PACKED_ARTIFACT_PATTERNS.some((pattern) => pattern.test(normalized))
+	) {
+		return "forbidden";
+	}
 	if (normalized === "tui.ts" || normalized === "tsconfig.json" || normalized.startsWith("src/") || normalized.startsWith("dist/")) {
 		return "allowlisted";
 	}
 	const lower = normalized.toLowerCase();
 	if (normalized === "package.json" || /^readme(\.[a-z0-9]+)*$/.test(lower) || /^licen[cs]e(\.[a-z0-9]+)*$/.test(lower)) {
 		return "auto";
-	}
-	if (FORBIDDEN_PACKED_FILES.has(normalized) || FORBIDDEN_PACKED_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
-		return "forbidden";
 	}
 	return "unexpected";
 }

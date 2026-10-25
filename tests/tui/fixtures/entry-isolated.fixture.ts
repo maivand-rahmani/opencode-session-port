@@ -41,6 +41,16 @@ mock.module("../../../src/tui/ui/restore-report-dialog.tsx", () => {
 	return { showRestoreReportDialog: () => {} };
 });
 
+mock.module("../../../src/tui/ui/restore-replacement-dialog.tsx", () => {
+	uiModuleEvaluations.push("restore-replacement-dialog");
+	return {
+		createRestoreReplacementUi: () => ({
+			confirm: async () => false,
+			report: async () => {},
+		}),
+	};
+});
+
 // Fake crypto/deriver seams: the wiring graph resolves these instead of the
 // real sodium-backed factories, so no real crypto runs in this file.
 mock.module("../../../src/core/crypto/index.ts", () => ({
@@ -55,10 +65,18 @@ mock.module("../../../src/core/restore/index.ts", () => ({
 		derive: () => "ses_0000000000000000000000000000000000000000000000000000000000000000",
 	}),
 	// Never invoked by these entry tests; present so the wiring graph's
-	// `planRestore` import resolves against the mock.
+	// replacement imports resolve against the mock.
 	planRestore: () => {
 		throw new Error("planRestore is not used by entry tests");
 	},
+	prepareStandaloneRecord: () => {
+		throw new Error("prepareStandaloneRecord is not used by entry tests");
+	},
+	fingerprintSessionRecord: () => {
+		throw new Error("fingerprintSessionRecord is not used by entry tests");
+	},
+	classifyReplacement: () => ({ mode: "copy" }),
+	verifyImportedRecord: () => ({ verified: false }),
 }));
 
 const sessionPort = (await import("../../../src/tui.ts")).default;
@@ -142,6 +160,7 @@ describe("SessionPort plugin entrypoint", () => {
 				// Loading the wiring on an allowlisted platform evaluates the UI modules it imports.
 				expect(uiModuleEvaluations).toContain("password-dialog");
 				expect(uiModuleEvaluations).toContain("restore-report-dialog");
+				expect(uiModuleEvaluations).toContain("restore-replacement-dialog");
 
 				// Activation reached the mocked crypto seam, not real sodium.
 				expect(cryptoFactoryCalls).toBeGreaterThan(factoryCallsBefore);
@@ -149,7 +168,7 @@ describe("SessionPort plugin entrypoint", () => {
 				slotClaim?.render?.({});
 				expect(layerCalls).toBe(1);
 				expect(layerMode).toBe("global");
-				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore", "sessionport.sync"]);
+				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore"]);
 
 				(cleanup as () => void)();
 				expect(disposed).toBe(1);
@@ -205,6 +224,7 @@ describe("SessionPort plugin entrypoint", () => {
 			// Loading the wiring on Windows evaluates the UI modules it imports.
 			expect(uiModuleEvaluations).toContain("password-dialog");
 			expect(uiModuleEvaluations).toContain("restore-report-dialog");
+			expect(uiModuleEvaluations).toContain("restore-replacement-dialog");
 
 			expect(slotClaim?.append).toBe("app");
 			expect(typeof cleanup).toBe("function");

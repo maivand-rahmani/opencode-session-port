@@ -57,19 +57,39 @@
  * makes no platform-support claim.
  */
 
-import type { ByteSource, CheckpointCryptoFactory } from "../../core/contracts/index.ts";
+import {
+	snapshotJsonValue,
+	type ByteSource,
+	type CheckpointCryptoFactory,
+	type JsonObject,
+	type SessionRecord,
+} from "../../core/contracts/index.ts";
 import { collectCheckpointPayload } from "../../core/sessions/index.ts";
+import { collectSessionMessages } from "../../core/sessions/collector.ts";
+import type { SessionCollectionPolicy, SessionDependencyReadPort } from "../../core/sessions/index.ts";
 import type { RemappedIdDeriver } from "../../core/restore/index.ts";
-import type { ResolveCheckpointOutputPathOptions, ResolveLatestCheckpointArtifactOptions } from "../artifacts/files.ts";
+import type {
+	ResolveCheckpointOutputPathOptions,
+	ResolveLatestCheckpointArtifactOptions,
+	ResolveRecoveryArtifactPathOptions,
+} from "../artifacts/files.ts";
 import { createLocationResolver, LocationResolutionError } from "../adapters/location-resolver.ts";
-import { createProjectDestinationsAdapter } from "../adapters/project-destinations.ts";
+import { createProjectDestinationsAdapter, type ProjectDestinationCandidate } from "../adapters/project-destinations.ts";
 import { createSessionIdInventory } from "../adapters/session-id-inventory.ts";
 import { createSessionDependencyReadAdapter, createSessionReadAdapter } from "../adapters/session-read.ts";
 import { createSessionImportAdapter, probeSessionImportCapability } from "../adapters/session-import.ts";
+import { createSessionReferenceInventoryPort } from "../adapters/session-reference-inventory.ts";
+import {
+	createReplacementDeletePortFactory,
+	createReplacementReferenceInventoryReader,
+	referenceInventoryFromAdapter,
+} from "../orchestration/newreplacement-execution.ts";
 import {
 	runCheckpointFlow,
+	runLocalRestore,
 	runRestoreExecution,
 	runRestorePreflightWithPasswordAttempts,
+	type LocalRestoreUiPort,
 	type RestoreExecutionResult,
 } from "../orchestration/index.ts";
 import { requireCallable, isRecordValue } from "../orchestration/shared.ts";
@@ -88,11 +108,13 @@ import {
 	reportRestoreAuthenticationFailed,
 	reportRestoreCanceled,
 	reportRestoreCapabilityUnavailable,
+	reportLocalRestoreEmpty,
 	reportRestoreExecution,
 	reportRestoreExecutionFallback,
 	reportRestoreFailure,
 	reportRestoreNoActiveProject,
 	reportRestoreNoCheckpointFound,
+	reportRestoreReplacementFallback,
 	type SessionPortNotification,
 } from "./reports.ts";
 
@@ -122,8 +144,18 @@ export interface SessionPortHandlerDependencies {
 	readonly dialog: RestoreProjectDialog;
 	/** Sanitized notification sink. */
 	readonly notify: SessionPortNotifier;
-	/** Presents the completed restore report (designer-owned dialog in production). */
+	/** Legacy report presenter retained for compatibility; unused when `restoreReplacementUi` is supplied. */
 	readonly showRestoreReport: (model: RestoreReportPresentationModel) => void;
+	/**
+	 * Local-first 0.1.7 preview/report UI. When present, the restore command uses
+	 * the real replacement executor and never calls `showRestoreReport`, so the
+	 * two presentation paths cannot display duplicate reports.
+	 */
+	readonly restoreReplacementUi?: LocalRestoreUiPort;
+	/** Exclusive recovery-artifact path resolver (production: `.sessionport/recovery-...`). */
+	readonly resolveRecoveryArtifactPath?: (options: ResolveRecoveryArtifactPathOptions) => Promise<string>;
+	/** Explicit clock for the replacement executor (tests inject a deterministic clock). */
+	readonly clock?: () => number;
 	/** Masked password provider (real UI or a fake in tests). */
 	readonly requestPassword: SessionPortPasswordProvider;
 	/** Initialized crypto factory; production uses the experimental profile (historical `-win-` selector name). */
@@ -176,6 +208,17 @@ export function createSessionPortHandlers(dependencies: SessionPortHandlerDepend
 	}
 	if (!isRecordValue(dependencies.dialog) || typeof dependencies.dialog.select !== "function") {
 		throw new TypeError("createSessionPortHandlers requires a dialog with a select(options) function");
+	}
+	if (dependencies.restoreReplacementUi !== undefined) {
+		if (
+			!isRecordValue(dependencies.restoreReplacementUi) ||
+			typeof dependencies.restoreReplacementUi.confirm !== "function" ||
+			typeof dependencies.restoreReplacementUi.report !== "function"
+		) {
+			throw new TypeError("restoreReplacementUi must provide confirm(preview) and report(report)");
+		}
+		requireCallable(dependencies.resolveRecoveryArtifactPath, "resolveRecoveryArtifactPath");
+		if (dependencies.clock !== undefined) requireCallable(dependencies.clock, "clock");
 	}
 
 	return {
@@ -285,6 +328,16 @@ async function runRestoreCommand(
 			targetDirectory: selected.targetDirectory,
 		});
 
+		if (dependencies.restoreReplacementUi !== undefined) {
+			await runLocalRestoreCommand(dependencies, {
+				artifactPath,
+				destinationProjectID: resolved.projectID,
+				targetDirectory: resolved.directory,
+				destinations,
+			});
+			return;
+		}
+
 		// Destination snapshot uses the same explicit project scope and the
 		// experimental collection bounds; it is read by runRestorePreflight only
 		// after full authentication and strict parsing. The cross-project
@@ -368,6 +421,147 @@ function reportRestoreOutcome(dependencies: SessionPortHandlerDependencies, resu
 	} catch {
 		dependencies.notify(reportRestoreExecutionFallback(result));
 	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* Local-first 0.1.7 restore path                                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Runs the local-first replacement flow with the real core planner, real
+ * replacement executor, and real adapter-backed exact readback. The list-only
+ * destination snapshot remains the collision/destination source; `session.get`
+ * plus bounded `message.list` is used only for exact full-record reads.
+ */
+async function runLocalRestoreCommand(
+	dependencies: SessionPortHandlerDependencies,
+	params: {
+		readonly artifactPath: string;
+		readonly destinationProjectID: string;
+		readonly targetDirectory: string;
+		readonly destinations: readonly ProjectDestinationCandidate[];
+	},
+): Promise<void> {
+	try {
+		const readPort = createSessionReadAdapter(dependencies.client);
+		const sessionIdInventory = createSessionIdInventory({
+			readPort,
+			projects: params.destinations,
+			selectedProjectID: params.destinationProjectID,
+			policy: EXPERIMENTAL_COLLECTION_POLICY,
+		});
+
+		let dependencyPort: SessionDependencyReadPort | undefined;
+		try {
+			dependencyPort = createSessionDependencyReadAdapter(dependencies.client);
+		} catch {
+			dependencyPort = undefined;
+		}
+		const readSession =
+			dependencyPort === undefined
+				? async (_sessionID: string): Promise<SessionRecord | undefined> => {
+						throw new Error("session.get is unavailable; exact full-record verification is impossible");
+					}
+				: createExactSessionRecordReader(dependencyPort, EXPERIMENTAL_COLLECTION_POLICY);
+
+		const referencePort = createSessionReferenceInventoryPort(dependencies.client, {
+			scope: { kind: "global" },
+			policy: EXPERIMENTAL_COLLECTION_POLICY,
+		});
+		const referenceReader = createReplacementReferenceInventoryReader(referencePort);
+		// Missing exact-read capability means no delete can ever be re-proven.
+		// Force copy-only previews and truthful candidate-verification failures
+		// instead of silently weakening the readback.
+		const safeReferenceReader =
+			dependencyPort === undefined
+				? async () => ({ infos: [], complete: false })
+				: referenceReader;
+
+		const outcome = await runLocalRestore({
+			artifactPath: params.artifactPath,
+			destinationProjectID: params.destinationProjectID,
+			targetDirectory: params.targetDirectory,
+			cryptoFactory: dependencies.cryptoFactory,
+			cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
+			readEncryptedArtifact: dependencies.readEncryptedArtifact,
+			requestPassword: (purpose) => dependencies.requestPassword(purpose, EXPERIMENTAL_MAX_PASSWORD_BYTES),
+			readDestination: async (projectID) =>
+				(await collectCheckpointPayload(readPort, {
+					projectID,
+					policy: EXPERIMENTAL_COLLECTION_POLICY,
+				})).sessions,
+			readGloballyVisibleSessionIDs: () => sessionIdInventory.readGloballyVisibleSessionIDs(),
+			readSession,
+			readReferenceInventory: safeReferenceReader,
+			importer: createSessionImportAdapter(dependencies.client),
+			deletePortFactory: createReplacementDeletePortFactory(dependencies.client),
+			resolveRecoveryPath: dependencies.resolveRecoveryArtifactPath!,
+			writeEncryptedArtifact: dependencies.writeEncryptedArtifact,
+			idDeriver: dependencies.idDeriver,
+			ui: dependencies.restoreReplacementUi!,
+			clock: dependencies.clock ?? (() => Date.now()),
+		});
+
+		switch (outcome.status) {
+			case "canceled":
+				dependencies.notify(reportRestoreCanceled());
+				return;
+			case "authentication-failed":
+				dependencies.notify(reportRestoreAuthenticationFailed());
+				return;
+			case "empty":
+				dependencies.notify(reportLocalRestoreEmpty());
+				return;
+			case "completed":
+				if (outcome.reportDisplayFailed) {
+					dependencies.notify(reportRestoreReplacementFallback(outcome.report));
+				}
+		}
+	} catch (error) {
+		dependencies.notify(reportRestoreFailure(error, false));
+	}
+}
+
+/**
+ * Exact full-record read: `session.get` supplies the authoritative info and
+ * bounded `message.list` pages supply the complete history. Only a verified
+ * 404/not-found response is absence; every other exception is unreadable and
+ * propagates to the executor's fail-closed readback path.
+ */
+function createExactSessionRecordReader(
+	port: SessionDependencyReadPort,
+	policy: SessionCollectionPolicy,
+): (sessionID: string) => Promise<SessionRecord | undefined> {
+	return async (sessionID: string): Promise<SessionRecord | undefined> => {
+		let rawInfo: unknown;
+		try {
+			rawInfo = await port.getSession(sessionID);
+		} catch (error) {
+			if (isVerifiedSessionMissing(error)) return undefined;
+			throw error;
+		}
+		if (rawInfo === undefined || rawInfo === null) return undefined;
+		let info: unknown;
+		try {
+			info = snapshotJsonValue(rawInfo, "session.get result");
+		} catch {
+			throw new Error("session.get returned a non-JSON session info record");
+		}
+		if (!isRecordValue(info) || info["id"] !== sessionID) {
+			throw new Error("session.get returned a different or malformed session id");
+		}
+		const messages = await collectSessionMessages(port, sessionID, policy, 0);
+		return { info: info as JsonObject, messages: [...messages] };
+	};
+}
+
+/** True only for an explicit 404/not-found signal; never for arbitrary failures. */
+function isVerifiedSessionMissing(error: unknown): boolean {
+	if (!isRecordValue(error)) return false;
+	if (error["status"] === 404) return true;
+	const code = error["code"];
+	if (code === 404 || code === "404" || code === "not-found" || code === "NotFound") return true;
+	return error["name"] === "NotFoundError" || error["name"] === "SessionNotFoundError";
 }
 
 /* ------------------------------------------------------------------------- */

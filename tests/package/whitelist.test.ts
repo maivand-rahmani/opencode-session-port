@@ -16,11 +16,12 @@ import {
 
 /**
  * Packed-surface whitelist and safe no-publish behavior. Pure classification
- * tests pin the allowlist (including the compiled `dist/tui.js` entry); the
- * live dry-run tests confirm npm and Bun both honor the `files` allowlist for
- * the actual workspace, including exclusion of the repository-local
- * `.package-verify-work/` scratch directory. npm runs `prepack` (build:tui)
- * during the dry run, so the listing proves the compiled entry is packed.
+ * tests pin the allowlist (including the compiled `dist/tui.js` entry and the
+ * local-first replacement sources); the live dry-run tests confirm npm and Bun
+ * both honor the `files` allowlist for the actual workspace, including
+ * exclusion of the repository-local `.package-verify-work/` scratch directory.
+ * npm runs `prepack` (build:tui) during the dry run, so the listing proves the
+ * compiled entry is built by the normal prepack path and packed.
  */
 
 describe("packed path classification", () => {
@@ -59,8 +60,34 @@ describe("packed path classification", () => {
 	});
 
 	test("anything outside the allowlist is unexpected", () => {
-		for (const unexpected of ["tui.jsx", "tsconfig.ts", "opencode-session-port.tgz"]) {
+		for (const unexpected of ["tui.jsx", "tsconfig.ts", "src-tui.ts"]) {
 			expect(classifyPackedPath(unexpected)).toBe("unexpected");
+		}
+	});
+
+	test("binary, sensitive, evidence, and nested scratch artifacts stay forbidden even under src/dist", () => {
+		for (const forbidden of [
+			"src/native/addon.node",
+			"dist/lib.dylib",
+			"src/.env",
+			".npmrc",
+			"src/cloud/auth/credentials.json",
+			"src/cloud/token",
+			"src/keys/id_ed25519",
+			"src/keys/server.pem",
+			"src/keys/server.key",
+			"src/state/profile.json",
+			"src/profiles/profile",
+			"src/evidence/live-host.json",
+			"src/cloud/evidence.json",
+			"dist/opencode-session-port-0.1.7.tgz",
+			"opencode-session-port-0.1.7.tgz",
+		]) {
+			expect(classifyPackedPath(forbidden)).toBe("forbidden");
+		}
+		// Intentional TypeScript sources with similar words are not artifacts.
+		for (const allowed of ["src/cloud/auth/credential-store.ts", "src/tui/wiring/experimental-profile.ts"]) {
+			expect(classifyPackedPath(allowed)).toBe("allowlisted");
 		}
 	});
 
@@ -106,6 +133,27 @@ describe("packed path classification", () => {
 		// No wildcard expansion: every non-built-entry required src path is exact.
 		for (const required of REQUIRED_PACKED_PATHS) {
 			if (required.startsWith("src/")) expect(required).not.toContain("*");
+		}
+	});
+
+	test("local-first replacement sources are required exact packed paths", () => {
+		// The active 0.1.7 local restore/replacement flow ships as source under
+		// src/**. These six exact paths (no wildcard) must stay required, and a
+		// listing missing any one of them must fail.
+		const replacementPaths = [
+			"src/core/restore/replacement.ts",
+			"src/tui/adapters/session-delete.ts",
+			"src/tui/adapters/session-reference-inventory.ts",
+			"src/tui/orchestration/local-restore.ts",
+			"src/tui/orchestration/newreplacement-execution.ts",
+			"src/tui/ui/restore-replacement-dialog.tsx",
+		];
+		for (const replacementPath of replacementPaths) {
+			expect(REQUIRED_PACKED_PATHS).toContain(replacementPath);
+			const withoutReplacement = REQUIRED_PACKED_PATHS.filter((required) => required !== replacementPath);
+			expect(checkPackedListing(withoutReplacement)).toContain(
+				`packed listing is missing required path: ${replacementPath}`,
+			);
 		}
 	});
 

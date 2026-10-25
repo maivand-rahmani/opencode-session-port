@@ -122,6 +122,10 @@ export interface FakeClientOptions {
 	readonly sessionGet?: (input: { readonly sessionID: string }) => Promise<unknown>;
 	/** Overrides the import response; the default derives a well-formed response from the request. */
 	readonly importSession?: (input: unknown) => Promise<unknown>;
+	/** When true, `session.remove` exists and removes a matching static fixture record. */
+	readonly withRemove?: boolean;
+	/** Overrides the remove behavior; inputs are still recorded. */
+	readonly removeSession?: (input: { readonly sessionID: string }) => Promise<unknown>;
 }
 
 export interface FakeClientHandle {
@@ -137,6 +141,7 @@ export interface FakeClientHandle {
 	}>;
 	readonly sessionGetInputs: Array<{ readonly sessionID: string }>;
 	readonly importInputs: unknown[];
+	readonly removeInputs: Array<{ readonly sessionID: string }>;
 	/** Times `client.session.import` was read (the capability probe is the first read). */
 	readonly sessionImportGetterReads: number;
 	/** Times `client.session.get` was read; the restore path must never read it. */
@@ -168,6 +173,7 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 	const messageListInputs: FakeClientHandle["messageListInputs"] = [];
 	const sessionGetInputs: FakeClientHandle["sessionGetInputs"] = [];
 	const importInputs: unknown[] = [];
+	const removeInputs: Array<{ readonly sessionID: string }> = [];
 	let projectListCalls = 0;
 	let sessionImportGetterReads = 0;
 	let sessionGetGetterReads = 0;
@@ -204,6 +210,15 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 			};
 		},
 	});
+	if (options.withRemove === true) {
+		(session as Record<string, unknown>)["remove"] = async (input: { readonly sessionID: string }) => {
+			removeInputs.push({ ...input });
+			if (options.removeSession !== undefined) return options.removeSession(input);
+			const index = sessions.findIndex((record) => record.info["id"] === input.sessionID);
+			if (index >= 0) sessions.splice(index, 1);
+			return undefined;
+		};
+	}
 	Object.defineProperty(session, "import", {
 		enumerable: true,
 		configurable: true,
@@ -253,6 +268,7 @@ export function createFakeClient(options: FakeClientOptions = {}): FakeClientHan
 		messageListInputs,
 		sessionGetInputs,
 		importInputs,
+		removeInputs,
 		get sessionImportGetterReads(): number {
 			return sessionImportGetterReads;
 		},

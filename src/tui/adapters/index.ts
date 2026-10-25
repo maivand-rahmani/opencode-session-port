@@ -71,6 +71,28 @@ export type {
 	ProjectDestinationErrorCode,
 	ProjectDestinationsAdapter,
 } from "./project-destinations.ts";
+export {
+	createSessionDeletePort,
+	probeSessionDeleteCapability,
+} from "./session-delete.ts";
+export type {
+	SessionDeleteOutcome,
+	SessionDeletePort,
+	SessionDeletePortOptions,
+	SessionDeleteProbe,
+} from "./session-delete.ts";
+export {
+	createSessionReferenceInventoryPort,
+} from "./session-reference-inventory.ts";
+export type {
+	SessionReferenceInventoryEntry,
+	SessionReferenceInventoryIncompleteReason,
+	SessionReferenceInventoryOptions,
+	SessionReferenceInventoryPort,
+	SessionReferenceInventoryResult,
+	SessionReferenceInventoryScope,
+	SessionReferenceInventoryScopeKind,
+} from "./session-reference-inventory.ts";
 export { createSessionIdInventory } from "./session-id-inventory.ts";
 export type {
 	SessionIdInventory,

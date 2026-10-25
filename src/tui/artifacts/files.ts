@@ -49,6 +49,7 @@
  */
 
 /// <reference types="node" />
+import { randomBytes } from "node:crypto";
 import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import type { ByteSource } from "../../core/contracts/index.ts";
@@ -92,6 +93,7 @@ const CHECKPOINT_DIRECTORY_NAME = ".sessionport";
  * implementation details (P-15/O-08), not a format or compatibility claim.
  */
 const CHECKPOINT_FILENAME_PREFIX = "checkpoint-";
+const RECOVERY_FILENAME_PREFIX = "recovery-";
 const CHECKPOINT_FILENAME_EXTENSION = ".sessionport";
 
 /** Options for `resolveCheckpointOutputPath`. */
@@ -156,11 +158,70 @@ export async function resolveCheckpointOutputPath(options: ResolveCheckpointOutp
  * UTC timestamp formatted with only Windows-safe characters (`:` replaced by
  * `-`, milliseconds included, `Z` suffix). Deterministic for an injected Date.
  */
-function buildDefaultFilename(instant: Date): string {
+function formatTimestamp(instant: Date): string {
 	const pad = (value: number, width: number): string => String(value).padStart(width, "0");
 	const date = `${pad(instant.getUTCFullYear(), 4)}-${pad(instant.getUTCMonth() + 1, 2)}-${pad(instant.getUTCDate(), 2)}`;
 	const time = `${pad(instant.getUTCHours(), 2)}-${pad(instant.getUTCMinutes(), 2)}-${pad(instant.getUTCSeconds(), 2)}-${pad(instant.getUTCMilliseconds(), 3)}`;
-	return `${CHECKPOINT_FILENAME_PREFIX}${date}T${time}Z${CHECKPOINT_FILENAME_EXTENSION}`;
+	return `${date}T${time}Z`;
+}
+
+function buildDefaultFilename(instant: Date): string {
+	return `${CHECKPOINT_FILENAME_PREFIX}${formatTimestamp(instant)}${CHECKPOINT_FILENAME_EXTENSION}`;
+}
+
+/** Options for `resolveRecoveryArtifactPath`. */
+export interface ResolveRecoveryArtifactPathOptions {
+	/** Current destination project directory; the recovery directory sits beneath it. */
+	readonly projectDirectory: string;
+	/** Injectable current time for deterministic filenames (tests). */
+	readonly now?: Date;
+	/** Injectable random suffix for deterministic filenames (tests); lowercase alphanumerics only. */
+	readonly randomSuffix?: string;
+}
+
+/**
+ * Resolves an exclusive path for one encrypted recovery artifact:
+ * `<projectDirectory>/.sessionport/recovery-<UTC timestamp>-<random>.sessionport`.
+ *
+ * The name never starts with `checkpoint-`, so the bare `/restore` latest
+ * checkpoint selector cannot confuse a recovery backup with a user checkpoint
+ * (the selector also excludes the `recovery-` prefix explicitly). The
+ * `.sessionport` directory is created if needed; an existing path is refused.
+ * The caller's `writeEncryptedArtifact` remains the authoritative `"wx"`
+ * overwrite guard. No plaintext file or temporary file is created here.
+ */
+export async function resolveRecoveryArtifactPath(options: ResolveRecoveryArtifactPathOptions): Promise<string> {
+	const input: unknown = options;
+	if (typeof input !== "object" || input === null) {
+		throw new ArtifactFileError("invalid-request", "resolveRecoveryArtifactPath options must be an object");
+	}
+	const fields = input as {
+		readonly projectDirectory?: unknown;
+		readonly now?: unknown;
+		readonly randomSuffix?: unknown;
+	};
+	const projectDirectory = requireNonEmptyString(fields.projectDirectory, "projectDirectory");
+	const now = fields.now;
+	if (now !== undefined && (!(now instanceof Date) || Number.isNaN(now.getTime()))) {
+		throw new ArtifactFileError("invalid-request", "now must be a valid Date when provided");
+	}
+	const randomSuffix = fields.randomSuffix;
+	if (
+		randomSuffix !== undefined &&
+		(typeof randomSuffix !== "string" || !/^[a-z0-9]+$/.test(randomSuffix))
+	) {
+		throw new ArtifactFileError("invalid-request", "randomSuffix must be lowercase alphanumeric when provided");
+	}
+
+	const directory = path.resolve(projectDirectory, CHECKPOINT_DIRECTORY_NAME);
+	await mkdir(directory, { recursive: true });
+	const suffix = randomSuffix ?? randomBytes(8).toString("hex");
+	const resolved = path.join(
+		directory,
+		`${RECOVERY_FILENAME_PREFIX}${formatTimestamp(now ?? new Date())}-${suffix}${CHECKPOINT_FILENAME_EXTENSION}`,
+	);
+	await assertPathDoesNotExist(resolved);
+	return resolved;
 }
 
 /**
@@ -257,6 +318,9 @@ export async function resolveLatestCheckpointArtifact(
 	let bestMtimeMs = Number.NEGATIVE_INFINITY;
 	for (const entry of await readdir(directory, { withFileTypes: true })) {
 		if (!entry.name.endsWith(CHECKPOINT_FILENAME_EXTENSION)) continue;
+		// Recovery backups are restore artifacts, not user checkpoints: the bare
+		// `/restore` newest-checkpoint selector never selects them.
+		if (entry.name.startsWith(RECOVERY_FILENAME_PREFIX)) continue;
 		// Dirent-level exclusion first; the lstat below is authoritative for
 		// the rest (including entries whose dirent type is unknown).
 		if (entry.isDirectory() || entry.isSymbolicLink()) continue;

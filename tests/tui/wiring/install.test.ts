@@ -201,13 +201,30 @@ describe("installSessionPortWiring", () => {
 			expect(handle.commands().map((command) => command.id)).toEqual([
 				"sessionport.checkpoint",
 				"sessionport.restore",
-				"sessionport.sync",
 			]);
 
 			(cleanup as () => void)();
 			expect(handle.disposals).toBe(1);
 		});
 	}
+
+	test("Windows: an explicit cloud-auth injection preserves the historical third /sync command", async () => {
+		const handle = createFakeInstallContext();
+		const cleanup = await installSessionPortWiring(handle.context, {
+			platform: "win32",
+			createCryptoFactory: async () => fakeFactory(),
+			createIdDeriver: async () => fakeDeriver(),
+			requestPassword: async () => undefined,
+			createCloudAuth: () => fakeCloudAuth(),
+		});
+		handle.renderSlot();
+		expect(handle.commands().map((command) => command.id)).toEqual([
+			"sessionport.checkpoint",
+			"sessionport.restore",
+			"sessionport.sync",
+		]);
+		(cleanup as () => void)();
+	});
 
 	test("Windows: host cleanup awaits deferred controller release, disposes the slot immediately, and shares one promise", async () => {
 		const handle = createFakeInstallContext();
@@ -425,7 +442,6 @@ describe("installSessionPortWiring", () => {
 		expect(handle.commands().map((command) => command.id)).toEqual([
 			"sessionport.checkpoint",
 			"sessionport.restore",
-			"sessionport.sync",
 		]);
 
 		(cleanup as () => void)();

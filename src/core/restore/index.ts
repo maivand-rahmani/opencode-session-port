@@ -22,3 +22,20 @@ export type {
 } from "./planner.ts";
 export { createRemappedIdDeriver, RemappedIdError } from "./identity.ts";
 export type { RemappedIdDeriver, RemappedIdErrorCode, RemappedIdNamespace } from "./identity.ts";
+export {
+	classifyReplacement,
+	fingerprintSessionRecord,
+	prepareStandaloneRecord,
+	ReplacementPolicyError,
+	verifyImportedRecord,
+} from "./replacement.ts";
+export type {
+	ClassifyReplacementInput,
+	ImportedRecordVerification,
+	ImportVerificationReason,
+	ReplacementClassification,
+	ReplacementCopyReason,
+	ReplacementMode,
+	ReplacementPolicyErrorCode,
+	VerifyImportedRecordInput,
+} from "./replacement.ts";

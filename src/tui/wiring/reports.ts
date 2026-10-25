@@ -37,6 +37,7 @@ import { CryptoContainerError } from "../../core/crypto/errors.ts";
 import { RestorePlanError, type RestorePlanErrorCode } from "../../core/restore/planner.ts";
 import { SessionCollectionError, type SessionCollectionErrorCode } from "../../core/sessions/index.ts";
 import { RESTORE_PASSWORD_ATTEMPT_LIMIT } from "../orchestration/index.ts";
+import type { RestoreReplacementReport } from "../orchestration/index.ts";
 import type { CheckpointOutcome, RestoreExecutionResult } from "../orchestration/index.ts";
 import type {
 	RestoreReportPresentationModel,
@@ -347,6 +348,43 @@ export function reportRestoreFailure(error: unknown, executionStarted: boolean):
 
 function restoreFailure(message: string): SessionPortNotification {
 	return { title: "Restore failed", message, variant: "error" };
+}
+
+/** An authenticated local checkpoint with no restorable sessions. */
+export function reportLocalRestoreEmpty(): SessionPortNotification {
+	return {
+		title: "Nothing to restore",
+		message: "The checkpoint contains no sessions; no sessions were imported.",
+		variant: "warning",
+	};
+}
+
+/**
+ * Bounded aggregate-only fallback when the replacement preview/outcome dialog
+ * could not be displayed after the executor ran. Per-session IDs/titles and raw
+ * exception text are omitted; the first encrypted recovery path is shown when
+ * one was verified so the user can retain it. No execution failure is claimed.
+ */
+export function reportRestoreReplacementFallback(report: RestoreReplacementReport): SessionPortNotification {
+	const count = (outcome: string): number =>
+		report.entries.filter((entry) => entry.outcome === outcome).length;
+	const lines = [
+		`Restore finished: ${count("replaced")} replaced, ${count("copied")} copied, ${count("imported")} imported, ` +
+			`${count("skipped")} skipped, ${count("kept")} kept, ${count("failed")} failed, ${count("uncertain")} uncertain ` +
+			`(${report.entries.length} total). The per-session report could not be displayed.`,
+	];
+	if (report.recoveryPath !== undefined) {
+		lines.push(`Encrypted recovery file: ${report.recoveryPath}`);
+	}
+	if (count("failed") > 0 || count("uncertain") > 0 || count("kept") > 0) {
+		lines.push("Partial progress: no atomic rollback; review the session list and keep the recovery file.");
+	}
+	const clean = count("failed") === 0 && count("uncertain") === 0 && count("kept") === 0;
+	return {
+		title: "Restore finished",
+		message: lines.join("\n"),
+		variant: clean ? "success" : "warning",
+	};
 }
 
 /**

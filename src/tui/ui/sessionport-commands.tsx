@@ -55,7 +55,7 @@ export function installSessionPortCommands(
 						id: SESSIONPORT_COMMAND_IDS.restore,
 						title: "Restore project sessions",
 						description:
-							"Choose an existing project and restore a checkpoint without overwriting its local sessions.",
+							"Preview and restore a checkpoint; confirm any local replacement.",
 						group: "SessionPort",
 						bind: false,
 						palette: true,
@@ -64,19 +64,25 @@ export function installSessionPortCommands(
 							await handlers.restore(rawInput);
 						},
 					},
-					{
-						id: SESSIONPORT_COMMAND_IDS.sync,
-						title: "Cloud sign-in",
-						description:
-							"Sign in to SessionPort cloud on this device.",
-						group: "SessionPort",
-						bind: false,
-						palette: true,
-						slash: { name: "sync", arguments: true },
-						run: async (rawInput) => {
-							await handlers.sync?.(rawInput);
-						},
-					},
+					// `/sync` exists only when an explicit cloud-auth handler was
+					// injected; the local-first default publishes two commands.
+					...(handlers.sync !== undefined
+						? [
+								{
+									id: SESSIONPORT_COMMAND_IDS.sync,
+									title: "Cloud sign-in",
+									description:
+										"Sign in to SessionPort cloud on this device.",
+									group: "SessionPort",
+									bind: false as const,
+									palette: true as const,
+									slash: { name: "sync", arguments: true as const },
+									run: async (rawInput: string | undefined) => {
+										await handlers.sync!(rawInput);
+									},
+								},
+							]
+						: []),
 				],
 			}));
 			return null;

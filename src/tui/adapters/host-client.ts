@@ -71,6 +71,19 @@ export interface SessionListCallInput {
 	readonly cursor?: string;
 }
 
+/**
+ * One global (unfiltered) `session.list` request as mapped by the
+ * incoming-reference inventory. `project` is deliberately absent: the
+ * inventory needs the unfiltered, all-project response surface, not a
+ * project-scoped one.
+ */
+export interface GlobalSessionListCallInput {
+	/** Explicit page size; the API default is never relied on. */
+	readonly limit: number;
+	/** Opaque `cursor.next`; absent on the first request. */
+	readonly cursor?: string;
+}
+
 /** One `message.list` request as mapped from `MessageListPageRequest`. */
 export interface MessageListCallInput {
 	/** Route-scoped session ID (the ownership boundary). */
@@ -178,6 +191,30 @@ export interface SessionImportClientLike {
 	};
 }
 
+/**
+ * One `session.remove` call payload. The pinned v2.0.22 generated client
+ * declares `remove(input: SessionRemoveInput, requestOptions?) =>
+ * Promise<void>` where `SessionRemoveInput` is exactly
+ * `{ readonly sessionID: string }`; no other field is ever sent by the delete
+ * adapter.
+ */
+export interface SessionRemoveCallInput {
+	/** The exact old session ID to remove; the only field ever sent. */
+	readonly sessionID: string;
+}
+
+/**
+ * Narrow structural view of the public native-delete surface. `remove` is
+ * optional because it may be absent or non-callable at runtime; the delete
+ * adapter reports that as a typed copy-only fallback instead of throwing an
+ * installation error.
+ */
+export interface SessionDeleteClientLike {
+	readonly session?: {
+		remove?(input: SessionRemoveCallInput): Promise<unknown>;
+	};
+}
+
 /* ------------------------------------------------------------------------- */
 /* Compile-time assertions against the installed TUI client declaration      */
 /* ------------------------------------------------------------------------- */
@@ -247,6 +284,36 @@ type _AssertHostImportOutputHasValidatedFields = AssertTrue<
 	}
 		? true
 		: false
+>;
+
+/**
+ * The installed v2.0.22 declaration must keep `session.remove` accepting
+ * exactly the narrow `{ sessionID }` payload the delete adapter sends. Drift
+ * in the input shape is a compile error, not a runtime surprise.
+ */
+type _AssertHostSessionRemoveInputCompatible = AssertTrue<
+	Parameters<HostTuiClient["session"]["remove"]>[0] extends SessionRemoveCallInput ? true : false
+>;
+
+/**
+ * The declared `session.remove` output must stay `void` (the generated
+ * promise client resolves `Promise<void>`). The delete adapter never reads a
+ * response body and never treats a returned host value as confirmation, so a
+ * declaration drift must fail compilation here.
+ */
+type HostSessionRemoveOutput = Awaited<ReturnType<HostTuiClient["session"]["remove"]>>;
+type _AssertHostSessionRemoveOutputIsVoid = AssertTrue<HostSessionRemoveOutput extends void ? true : false>;
+
+/** The installed declaration must expose the narrow native-delete surface. */
+type _AssertHostDeleteClientCompatible = AssertTrue<HostTuiClient extends SessionDeleteClientLike ? true : false>;
+
+/**
+ * The installed declaration must keep accepting the unfiltered global list
+ * request shape (no `project`) used by the incoming-reference inventory.
+ */
+type HostSessionListInput = NonNullable<Parameters<HostTuiClient["session"]["list"]>[0]>;
+type _AssertHostGlobalSessionListInputCompatible = AssertTrue<
+	GlobalSessionListCallInput extends HostSessionListInput ? true : false
 >;
 
 /* ------------------------------------------------------------------------- */

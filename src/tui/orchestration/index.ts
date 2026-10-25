@@ -47,6 +47,32 @@ export type { RestorePreflightInput, RestorePreflightOutcome } from "./restore-p
 export { isAuthenticationFailure, RESTORE_PASSWORD_ATTEMPT_LIMIT, runRestorePreflightWithPasswordAttempts } from "./restore-auth.ts";
 export type { RestoreAuthenticatedPreflightOutcome } from "./restore-auth.ts";
 export { runRestoreExecution } from "./restore-execution.ts";
+export { runLocalRestore } from "./local-restore.ts";
+export type { LocalRestoreInput, LocalRestoreOutcome, LocalRestoreUiPort } from "./local-restore.ts";
+export {
+	createReplacementDeletePortFactory,
+	createReplacementReferenceInventoryReader,
+	referenceInventoryFromAdapter,
+	runRestoreReplacementExecution,
+} from "./newreplacement-execution.ts";
+export type {
+	ReplacementDeleteOutcome,
+	ReplacementDeletePort,
+	ReplacementRecoveryPort,
+	ReplacementRecoveryResult,
+	ReplacementReferenceInventory,
+	RestoreReplacementAction,
+	RestoreReplacementExecutionInput,
+	RestoreReplacementExecutionResult,
+	RestoreReplacementOutcome,
+	RestoreReplacementPreview,
+	RestoreReplacementPreviewEntry,
+	RestoreReplacementReason,
+	RestoreReplacementReport,
+	RestoreReplacementReportEntry,
+	StandaloneRestorePlan,
+	StandaloneRestorePlanEntry,
+} from "./newreplacement-execution.ts";
 export type {
 	RestoreExecutionInput,
 	RestoreExecutionResult,

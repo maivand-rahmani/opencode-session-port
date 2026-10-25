@@ -54,12 +54,39 @@ describe("SessionPort command registration", () => {
 		expect(commands.every((command) => command.palette === true)).toBe(true);
 		expect(commands.map((command) => command.description)).toEqual([
 			"Create a password-encrypted checkpoint of the current project's sessions.",
-			"Choose an existing project and restore a checkpoint without overwriting its local sessions.",
+			"Preview and restore a checkpoint; confirm any local replacement.",
 			"Sign in to SessionPort cloud on this device.",
 		]);
 
 		cleanup();
 		expect(disposeCount).toBe(1);
+	});
+
+	test("publishes only the two local commands when no sync handler is provided", () => {
+		let slotClaim: Parameters<SessionPortCommandHost["ui"]["slot"]>[0] | undefined;
+		let layerFactory: Parameters<SessionPortCommandHost["keymap"]["layer"]>[0] | undefined;
+		installSessionPortCommands(
+			{
+				ui: {
+					slot: (claim) => {
+						slotClaim = claim;
+						return () => {};
+					},
+				},
+				keymap: {
+					layer: (factory) => {
+						layerFactory = factory;
+					},
+				},
+			},
+			{ checkpoint: async () => {}, restore: async () => {} },
+		);
+		slotClaim?.render({});
+		const commands = layerFactory?.().commands ?? [];
+		expect(commands.map((command) => command.id)).toEqual([
+			SESSIONPORT_COMMAND_IDS.checkpoint,
+			SESSIONPORT_COMMAND_IDS.restore,
+		]);
 	});
 
 	test("forwards raw slash input to each async handler without parsing or trimming", async () => {

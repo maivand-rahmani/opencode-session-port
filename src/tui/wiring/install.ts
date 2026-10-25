@@ -18,17 +18,21 @@
  * - Native commands are registered through the existing component-scoped
  *   `installSessionPortCommands` (E39: the keymap layer must live inside the
  *   app-slot component scope). The returned cleanup is composite and
- *   idempotent: it cancels cloud login and disposes the slot immediately, then
- *   starts controller disposal without making host teardown wait; command
+ *   idempotent: it disposes the slot immediately and, only for an explicitly
+ *   injected cloud auth, cancels login and starts controller disposal; command
  *   handlers own their errors and report sanitized copy, so a handler never
  *   throws raw host data at the host.
- * - Completed non-empty restore executions are presented through the
- *   designer-owned `showRestoreReportDialog` (aggregate/per-session facts only);
- *   empty results and dialog-display failures keep sanitized toast copy.
- * - The optional `/sync` command composes the designer-owned cloud-auth flow.
- *   Its controller, options value, owner lock, keyring, and vault are created
- *   only on a user action; absent/malformed configuration cannot block
- *   checkpoint/restore registration.
+ * - Restore preview/confirmation and per-session outcomes use the
+ *   designer-owned replacement UI (`createRestoreReplacementUi`). The legacy
+ *   `showRestoreReport` dependency is retained only for old injected tests and
+ *   is never used by the production local-first path, so two report UIs can
+ *   never both appear.
+ * - The local-first default publishes exactly `/checkpoint` and `/restore` and
+ *   never constructs a cloud controller, reads cloud options, opens a keyring,
+ *   or creates a vault. `/sync` appears only when an explicit
+ *   `options.createCloudAuth` handler is injected (historical validation
+ *   seam); cleanup for that explicit handler stays at-most-once and
+ *   fail-closed.
  *
  * This module statically imports the designer-owned UI modules (password modal
  * and restore report dialog), which import the optional UI peers
@@ -46,15 +50,19 @@ import type { Plugin } from "@opencode/plugin/tui";
 import type { CheckpointCryptoFactory } from "../../core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../core/crypto/index.ts";
 import { createRemappedIdDeriver, type RemappedIdDeriver } from "../../core/restore/index.ts";
-import { readEncryptedArtifact, resolveCheckpointOutputPath, resolveLatestCheckpointArtifact, writeEncryptedArtifact } from "../artifacts/files.ts";
+import {
+	readEncryptedArtifact,
+	resolveCheckpointOutputPath,
+	resolveLatestCheckpointArtifact,
+	resolveRecoveryArtifactPath,
+	writeEncryptedArtifact,
+} from "../artifacts/files.ts";
 import { requestPassword as showPasswordDialog } from "../ui/password-dialog.tsx";
 import { showRestoreReportDialog } from "../ui/restore-report-dialog.tsx";
+import { createRestoreReplacementUi } from "../ui/restore-replacement-dialog.tsx";
 import { installSessionPortCommands } from "../ui/sessionport-commands.tsx";
 import { createSessionPortHandlers, type SessionPortPasswordProvider } from "./composition.ts";
-import {
-	createSessionPortCloudAuth,
-	type SessionPortCloudAuthHandlers,
-} from "./cloud-auth.ts";
+import type { SessionPortCloudAuthHandlers } from "./cloud-auth.ts";
 import { EXPERIMENTAL_CRYPTO_POLICY_DEFINITION } from "./experimental-profile.ts";
 
 /** Test-only seams; production omits every field. */
@@ -67,7 +75,12 @@ export interface SessionPortInstallOptions {
 	readonly createIdDeriver?: () => Promise<RemappedIdDeriver>;
 	/** Password-provider seam; the default is the designer-owned masked TUI modal. */
 	readonly requestPassword?: SessionPortPasswordProvider;
-	/** Cloud-auth seam; production uses the lazy controller/UI composition. */
+	/**
+	 * Explicit cloud-auth injection seam only. The local-first 0.1.7 default
+	 * never creates a cloud controller, resolves cloud options, reads a keyring,
+	 * or opens a vault; without this injected handler only the two local
+	 * commands are registered.
+	 */
 	readonly createCloudAuth?: (
 		context: Plugin.Context,
 	) => SessionPortCloudAuthHandlers;
@@ -107,6 +120,8 @@ export async function installSessionPortWiring(
 			});
 		},
 		showRestoreReport: (model) => showRestoreReportDialog(context, model),
+		restoreReplacementUi: createRestoreReplacementUi(context),
+		resolveRecoveryArtifactPath,
 		requestPassword:
 			options.requestPassword ?? ((mode, maxPasswordBytes) => showPasswordDialog(context, mode, maxPasswordBytes)),
 		cryptoFactory,
@@ -117,12 +132,15 @@ export async function installSessionPortWiring(
 		readEncryptedArtifact,
 	});
 
-	// Cloud auth is optional: its handlers are cheap closures. The runtime
-	// options value, controller, owner lock, keyring, and vault stay untouched
-	// until the user invokes `/sync`.
-	const cloudAuth = (options.createCloudAuth ?? createSessionPortCloudAuth)(
-		context,
-	);
+	// Local-first default: no cloud controller/options/keyring/vault is touched.
+	// Only an explicit injected handler enables `/sync` (historical tests).
+	const cloudAuth = options.createCloudAuth?.(context);
+	if (
+		cloudAuth !== undefined &&
+		(typeof cloudAuth.cancel !== "function" || typeof cloudAuth.dispose !== "function")
+	) {
+		throw new TypeError("Injected cloud auth must expose cancel() and dispose()");
+	}
 
 	// E39: registration must stay inside the existing app-slot/keymap
 	// component scope. Cleanup is composite: cancel any login and dispose the
@@ -132,7 +150,7 @@ export async function installSessionPortWiring(
 	const slotDispose = installSessionPortCommands(context, {
 		checkpoint: handlers.checkpoint,
 		restore: handlers.restore,
-		sync: cloudAuth.sync,
+		...(cloudAuth !== undefined ? { sync: cloudAuth.sync } : {}),
 	});
 
 	let cleanupPromise: Promise<void> | undefined;
@@ -155,11 +173,14 @@ export async function installSessionPortWiring(
 	};
 
 	async function performCleanup(): Promise<void> {
-		// Both immediate cleanup steps run even if the other throws.
-		try {
-			cloudAuth.cancel();
-		} catch {
-			// Cancellation is contained; release still runs below.
+		// Both immediate cleanup steps run even if the other throws. Cloud
+		// cancellation/release exist only for an explicitly injected controller.
+		if (cloudAuth !== undefined) {
+			try {
+				cloudAuth.cancel?.();
+			} catch {
+				// Cancellation is contained; release still runs below.
+			}
 		}
 		let slotFailure = false;
 		try {
@@ -169,10 +190,12 @@ export async function installSessionPortWiring(
 		}
 
 		let releaseFailure = false;
-		try {
-			await cloudAuth.dispose();
-		} catch {
-			releaseFailure = true;
+		if (cloudAuth !== undefined) {
+			try {
+				await cloudAuth.dispose?.();
+			} catch {
+				releaseFailure = true;
+			}
 		}
 
 		if (releaseFailure) {
