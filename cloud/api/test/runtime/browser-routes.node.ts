@@ -158,9 +158,10 @@ test('callback query is allowlisted and redirects stay on the configured origin'
     ],
   });
 
+  const issuer = 'https://github.com/login/oauth';
   const response = await app.inject({
     method: 'GET',
-    url: '/api/auth/callback/github?code=abc&state=xyz',
+    url: `/api/auth/callback/github?code=abc&state=xyz&iss=${encodeURIComponent(issuer)}`,
   });
 
   assert.equal(response.statusCode, 302);
@@ -171,15 +172,21 @@ test('callback query is allowlisted and redirects stay on the configured origin'
   assert.equal(authority.calls.length, 1);
   assert.equal(
     authority.calls[0]?.url,
-    'https://api.example.test/api/auth/callback/github?code=abc&state=xyz',
+    `https://api.example.test/api/auth/callback/github?code=abc&state=xyz&iss=${encodeURIComponent(issuer)}`,
   );
 
-  const unknown = await app.inject({
-    method: 'GET',
-    url: '/api/auth/callback/github?code=abc&unexpected=1',
-  });
-  assert.equal(unknown.statusCode, 400);
-  assert.equal(errorBody(unknown.body).error.code, 'invalid-request');
+  for (const query of [
+    'code=abc&unexpected=1',
+    'code=abc&state=xyz&iss=https%3A%2F%2Fevil.example.test',
+    `code=abc&state=xyz&iss=${encodeURIComponent(issuer)}&iss=${encodeURIComponent(issuer)}`,
+  ]) {
+    const rejected = await app.inject({
+      method: 'GET',
+      url: `/api/auth/callback/github?${query}`,
+    });
+    assert.equal(rejected.statusCode, 400);
+    assert.equal(errorBody(rejected.body).error.code, 'invalid-request');
+  }
   assert.equal(authority.calls.length, 1);
 });
 

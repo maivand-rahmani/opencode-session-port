@@ -758,3 +758,24 @@ test('poll errors carry Retry-After and unknown service errors are redacted', as
   assert.equal(brokenResponse.headers['cache-control'], 'no-store');
   assert.equal(brokenResponse.headers['referrer-policy'], 'no-referrer');
 });
+
+test('legacy unprovisioned quota exchanges stay a redacted 500 until opt-in is configured', async (t) => {
+  const quotaService = new FakeService({
+    exchange: async () => {
+      throw new NativeAuthServiceError('quota-not-provisioned');
+    },
+  });
+  const quota = makeApp(t, { service: quotaService });
+  const response = await quota.app.inject({
+    method: 'POST',
+    url: '/api/native/v1/token',
+    headers: { 'content-type': 'application/json' },
+    payload: JSON.stringify({ deviceCode: DEVICE_CODE }),
+  });
+
+  assert.equal(response.statusCode, 500);
+  assert.equal(errorCode(response), 'quota-not-provisioned');
+  assert.equal(response.headers['cache-control'], 'no-store');
+  assert.equal(response.headers['referrer-policy'], 'no-referrer');
+  assert.equal(response.body.includes(DEVICE_CODE), false);
+});

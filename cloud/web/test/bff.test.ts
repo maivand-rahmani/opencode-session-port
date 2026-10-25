@@ -576,6 +576,37 @@ test("sign-in is GitHub-only, fixes its callback, uses manual redirects, and pre
 	]);
 });
 
+test("sign-in accepts the internal bridge redirectURL and rejects unsafe candidates", async () => {
+	const safeURL = "https://github.com/login/oauth/authorize?client_id=example&state=state-value";
+	const makeRequest = () => new Request(`${config.publicOrigin}/api/auth/sign-in/social`, {
+		method: "POST",
+		headers: { origin: config.publicOrigin, "content-type": "application/json" },
+		body: JSON.stringify({ provider: "github" }),
+	});
+	const success = await proxyAuthRequest(makeRequest(), ["sign-in", "social"], {
+		config,
+		policy,
+		fetcher: async () => Response.json({ redirectURL: safeURL }),
+	});
+	assert.equal(success.status, 200);
+	assert.deepEqual(await success.json(), { url: safeURL });
+
+	for (const candidate of [
+		"https://evil.example/login/oauth/authorize?client_id=example",
+		"not-a-url",
+		42,
+	]) {
+		const rejected = await proxyAuthRequest(makeRequest(), ["sign-in", "social"], {
+			config,
+			policy,
+			fetcher: async () => Response.json({ redirectURL: candidate }),
+		});
+		assert.equal(rejected.status, 500);
+		assert.equal((await rejected.json()).error.code, "internal-error");
+		assert.equal(rejected.headers.get("location"), null);
+	}
+});
+
 test("sign-in rejects provider and callback fields supplied by the browser", async () => {
 	let calls = 0;
 	const request = new Request(`${config.publicOrigin}/api/auth/sign-in/social`, {
@@ -642,7 +673,8 @@ test("get-session removes Better Auth session tokens from the browser DTO", asyn
 test("GitHub callback forwards only OAuth query keys and redirects only to the fixed device page", async () => {
 	let capturedURL = "";
 	let capturedInit: RequestInit | undefined;
-	const request = new Request(`${config.publicOrigin}/api/auth/callback/github?code=oauth-code&state=state-value`, {
+	const issuer = "https://github.com/login/oauth";
+	const request = new Request(`${config.publicOrigin}/api/auth/callback/github?code=oauth-code&state=state-value&iss=${encodeURIComponent(issuer)}`, {
 		headers: { cookie: "oauth-state=opaque", authorization: "Bearer attacker" },
 	});
 	const response = await proxyAuthRequest(request, ["callback", "github"], {
@@ -658,7 +690,7 @@ test("GitHub callback forwards only OAuth query keys and redirects only to the f
 		},
 	});
 	const forwarded = new Headers(capturedInit?.headers);
-	assert.equal(capturedURL, `${config.apiOrigin}/api/auth/callback/github?code=oauth-code&state=state-value`);
+	assert.equal(capturedURL, `${config.apiOrigin}/api/auth/callback/github?code=oauth-code&state=state-value&iss=${encodeURIComponent(issuer)}`);
 	assert.equal(capturedInit?.redirect, "manual");
 	assert.deepEqual([...forwarded.keys()].sort(), ["accept", "cookie"]);
 	assert.equal(forwarded.get("origin"), null);
@@ -672,7 +704,13 @@ test("GitHub callback forwards only OAuth query keys and redirects only to the f
 
 test("callback rejects human-code query parameters and duplicate OAuth fields", async () => {
 	let calls = 0;
-	for (const suffix of ["?userCode=01ARZ3NDEKTS", "?code=a&code=b", "?state=s&next=https%3A%2F%2Fevil.example"]) {
+	for (const suffix of [
+		"?userCode=01ARZ3NDEKTS",
+		"?code=a&code=b",
+		"?state=s&next=https%3A%2F%2Fevil.example",
+		"?code=a&state=s&iss=https%3A%2F%2Fevil.example",
+		"?code=a&state=s&iss=https%3A%2F%2Fgithub.com%2Flogin%2Foauth&iss=https%3A%2F%2Fgithub.com%2Flogin%2Foauth",
+	]) {
 		const request = new Request(`${config.publicOrigin}/api/auth/callback/github${suffix}`);
 		const response = await proxyAuthRequest(request, ["callback", "github"], {
 			config,

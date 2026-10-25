@@ -269,6 +269,13 @@ export interface NativeAuthServiceOptions {
   readonly generateHumanCode?: () => string;
   readonly generateCredential?: (kind: CredentialKind) => string;
   readonly generateID?: () => string;
+  /**
+   * Explicit initial storage limit, in bytes, for an approved account whose
+   * quota row does not exist when its first device-code exchange succeeds.
+   * Omitted preserves fail-closed `quota-not-provisioned` behavior; there is
+   * no implicit default. Existing quota rows are never modified.
+   */
+  readonly initialStorageLimitBytes?: bigint;
 }
 
 export interface NativeAuthService {
@@ -299,6 +306,7 @@ interface NormalizedConfig {
   readonly policy: NativeAuthPolicy;
   readonly polling: NativePollingPolicy;
   readonly humanCodes: HumanCodeKeyRing;
+  readonly initialStorageLimitBytes?: bigint;
 }
 
 /**
@@ -358,6 +366,7 @@ export function createNativeAuthService(
         generateCredentialValue,
         generateIDValue,
         deviceCode,
+        normalized.initialStorageLimitBytes,
       ),
     refreshToken: (value: string) =>
       refreshToken(
@@ -571,6 +580,7 @@ async function exchangeDeviceCode(
   generateCredentialValue: (kind: CredentialKind) => string,
   generateIDValue: () => string,
   rawDeviceCode: string,
+  initialStorageLimitBytes: bigint | undefined,
 ): Promise<NativeTokenResponse> {
   const deviceCodeFingerprint = fingerprintInput('device', rawDeviceCode);
   const now = clock();
@@ -612,6 +622,9 @@ async function exchangeDeviceCode(
       polling: config.polling,
       maxActiveGrantsPerUser:
         config.policy.capacity.maxActiveGrantsPerUser,
+      ...(initialStorageLimitBytes === undefined
+        ? {}
+        : { initialStorageLimitBytes }),
     });
   } catch (error) {
     return throwRepositoryFailure(error);
@@ -845,6 +858,14 @@ function readServiceOptions(
   ) {
     throw new TypeError('Invalid native-auth service options.');
   }
+  if (
+    options.initialStorageLimitBytes !== undefined &&
+    (typeof options.initialStorageLimitBytes !== 'bigint' ||
+      options.initialStorageLimitBytes <= 0n ||
+      options.initialStorageLimitBytes > BigInt(Number.MAX_SAFE_INTEGER))
+  ) {
+    throw new TypeError('Invalid native-auth service options.');
+  }
 
   const clock = readClock(options.now);
   let humanCodes: HumanCodeKeyRing;
@@ -862,6 +883,9 @@ function readServiceOptions(
     policy,
     polling: policy.polling,
     humanCodes,
+    ...(options.initialStorageLimitBytes === undefined
+      ? {}
+      : { initialStorageLimitBytes: options.initialStorageLimitBytes }),
   };
 }
 

@@ -20,6 +20,7 @@ export const BROWSER_SIGN_OUT_PATH = '/api/auth/sign-out';
 
 const INVALID_DEPENDENCY_MESSAGE = 'Invalid browser auth dependency.';
 const AUTH_UNAVAILABLE_MESSAGE = 'The authentication service is unavailable.';
+const GITHUB_ISSUER = 'https://github.com/login/oauth';
 
 export interface BrowserAuthBridgeOptions {
   readonly authority: BrowserSessionAuthority;
@@ -351,10 +352,14 @@ function readCallbackQuery(request: FastifyRequest): URLSearchParams | null {
     'state',
     'error',
     'error_description',
+    'iss',
   ]);
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
     if (!allowed.has(key) || typeof value !== 'string') {
+      return null;
+    }
+    if (key === 'iss' && value !== GITHUB_ISSUER) {
       return null;
     }
     params.set(key, value);

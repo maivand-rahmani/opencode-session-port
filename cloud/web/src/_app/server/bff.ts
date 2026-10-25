@@ -58,6 +58,7 @@ const CROCKFORD_CODE = /^[0-9A-HJKMNP-TV-Z]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CSRF_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_TIMER_MS = 2_147_483_647;
+const GITHUB_ISSUER = "https://github.com/login/oauth";
 
 const PUBLIC_ORIGIN_ENV = "SESSIONPORT_PUBLIC_ORIGIN";
 const API_ORIGIN_ENV = "SESSIONPORT_INTERNAL_API_ORIGIN";
@@ -359,9 +360,11 @@ export async function proxyAuthRequest(
 		if (!upstream.ok) return apiErrorResponse(upstream.status === 401 ? 401 : 503, upstream.status === 401 ? "unauthenticated" : "unavailable", setCookies);
 		const parsed = parseJson(upstreamResult.text);
 		if (!parsed.ok) return apiErrorResponse(500, "internal-error", setCookies);
-		const url = isPlainRecord(parsed.value) ? parsed.value.url : undefined;
-		if (!isSafeGitHubAuthorizationUrl(url)) return apiErrorResponse(500, "internal-error", setCookies);
-		return jsonResponse({ url }, 200, undefined, setCookies);
+		const candidate = isPlainRecord(parsed.value)
+			? (parsed.value.url ?? parsed.value.redirectURL)
+			: undefined;
+		if (!isSafeGitHubAuthorizationUrl(candidate)) return apiErrorResponse(500, "internal-error", setCookies);
+		return jsonResponse({ url: candidate }, 200, undefined, setCookies);
 	}
 
 	if (path === "callback/github") {
@@ -611,12 +614,13 @@ function isExactAuthUrl(request: Request, path: string, allowQuery: boolean): bo
 }
 
 function safeOAuthCallbackQuery(request: Request): string | null {
-	const allowed = new Set(["code", "state", "error", "error_description"]);
+	const allowed = new Set(["code", "state", "error", "error_description", "iss"]);
 	try {
 		const url = new URL(request.url);
 		const out = new URLSearchParams();
 		for (const [key, value] of url.searchParams) {
 			if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) return null;
+			if (key === "iss" && value !== GITHUB_ISSUER) return null;
 			out.append(key, value);
 		}
 		return out.toString();

@@ -53,6 +53,12 @@ export type BrowserAuthFactory = (
   client: PrismaClient,
 ) => Promise<BrowserSessionAuthority>;
 
+/** Focused-test seam only; production uses `createNativeAuthService`. */
+export type NativeAuthServiceFactory = (
+  client: PrismaClient,
+  options: Parameters<typeof createNativeAuthService>[1],
+) => NativeAuthService;
+
 export interface CloudRuntimeRepositoryOverrides {
   readonly projects?: ProjectRepositoryWithState;
   readonly projectList?: ProjectListRepository;
@@ -63,6 +69,8 @@ export interface CloudRuntimeRepositoryOverrides {
 export interface CloudRuntimeDependencies {
   /** Focused-test seam only; production uses `createBrowserAuth`. */
   readonly browserAuthFactory?: BrowserAuthFactory;
+  /** Focused-test seam only; production uses `createNativeAuthService`. */
+  readonly nativeAuthServiceFactory?: NativeAuthServiceFactory;
   readonly repositories?: CloudRuntimeRepositoryOverrides;
   /** Injected clock for deterministic tests. */
   readonly now?: () => Date;
@@ -133,14 +141,28 @@ export async function createCloudRuntime(
     dependencies.browserAuthFactory,
   );
 
-  const nativeService = createNativeAuthService(client, {
+  const nativeAuthOptions: Parameters<typeof createNativeAuthService>[1] = {
     config: config.native,
     repositoryPolicy: {
       maxOutstandingPendingAuthorizationsGlobal:
         config.backend.maxOutstandingPendingAuthorizationsGlobal,
     },
+    // fix106 owns NativeAuthServiceOptions/repository forwarding. Until that
+    // optional field lands, the service ignores this option, so provisioning
+    // stays disabled even when configured; do not add a fallback default here.
+    ...(config.backend.initialStorageLimitBytes === undefined
+      ? {}
+      : {
+          initialStorageLimitBytes: BigInt(
+            config.backend.initialStorageLimitBytes,
+          ),
+        }),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
-  });
+  };
+  const nativeService =
+    dependencies.nativeAuthServiceFactory === undefined
+      ? createNativeAuthService(client, nativeAuthOptions)
+      : dependencies.nativeAuthServiceFactory(client, nativeAuthOptions);
   const rateLimiter = createInMemoryRateLimiter({
     maxEntries: config.backend.maxRateLimitEntries,
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),

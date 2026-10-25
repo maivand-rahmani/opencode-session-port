@@ -1,13 +1,22 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-export function securityProxy(request: NextRequest) {
+type SecurityRuntimeEnvironment = {
+	readonly NODE_ENV?: string;
+};
+
+export function securityProxy(
+	request: NextRequest,
+	runtimeEnvironment: SecurityRuntimeEnvironment = process.env,
+) {
 	const nonce = btoa(crypto.randomUUID());
-	const developmentConnect = process.env.NODE_ENV === "development"
+	const isDevelopment = runtimeEnvironment.NODE_ENV === "development";
+	const developmentConnect = isDevelopment
 		? " ws://localhost:* ws://127.0.0.1:*"
 		: "";
+	const developmentScript = isDevelopment ? " 'unsafe-eval'" : "";
 	const policy = [
 		"default-src 'self'",
-		`script-src 'self' 'nonce-${nonce}'`,
+		`script-src 'self' 'nonce-${nonce}'${developmentScript}`,
 		`style-src 'self' 'nonce-${nonce}'`,
 		"style-src-attr 'none'",
 		"script-src-attr 'none'",

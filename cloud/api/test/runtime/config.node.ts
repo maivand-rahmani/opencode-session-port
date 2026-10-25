@@ -168,6 +168,83 @@ test('cloud mode validates the exact backend policy shape and bounds', () => {
   }
 });
 
+test('legacy seven-field backend policy is accepted with no quota-provision field', () => {
+  const config = readRuntimeConfig(cloudEnv(), API_CONFIG);
+  assert.equal(config.mode, 'cloud');
+  if (config.mode !== 'cloud') {
+    throw new Error('expected cloud mode');
+  }
+  assert.deepEqual(config.backend, BACKEND_POLICY);
+  assert.equal(
+    Object.hasOwn(config.backend, 'initialStorageLimitBytes'),
+    false,
+  );
+});
+
+test('explicit owner-approved initialStorageLimitBytes is accepted unchanged', () => {
+  const config = readRuntimeConfig(
+    cloudEnv({
+      [BACKEND_POLICY_ENV]: JSON.stringify({
+        ...BACKEND_POLICY,
+        initialStorageLimitBytes: 1_073_741_824,
+      }),
+    }),
+    API_CONFIG,
+  );
+  assert.equal(config.mode, 'cloud');
+  if (config.mode !== 'cloud') {
+    throw new Error('expected cloud mode');
+  }
+  assert.equal(config.backend.initialStorageLimitBytes, 1_073_741_824);
+  const { initialStorageLimitBytes, ...legacy } = config.backend;
+  assert.equal(initialStorageLimitBytes, 1_073_741_824);
+  assert.deepEqual(legacy, BACKEND_POLICY);
+});
+
+test('invalid optional initialStorageLimitBytes fails closed', () => {
+  const invalidValues: unknown[] = [
+    0,
+    -1,
+    1.5,
+    2 ** 53,
+    '1073741824',
+    null,
+    true,
+    [],
+    {},
+  ];
+  for (const value of invalidValues) {
+    assert.throws(
+      () =>
+        readRuntimeConfig(
+          cloudEnv({
+            [BACKEND_POLICY_ENV]: JSON.stringify({
+              ...BACKEND_POLICY,
+              initialStorageLimitBytes: value,
+            }),
+          }),
+          API_CONFIG,
+        ),
+      expectedError('invalid-backend-policy'),
+      String(value),
+    );
+  }
+});
+
+test('health-only mode ignores an invalid quota-provision field as before', () => {
+  const config = readRuntimeConfig(
+    cloudEnv({
+      [API_MODE_ENV]: 'health-only',
+      [BACKEND_POLICY_ENV]: JSON.stringify({
+        ...BACKEND_POLICY,
+        initialStorageLimitBytes: 0,
+      }),
+    }),
+    API_CONFIG,
+  );
+  assert.deepEqual(config, { mode: 'health-only' });
+});
+
 test('cloud mode requires native auth to match the API origin and device cap', () => {
   assert.throws(
     () =>

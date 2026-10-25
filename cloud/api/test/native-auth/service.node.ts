@@ -166,6 +166,8 @@ interface FakeOptions {
   readonly quota?: readonly string[];
   readonly pendingCreateErrors?: unknown[];
   readonly pendingUpdateErrors?: unknown[];
+  readonly grantCreateError?: unknown;
+  readonly quotaInsertError?: unknown;
 }
 
 class FakePrisma {
@@ -188,6 +190,7 @@ class FakePrisma {
   readonly refreshUpdates: Array<{ data: Record<string, unknown> }> = [];
   readonly createErrors: unknown[];
   readonly updateErrors: unknown[];
+  readonly quotaInserts: Array<{ userID: string; limitBytes: bigint }> = [];
 
   readonly tx: Record<string, unknown>;
   readonly nativePendingAuthorization: {
@@ -196,7 +199,10 @@ class FakePrisma {
   readonly nativeRefreshToken: { findUnique(args: unknown): Promise<unknown> };
   readonly nativeDeviceGrant: { findMany(args: unknown): Promise<unknown> };
 
+  private readonly options: FakeOptions;
+
   constructor(options: FakeOptions = {}) {
+    this.options = options;
     this.pending = options.pending ?? [];
     this.grants = options.grants ?? [];
     this.devices = options.devices ?? [];
@@ -322,6 +328,9 @@ class FakePrisma {
         async create(args: { data: Record<string, unknown> }) {
           self.order.push('grant.create');
           self.grantCreates.push(args.data);
+          if (self.options.grantCreateError !== undefined) {
+            throw self.options.grantCreateError;
+          }
           const row: GrantRow = {
             id: args.data.id as string,
             userID: args.data.userID as string,
@@ -431,6 +440,20 @@ class FakePrisma {
           return (row === undefined ? [] : [row]) as unknown as T;
         }
         if (sql.includes('"UserQuota"')) {
+          if (sql.includes('INSERT INTO "UserQuota"')) {
+            self.order.push('raw.quota-insert');
+            if (self.options.quotaInsertError !== undefined) {
+              throw self.options.quotaInsertError;
+            }
+            const userID = values[0] as string;
+            const limitBytes = values[1] as bigint;
+            if (!self.quota.has(userID)) {
+              self.quota.add(userID);
+              self.quotaInserts.push({ userID, limitBytes });
+              return [{ userID }] as unknown as T;
+            }
+            return [] as unknown as T;
+          }
           self.order.push('raw.quota-lock');
           return (self.quota.has(values[0] as string)
             ? [{ userID: values[0] }]
@@ -500,9 +523,18 @@ class FakePrisma {
   ): Promise<T> {
     this.transactionOptions.push(options);
     this.order.push('transaction.begin');
-    const result = await operation(this.tx);
-    this.order.push('transaction.commit');
-    return result;
+    const quotaBefore = new Set(this.quota);
+    const insertsBefore = this.quotaInserts.length;
+    try {
+      const result = await operation(this.tx);
+      this.order.push('transaction.commit');
+      return result;
+    } catch (error) {
+      this.quota.clear();
+      for (const userID of quotaBefore) this.quota.add(userID);
+      this.quotaInserts.length = insertsBefore;
+      throw error;
+    }
   }
 }
 
@@ -1063,6 +1095,151 @@ test('exchange maps pending, slow-down, denied, expired, consumed, quota, and ca
       error instanceof NativeAuthServiceError &&
       error.code === 'state-conflict',
   );
+});
+
+test('opt-in initial quota provisioning flows through the real service and repository only for approved users', async () => {
+  const deviceCode = credential(60);
+  const fingerprint = fingerprintCredential('device', deviceCode);
+  const initialStorageLimitBytes = 1_073_741_824n;
+  const fake = new FakePrisma({
+    pending: [
+      pendingRow({
+        deviceCodeFingerprint: fingerprint,
+        status: 'approved',
+        approvedUserID: USER_ID,
+      }),
+    ],
+    quota: [],
+  });
+
+  const result = await service(fake, {
+    initialStorageLimitBytes,
+    generateCredential: generatedCredentials([credential(61), credential(62)]),
+    generateID: generatedIDs([GRANT_ID, DEVICE_ID, ACCESS_ID, REFRESH_ID]),
+  }).exchangeDeviceCode(deviceCode);
+
+  assert.equal(result.tokenType, 'Bearer');
+  assert.equal(fake.quotaInserts.length, 1);
+  assert.deepEqual(fake.quotaInserts[0], {
+    userID: USER_ID,
+    limitBytes: initialStorageLimitBytes,
+  });
+  assert.equal(fake.grantCreates[0]?.userID, USER_ID);
+  assert.equal(fake.pending[0]?.status, 'consumed');
+
+  const existing = new FakePrisma({
+    pending: [
+      pendingRow({
+        deviceCodeFingerprint: fingerprint,
+        status: 'approved',
+        approvedUserID: USER_ID,
+      }),
+    ],
+    quota: [USER_ID],
+  });
+  await service(existing, {
+    initialStorageLimitBytes: 1n,
+    generateCredential: generatedCredentials([credential(61), credential(62)]),
+    generateID: generatedIDs([GRANT_ID, DEVICE_ID, ACCESS_ID, REFRESH_ID]),
+  }).exchangeDeviceCode(deviceCode);
+  assert.equal(existing.quotaInserts.length, 0);
+
+  const legacy = new FakePrisma({
+    pending: [
+      pendingRow({
+        deviceCodeFingerprint: fingerprint,
+        status: 'approved',
+        approvedUserID: USER_ID,
+      }),
+    ],
+    quota: [],
+  });
+  await assert.rejects(
+    service(legacy, {
+      generateCredential: generatedCredentials([credential(61), credential(62)]),
+      generateID: generatedIDs([GRANT_ID, DEVICE_ID, ACCESS_ID, REFRESH_ID]),
+    }).exchangeDeviceCode(deviceCode),
+    (error: unknown) =>
+      error instanceof NativeAuthServiceError &&
+      error.code === 'quota-not-provisioned',
+  );
+  assert.equal(legacy.quotaInserts.length, 0);
+  assert.equal(legacy.grantCreates.length, 0);
+});
+
+test('invalid initial quota options fail construction and no provisioning happens for rejected exchanges', async () => {
+  for (const initialStorageLimitBytes of [
+    0n,
+    -1n,
+    BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+    1 as unknown as bigint,
+    '1073741824' as unknown as bigint,
+  ]) {
+    assert.throws(
+      () => service(new FakePrisma(), { initialStorageLimitBytes }),
+      TypeError,
+    );
+  }
+  assert.doesNotThrow(() =>
+    service(new FakePrisma(), {
+      initialStorageLimitBytes: BigInt(Number.MAX_SAFE_INTEGER),
+    }),
+  );
+
+  const deviceCode = credential(63);
+  const fingerprint = fingerprintCredential('device', deviceCode);
+  for (const [status, code, expiresAt] of [
+    ['denied', 'authorization-denied', LATER],
+    ['consumed', 'authorization-consumed', NOW],
+  ] as const) {
+    const fake = new FakePrisma({
+      pending: [
+        pendingRow({ deviceCodeFingerprint: fingerprint, status, expiresAt }),
+      ],
+      quota: [],
+    });
+    await assert.rejects(
+      service(fake, {
+        initialStorageLimitBytes: 1_073_741_824n,
+        generateCredential: generatedCredentials([credential(64), credential(65)]),
+        generateID: generatedIDs([GRANT_ID, DEVICE_ID, ACCESS_ID, REFRESH_ID]),
+      }).exchangeDeviceCode(deviceCode),
+      (error: unknown) =>
+        error instanceof NativeAuthServiceError && error.code === code,
+    );
+    assert.equal(fake.quotaInserts.length, 0);
+    assert.equal(fake.grantCreates.length, 0);
+  }
+});
+
+test('a failed grant write rolls back opt-in quota provisioning and surfaces unavailable', async () => {
+  const deviceCode = credential(66);
+  const fake = new FakePrisma({
+    pending: [
+      pendingRow({
+        deviceCodeFingerprint: fingerprintCredential('device', deviceCode),
+        status: 'approved',
+        approvedUserID: USER_ID,
+      }),
+    ],
+    quota: [],
+    grantCreateError: new Error('simulated grant write failure'),
+  });
+
+  await assert.rejects(
+    service(fake, {
+      initialStorageLimitBytes: 1_073_741_824n,
+      generateCredential: generatedCredentials([credential(67), credential(68)]),
+      generateID: generatedIDs([GRANT_ID, DEVICE_ID, ACCESS_ID, REFRESH_ID]),
+    }).exchangeDeviceCode(deviceCode),
+    (error: unknown) =>
+      error instanceof NativeAuthServiceError && error.code === 'unavailable',
+  );
+  assert.equal(fake.quota.has(USER_ID), false);
+  assert.equal(fake.quotaInserts.length, 0);
+  assert.equal(fake.accessCreates.length, 0);
+  assert.equal(fake.refreshCreates.length, 0);
+  assert.equal(fake.pending[0]?.status, 'approved');
 });
 
 test('refresh rotates once and a spent-token replay throws only after committed revocation', async () => {

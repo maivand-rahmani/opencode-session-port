@@ -196,6 +196,13 @@ export interface ExchangeDeviceCodeInput {
   readonly refresh: NativeTokenInsert;
   readonly polling: NativePollingPolicy;
   readonly maxActiveGrantsPerUser: number;
+  /**
+   * Explicit initial storage limit for an approved account whose quota row
+   * does not exist yet. Omitted means fail closed with
+   * `quota-not-provisioned`; there is no implicit default. Existing quota rows
+   * are never modified, even when this value differs.
+   */
+  readonly initialStorageLimitBytes?: bigint;
 }
 
 export interface RotateRefreshTokenInput {
@@ -599,21 +606,44 @@ async function exchangeDeviceCode(
           return { kind: 'state-conflict' as const };
         }
 
+        // Opt-in preflight only avoids writing a quota row for a request that
+        // is already capped. It is NOT authoritative: the count under the
+        // quota FOR UPDATE lock below always decides grant creation.
+        if (input.initialStorageLimitBytes !== undefined) {
+          const preflightGrantCount = await countActiveGrants(
+            transaction,
+            pending.approvedUserID,
+            input.now,
+          );
+          if (preflightGrantCount >= input.maxActiveGrantsPerUser) {
+            return { kind: 'active-grant-limit' as const };
+          }
+        }
+
         // Pending -> quota -> grant creation. No other transaction takes the
         // quota lock before a pending lock, so this order cannot cycle with
-        // approval, refresh, or revocation.
-        const quota = await lockQuotaRow(transaction, pending.approvedUserID);
+        // approval, refresh, or revocation. Initial provisioning is opt-in and
+        // only applies to this verified approved user in this transaction.
+        const quota =
+          input.initialStorageLimitBytes === undefined
+            ? await lockQuotaRow(transaction, pending.approvedUserID)
+            : await provisionAndLockQuota(
+                transaction,
+                pending.approvedUserID,
+                input.initialStorageLimitBytes,
+              );
         if (!quota) {
           return { kind: 'quota-not-provisioned' as const };
         }
 
-        const activeGrantCount = await transaction.nativeDeviceGrant.count({
-          where: {
-            userID: pending.approvedUserID,
-            status: 'active',
-            expiresAt: { gt: input.now },
-          },
-        });
+        // Authoritative cap gate after the quota lock. Never reuse the
+        // preflight count: concurrent approved exchanges can pass preflight
+        // before either grant commits.
+        const activeGrantCount = await countActiveGrants(
+          transaction,
+          pending.approvedUserID,
+          input.now,
+        );
         if (activeGrantCount >= input.maxActiveGrantsPerUser) {
           return { kind: 'active-grant-limit' as const };
         }
@@ -970,6 +1000,40 @@ async function lockQuotaRow(
   return rows.length === 1 && rows[0].userID === userID;
 }
 
+async function countActiveGrants(
+  transaction: Transaction,
+  userID: string,
+  now: Date,
+): Promise<number> {
+  return transaction.nativeDeviceGrant.count({
+    where: {
+      userID,
+      status: 'active',
+      expiresAt: { gt: now },
+    },
+  });
+}
+
+/**
+ * Create the explicitly requested initial quota row only when it is missing,
+ * then lock it. The static INSERT is race-safe: a concurrent insert for the
+ * same approved user is a no-op instead of an error or an update, so existing
+ * counters and limits are preserved. New rows always start at zero usage.
+ */
+async function provisionAndLockQuota(
+  transaction: Transaction,
+  userID: string,
+  limitBytes: bigint,
+): Promise<boolean> {
+  await transaction.$queryRaw<QuotaLockRow[]>`
+    INSERT INTO "UserQuota" ("userID", "limitBytes", "usedBytes", "reservedBytes", "updatedAt")
+    VALUES (${userID}, ${limitBytes}, ${0n}, ${0n}, CURRENT_TIMESTAMP)
+    ON CONFLICT ("userID") DO NOTHING
+    RETURNING "userID"
+  `;
+  return lockQuotaRow(transaction, userID);
+}
+
 async function updatePendingPoll(
   transaction: Transaction,
   pending: PendingAuthorizationRow,
@@ -1175,7 +1239,24 @@ function readExchangeInput(
     maxActiveGrantsPerUser: readPositiveInteger(
       rawInput.maxActiveGrantsPerUser,
     ),
+    initialStorageLimitBytes: readOptionalInitialStorageLimitBytes(
+      rawInput.initialStorageLimitBytes,
+    ),
   };
+}
+
+function readOptionalInitialStorageLimitBytes(
+  value: unknown,
+): bigint | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== 'bigint' ||
+    value <= 0n ||
+    value > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new NativeAuthRepositoryError('invalid-input');
+  }
+  return value;
 }
 
 function readRotateInput(

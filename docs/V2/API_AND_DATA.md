@@ -142,7 +142,12 @@ GET /v1/me
 cloud crypto profile is validated (see [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) section 2).
 
 **Current source note:** the DTO and quota-row reads exist in local source with fake-client tests;
-there is no live quota-row/concurrency proof or auto-provisioning of a quota row.
+there is no live quota-row/concurrency proof. On 2026-10-24 the owner approved one narrow explicit
+opt-in for the approved device exchange: when the operator sets the optional backend policy field
+`initialStorageLimitBytes`, cloud composition may provision a new quota row for an approved account
+that has none. There is **no auto quota**: omitting the field keeps legacy `quota-not-provisioned`
+behavior, the value never overwrites an existing limit or counter, and there is no implicit/default
+1 GiB grant. This approval does not extend to billing/admin approvals or production deployment.
 
 ### 4.2 Devices — planned, not mounted
 

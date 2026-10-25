@@ -36,6 +36,12 @@ export interface BackendPolicy {
   readonly maxOutstandingPendingAuthorizationsGlobal: number;
   readonly maxRateLimitEntries: number;
   readonly maxAuthResponseBytes: number;
+  /**
+   * Owner-approved explicit quota-provision opt-in for the first approved
+   * device exchange. Absent disables new quota provisioning; it is not a
+   * default quota and never grants or overwrites an existing quota row.
+   */
+  readonly initialStorageLimitBytes?: number;
 }
 
 export interface HealthOnlyRuntimeConfig {
@@ -94,7 +100,7 @@ export const RUNTIME_ENV_INVENTORY = Object.freeze([
   Object.freeze({
     name: BACKEND_POLICY_ENV,
     purpose:
-      'Required in cloud mode: exact JSON object with the seven positive integer backend bounds.',
+      'Required in cloud mode: exact JSON object with the seven required positive integer backend bounds plus optional initialStorageLimitBytes (positive integer; omitted disables quota provisioning).',
     secret: false,
   }),
   ...NATIVE_AUTH_ENV_INVENTORY,
@@ -108,6 +114,15 @@ const BACKEND_POLICY_KEYS = Object.freeze([
   'maxOutstandingPendingAuthorizationsGlobal',
   'maxRateLimitEntries',
   'maxAuthResponseBytes',
+] as const);
+
+const OPTIONAL_BACKEND_POLICY_KEYS = Object.freeze([
+  'initialStorageLimitBytes',
+] as const);
+
+const ALLOWED_BACKEND_POLICY_KEYS = Object.freeze([
+  ...BACKEND_POLICY_KEYS,
+  ...OPTIONAL_BACKEND_POLICY_KEYS,
 ] as const);
 
 /**
@@ -177,8 +192,12 @@ function readBackendPolicy(raw: unknown): BackendPolicy {
   const record = parsed as Record<string, unknown>;
   const actualKeys = Object.keys(record);
   if (
-    actualKeys.length !== BACKEND_POLICY_KEYS.length ||
-    BACKEND_POLICY_KEYS.some((key) => !Object.hasOwn(record, key))
+    actualKeys.length < BACKEND_POLICY_KEYS.length ||
+    actualKeys.length > ALLOWED_BACKEND_POLICY_KEYS.length ||
+    BACKEND_POLICY_KEYS.some((key) => !Object.hasOwn(record, key)) ||
+    actualKeys.some(
+      (key) => !(ALLOWED_BACKEND_POLICY_KEYS as readonly string[]).includes(key),
+    )
   ) {
     throw new RuntimeConfigError('invalid-backend-policy');
   }
@@ -196,6 +215,16 @@ function readBackendPolicy(raw: unknown): BackendPolicy {
     policy[key] = value;
   }
 
+  const initialStorageLimitBytes = record.initialStorageLimitBytes;
+  if (
+    initialStorageLimitBytes !== undefined &&
+    (typeof initialStorageLimitBytes !== 'number' ||
+      !Number.isSafeInteger(initialStorageLimitBytes) ||
+      initialStorageLimitBytes <= 0)
+  ) {
+    throw new RuntimeConfigError('invalid-backend-policy');
+  }
+
   return Object.freeze({
     maxActiveProjects: policy.maxActiveProjects,
     maxActiveDevices: policy.maxActiveDevices,
@@ -205,5 +234,8 @@ function readBackendPolicy(raw: unknown): BackendPolicy {
       policy.maxOutstandingPendingAuthorizationsGlobal,
     maxRateLimitEntries: policy.maxRateLimitEntries,
     maxAuthResponseBytes: policy.maxAuthResponseBytes,
+    ...(initialStorageLimitBytes === undefined
+      ? {}
+      : { initialStorageLimitBytes }),
   });
 }

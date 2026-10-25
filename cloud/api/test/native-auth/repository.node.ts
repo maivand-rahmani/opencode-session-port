@@ -5,6 +5,7 @@ import {
   createNativeAuthRepository,
   NativeAuthRepositoryError,
   type HumanCodeCandidate,
+  type ExchangeDeviceCodeInput,
   type NativeAuthRepositoryClient,
   type PendingAuthorizationRow,
 } from '../../src/native-auth/repository.js';
@@ -93,6 +94,9 @@ interface FakeOptions {
   readonly pendingCreateError?: unknown;
   readonly pendingUpdateError?: unknown;
   readonly transactionError?: unknown;
+  readonly grantCreateError?: unknown;
+  readonly quotaInsertError?: unknown;
+  readonly activeGrantCounts?: number[];
   readonly pendingCount?: number;
   readonly serializeTransactions?: boolean;
 }
@@ -117,6 +121,8 @@ class FakePrisma {
   readonly grantUpdates: Array<{ where: unknown; data: Record<string, unknown> }> = [];
   readonly refreshUpdates: Array<{ where: unknown; data: Record<string, unknown> }> = [];
   readonly pendingCountCalls: unknown[] = [];
+  readonly quotaInserts: Array<{ userID: string; limitBytes: bigint }> = [];
+  readonly activeGrantCounts: number[] = [];
 
   readonly tx: Record<string, unknown>;
   readonly nativeDeviceGrant: { findMany(args: unknown): Promise<unknown> };
@@ -134,6 +140,7 @@ class FakePrisma {
     this.refresh = options.refresh ?? [];
     this.users = new Set(options.users ?? [USER_ID]);
     this.quota = new Set(options.quota ?? [USER_ID]);
+    this.activeGrantCounts = [...(options.activeGrantCounts ?? [])];
 
     const self = this;
     this.tx = {
@@ -243,6 +250,10 @@ class FakePrisma {
       nativeDeviceGrant: {
         async count(args: { where: unknown }) {
           self.order.push('grant.count');
+          const scripted = self.activeGrantCounts.shift();
+          if (scripted !== undefined) {
+            return scripted;
+          }
           const where = args.where as {
             userID?: string;
             status?: string;
@@ -259,6 +270,9 @@ class FakePrisma {
         async create(args: { data: Record<string, unknown> }) {
           self.order.push('grant.create');
           self.grantCreates.push(args.data);
+          if (self.options.grantCreateError !== undefined) {
+            throw self.options.grantCreateError;
+          }
           const row: GrantRow = {
             id: args.data.id as string,
             userID: args.data.userID as string,
@@ -378,6 +392,20 @@ class FakePrisma {
           return (row === undefined ? [] : [row]) as unknown as T;
         }
         if (sql.includes('"UserQuota"')) {
+          if (sql.includes('INSERT INTO "UserQuota"')) {
+            self.order.push('raw.quota-insert');
+            if (self.options.quotaInsertError !== undefined) {
+              throw self.options.quotaInsertError;
+            }
+            const userID = values[0] as string;
+            const limitBytes = values[1] as bigint;
+            if (!self.quota.has(userID)) {
+              self.quota.add(userID);
+              self.quotaInserts.push({ userID, limitBytes });
+              return [{ userID }] as unknown as T;
+            }
+            return [] as unknown as T;
+          }
           self.order.push('raw.quota-lock');
           return (self.quota.has(values[0] as string)
             ? [{ userID: values[0] }]
@@ -439,13 +467,25 @@ class FakePrisma {
   ): Promise<T> {
     this.transactionOptions.push(options);
     this.order.push(`transaction.begin:${String((options as { isolationLevel?: string } | undefined)?.isolationLevel)}`);
+    const quotaBefore = new Set(this.quota);
+    const insertsBefore = this.quotaInserts.length;
+    const restoreQuota = () => {
+      this.quota.clear();
+      for (const userID of quotaBefore) this.quota.add(userID);
+      this.quotaInserts.length = insertsBefore;
+    };
     if (this.options.serializeTransactions === true) {
       const run = this.chain.then(async () => {
-        const value = await operation(this.tx);
-        if (this.options.transactionError !== undefined) {
-          throw this.options.transactionError;
+        try {
+          const value = await operation(this.tx);
+          if (this.options.transactionError !== undefined) {
+            throw this.options.transactionError;
+          }
+          return value;
+        } catch (error) {
+          restoreQuota();
+          throw error;
         }
-        return value;
       });
       this.chain = run.then(
         () => undefined,
@@ -455,9 +495,15 @@ class FakePrisma {
       this.order.push('transaction.commit');
       return result;
     }
-    const result = await operation(this.tx);
-    if (this.options.transactionError !== undefined) {
-      throw this.options.transactionError;
+    let result: T;
+    try {
+      result = await operation(this.tx);
+      if (this.options.transactionError !== undefined) {
+        throw this.options.transactionError;
+      }
+    } catch (error) {
+      restoreQuota();
+      throw error;
     }
     this.order.push('transaction.commit');
     return result;
@@ -587,6 +633,35 @@ function deviceRow(overrides: Partial<DeviceRow> = {}): DeviceRow {
     grantID: GRANT_ID,
     createdAt: NOW,
     lastSeenAt: null,
+    ...overrides,
+  };
+}
+
+function exchangeInput(
+  overrides: Partial<ExchangeDeviceCodeInput> = {},
+): ExchangeDeviceCodeInput {
+  return {
+    deviceCodeFingerprint: FINGERPRINT,
+    now: NOW,
+    grantID: GRANT_ID,
+    deviceID: DEVICE_ID,
+    grantExpiresAt: LATER,
+    access: {
+      id: ACCESS_ID,
+      fingerprint: OTHER_FINGERPRINT,
+      expiresAt: LATER,
+    },
+    refresh: {
+      id: REFRESH_ID,
+      fingerprint: 'c'.repeat(64),
+      expiresAt: LATER,
+    },
+    polling: {
+      intervalSeconds: 5,
+      backoffIncrementSeconds: 5,
+      maxIntervalSeconds: 30,
+    },
+    maxActiveGrantsPerUser: 3,
     ...overrides,
   };
 }
@@ -844,6 +919,348 @@ test('exchange fails closed for missing quota and the active-grant cap', async (
   });
   assert.equal(cappedOutcome.kind, 'active-grant-limit');
   assert.equal(capped.grantCreates.length, 0);
+});
+
+test('exchange opt-in provisions one zero-usage quota before grant creation', async () => {
+  const fake = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [],
+  });
+
+  const outcome = await repository(fake).exchangeDeviceCode(
+    exchangeInput({ initialStorageLimitBytes: 1_073_741_824n }),
+  );
+
+  assert.equal(outcome.kind, 'tokens');
+  assert.deepEqual(fake.quotaInserts, [
+    { userID: USER_ID, limitBytes: 1_073_741_824n },
+  ]);
+  const insert = fake.rawCalls.find((call) =>
+    call.sql.includes('INSERT INTO "UserQuota"'),
+  );
+  assert.ok(insert !== undefined);
+  assert.equal(insert.values[2], 0n);
+  assert.equal(insert.values[3], 0n);
+  assert.equal(insert.sql.includes('ON CONFLICT ("userID") DO NOTHING'), true);
+  assert.equal(insert.sql.includes('RETURNING'), true);
+  assert.ok(fake.order.indexOf('raw.quota-insert') < fake.order.indexOf('grant.create'));
+  assert.ok(fake.order.indexOf('raw.quota-lock') < fake.order.indexOf('grant.create'));
+  assert.equal(fake.grantCreates[0]?.userID, USER_ID);
+});
+
+test('exchange preserves an existing quota row and legacy opt-out still fails closed', async () => {
+  const existing = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [USER_ID],
+    grants: [
+      grantRow({
+        id: '55555555-5555-4555-8555-555555555555',
+        userID: OTHER_USER_ID,
+      }),
+    ],
+  });
+  const outcome = await repository(existing).exchangeDeviceCode(
+    exchangeInput({ initialStorageLimitBytes: 1n }),
+  );
+  assert.equal(outcome.kind, 'tokens');
+  assert.equal(existing.quotaInserts.length, 0);
+  const existingInsert = existing.rawCalls.find((call) =>
+    call.sql.includes('INSERT INTO "UserQuota"'),
+  );
+  assert.ok(existingInsert !== undefined);
+  assert.equal(existingInsert.sql.includes('ON CONFLICT ("userID") DO NOTHING'), true);
+  assert.equal(existing.grantCreates[0]?.userID, USER_ID);
+  assert.equal(existing.grantCreates.length, 1);
+
+  const legacy = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [],
+  });
+  const legacyOutcome = await repository(legacy).exchangeDeviceCode(
+    exchangeInput(),
+  );
+  assert.equal(legacyOutcome.kind, 'quota-not-provisioned');
+  assert.equal(legacy.quotaInserts.length, 0);
+  assert.equal(legacy.grantCreates.length, 0);
+  assert.equal(legacy.pendingUpdates.length, 0);
+});
+
+test('quota provisioning never runs for non-approved terminal, expired, or capped exchanges', async () => {
+  const cases: Array<{
+    readonly fake: FakePrisma;
+    readonly outcome: string;
+    readonly maxActiveGrantsPerUser?: number;
+  }> = [
+    {
+      fake: new FakePrisma({
+        pending: [pendingRow({ status: 'denied', approvedUserID: USER_ID })],
+        quota: [],
+      }),
+      outcome: 'authorization-denied',
+    },
+    {
+      fake: new FakePrisma({
+        pending: [pendingRow({ status: 'consumed', approvedUserID: USER_ID })],
+        quota: [],
+      }),
+      outcome: 'authorization-consumed',
+    },
+    {
+      fake: new FakePrisma({
+        pending: [pendingRow()],
+        quota: [],
+      }),
+      outcome: 'authorization-pending',
+    },
+    {
+      fake: new FakePrisma({
+        pending: [
+          pendingRow({
+            status: 'approved',
+            approvedUserID: USER_ID,
+            expiresAt: NOW,
+          }),
+        ],
+        quota: [],
+      }),
+      outcome: 'authorization-expired',
+    },
+    {
+      fake: new FakePrisma({
+        pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+        quota: [],
+        grants: [grantRow()],
+      }),
+      outcome: 'active-grant-limit',
+      maxActiveGrantsPerUser: 1,
+    },
+  ];
+
+  for (const entry of cases) {
+    const result = await repository(entry.fake).exchangeDeviceCode(
+      exchangeInput({
+        initialStorageLimitBytes: 1_073_741_824n,
+        ...(entry.maxActiveGrantsPerUser === undefined
+          ? {}
+          : { maxActiveGrantsPerUser: entry.maxActiveGrantsPerUser }),
+      }),
+    );
+    assert.equal(result.kind, entry.outcome);
+    assert.equal(entry.fake.quotaInserts.length, 0);
+    assert.equal(entry.fake.grantCreates.length, 0);
+  }
+});
+
+test('invalid initial quota limits are rejected before any transaction', async () => {
+  const invalid = [
+    0n,
+    -1n,
+    BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+    1 as unknown as bigint,
+    '1073741824' as unknown as bigint,
+    null as unknown as bigint,
+  ];
+  for (const initialStorageLimitBytes of invalid) {
+    const fake = new FakePrisma({
+      pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+      quota: [],
+    });
+    await assert.rejects(
+      repository(fake).exchangeDeviceCode(
+        exchangeInput({ initialStorageLimitBytes }),
+      ),
+      (error: unknown) =>
+        error instanceof NativeAuthRepositoryError &&
+        error.code === 'invalid-input',
+    );
+    assert.equal(fake.quotaInserts.length, 0);
+    assert.equal(fake.transactionOptions.length, 0);
+  }
+});
+
+test('a grant write failure rolls the provisioned quota back atomically', async () => {
+  const fake = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [],
+    grantCreateError: new Error('simulated grant write failure'),
+  });
+
+  await assert.rejects(
+    repository(fake).exchangeDeviceCode(
+      exchangeInput({ initialStorageLimitBytes: 1_073_741_824n }),
+    ),
+    (error: unknown) =>
+      error instanceof NativeAuthRepositoryError && error.code === 'unavailable',
+  );
+  assert.equal(fake.quota.has(USER_ID), false);
+  assert.equal(fake.quotaInserts.length, 0);
+  assert.equal(fake.accessCreates.length, 0);
+  assert.equal(fake.refreshCreates.length, 0);
+  assert.equal(fake.pendingUpdates.length, 0);
+});
+
+test('serialized concurrent exchanges share one provisioned quota and the grant cap', async () => {
+  const first = new FakePrisma({
+    pending: [
+      pendingRow({ status: 'approved', approvedUserID: USER_ID }),
+      pendingRow({
+        id: '66666666-6666-4666-8666-666666666666',
+        status: 'approved',
+        approvedUserID: USER_ID,
+        deviceCodeFingerprint: 'd'.repeat(64),
+      }),
+    ],
+    quota: [],
+    serializeTransactions: true,
+  });
+  const repo = repository(first, 10, 10);
+
+  const firstOutcome = await repo.exchangeDeviceCode(
+    exchangeInput({ initialStorageLimitBytes: 1_073_741_824n }),
+  );
+  const secondOutcome = await repo.exchangeDeviceCode(
+    exchangeInput({
+      deviceCodeFingerprint: 'd'.repeat(64),
+      grantID: '77777777-7777-4777-8777-777777777777',
+      deviceID: '88888888-8888-4888-8888-888888888888',
+      access: {
+        id: '99999999-9999-4999-8999-999999999999',
+        fingerprint: 'e'.repeat(64),
+        expiresAt: LATER,
+      },
+      refresh: {
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        fingerprint: 'f'.repeat(64),
+        expiresAt: LATER,
+      },
+      initialStorageLimitBytes: 1_073_741_824n,
+    }),
+  );
+
+  assert.equal(firstOutcome.kind, 'tokens');
+  assert.equal(secondOutcome.kind, 'tokens');
+  assert.equal(first.quotaInserts.length, 1);
+  assert.equal(first.quota.size, 1);
+
+  const capped = new FakePrisma({
+    pending: [
+      pendingRow({ status: 'approved', approvedUserID: USER_ID }),
+      pendingRow({
+        id: '66666666-6666-4666-8666-666666666666',
+        status: 'approved',
+        approvedUserID: USER_ID,
+        deviceCodeFingerprint: 'd'.repeat(64),
+      }),
+    ],
+    quota: [],
+    serializeTransactions: true,
+  });
+  const cappedRepo = repository(capped, 10, 10);
+  const allowed = await cappedRepo.exchangeDeviceCode(
+    exchangeInput({
+      initialStorageLimitBytes: 1_073_741_824n,
+      maxActiveGrantsPerUser: 1,
+    }),
+  );
+  const refused = await cappedRepo.exchangeDeviceCode(
+    exchangeInput({
+      deviceCodeFingerprint: 'd'.repeat(64),
+      grantID: '77777777-7777-4777-8777-777777777777',
+      deviceID: '88888888-8888-4888-8888-888888888888',
+      access: {
+        id: '99999999-9999-4999-8999-999999999999',
+        fingerprint: 'e'.repeat(64),
+        expiresAt: LATER,
+      },
+      refresh: {
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        fingerprint: 'f'.repeat(64),
+        expiresAt: LATER,
+      },
+      initialStorageLimitBytes: 1_073_741_824n,
+      maxActiveGrantsPerUser: 1,
+    }),
+  );
+  assert.equal(allowed.kind, 'tokens');
+  assert.equal(refused.kind, 'active-grant-limit');
+  assert.equal(capped.grantCreates.length, 1);
+});
+
+test('post-lock active-grant count is authoritative after an optimistic preflight', async () => {
+  // Interleaving: preflight sees 0, a concurrent exchange commits a grant, the
+  // post-lock count sees the cap. The stale preflight must not authorize
+  // grant/token/pending writes.
+  const fake = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [USER_ID],
+    activeGrantCounts: [0, 1],
+  });
+  const outcome = await repository(fake).exchangeDeviceCode(
+    exchangeInput({
+      initialStorageLimitBytes: 1_073_741_824n,
+      maxActiveGrantsPerUser: 1,
+    }),
+  );
+
+  assert.equal(outcome.kind, 'active-grant-limit');
+  assert.equal(fake.grantCreates.length, 0);
+  assert.equal(fake.deviceCreates.length, 0);
+  assert.equal(fake.accessCreates.length, 0);
+  assert.equal(fake.refreshCreates.length, 0);
+  assert.equal(fake.pendingUpdates.length, 0);
+  assert.equal(fake.quotaInserts.length, 0);
+
+  const countIndexes = fake.order
+    .map((entry, index) => (entry === 'grant.count' ? index : -1))
+    .filter((index) => index >= 0);
+  assert.equal(countIndexes.length, 2);
+  const quotaLockIndex = fake.order.indexOf('raw.quota-lock');
+  assert.ok(quotaLockIndex >= 0);
+  assert.ok(countIndexes[1] > quotaLockIndex);
+});
+
+test('legacy exchanges rely on one authoritative count after the quota lock', async () => {
+  const fake = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [USER_ID],
+    activeGrantCounts: [1],
+  });
+  const outcome = await repository(fake).exchangeDeviceCode(
+    exchangeInput({ maxActiveGrantsPerUser: 1 }),
+  );
+
+  assert.equal(outcome.kind, 'active-grant-limit');
+  assert.equal(fake.grantCreates.length, 0);
+  assert.equal(fake.quotaInserts.length, 0);
+  const countIndexes = fake.order
+    .map((entry, index) => (entry === 'grant.count' ? index : -1))
+    .filter((index) => index >= 0);
+  assert.equal(countIndexes.length, 1);
+  assert.ok(countIndexes[0] > fake.order.indexOf('raw.quota-lock'));
+});
+
+test('an already-capped opt-in request refuses before any quota insert', async () => {
+  const fake = new FakePrisma({
+    pending: [pendingRow({ status: 'approved', approvedUserID: USER_ID })],
+    quota: [],
+    activeGrantCounts: [1],
+  });
+  const outcome = await repository(fake).exchangeDeviceCode(
+    exchangeInput({
+      initialStorageLimitBytes: 1_073_741_824n,
+      maxActiveGrantsPerUser: 1,
+    }),
+  );
+
+  assert.equal(outcome.kind, 'active-grant-limit');
+  assert.equal(fake.quotaInserts.length, 0);
+  assert.equal(
+    fake.rawCalls.some((call) =>
+      call.sql.includes('INSERT INTO "UserQuota"'),
+    ),
+    false,
+  );
+  assert.equal(fake.grantCreates.length, 0);
 });
 
 test('pending poll commits clock/backoff before returning slow-down', async () => {

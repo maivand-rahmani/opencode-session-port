@@ -17,6 +17,7 @@ import {
   createCloudRuntime,
   createRouteAuthorizer,
   type CloudRuntimeDependencies,
+  type NativeAuthServiceFactory,
 } from '../../src/runtime/cloud.js';
 import {
   readRuntimeConfig,
@@ -99,7 +100,9 @@ const NATIVE_POLICY = {
   },
 } as const;
 
-function cloudConfig(): CloudRuntimeConfig {
+function cloudConfig(
+  backendOverrides: Readonly<Record<string, unknown>> = {},
+): CloudRuntimeConfig {
   const env: NodeJS.ProcessEnv = {
     SESSIONPORT_PUBLIC_ORIGIN: API_CONFIG.publicOrigin,
     SESSIONPORT_NATIVE_ALLOW_LOOPBACK_HTTP: 'false',
@@ -113,7 +116,10 @@ function cloudConfig(): CloudRuntimeConfig {
     SESSIONPORT_NATIVE_CSRF_KEY_BASE64: Buffer.alloc(32, 2).toString('base64'),
     SESSIONPORT_NATIVE_POLICY_JSON: JSON.stringify(NATIVE_POLICY),
     SESSIONPORT_API_MODE: 'cloud',
-    SESSIONPORT_BACKEND_POLICY_JSON: JSON.stringify(BACKEND_POLICY),
+    SESSIONPORT_BACKEND_POLICY_JSON: JSON.stringify({
+      ...BACKEND_POLICY,
+      ...backendOverrides,
+    }),
   };
   const config = readRuntimeConfig(env, API_CONFIG);
   if (config.mode !== 'cloud') {
@@ -366,3 +372,36 @@ test('createCloudRuntime wires actual repos, native auth, limiter, and browser b
   assert.equal(Object.isFrozen(runtime.api), true);
   assert.equal(Object.isFrozen(runtime.api.nativeAuth), true);
 });
+
+test('cloud runtime passes an explicit quota limit to native auth as bigint only when configured', async () => {
+  const captured: Array<Parameters<NativeAuthServiceFactory>[1]> = [];
+  const factory: NativeAuthServiceFactory = (_client, options) => {
+    captured.push(options);
+    return {} as NativeAuthService;
+  };
+  const dependencies = (): CloudRuntimeDependencies => ({
+    browserAuthFactory: async () => new FakeBrowserAuthority(),
+    nativeAuthServiceFactory: factory,
+  });
+
+  await createCloudRuntime({} as never, cloudConfig(), dependencies());
+  await createCloudRuntime(
+    {} as never,
+    cloudConfig({ initialStorageLimitBytes: 1_073_741_824 }),
+    dependencies(),
+  );
+
+  assert.equal(captured.length, 2);
+  assert.equal(Object.hasOwn(captured[0]!, 'initialStorageLimitBytes'), false);
+  assert.equal(
+    captured[0]!.repositoryPolicy.maxOutstandingPendingAuthorizationsGlobal,
+    BACKEND_POLICY.maxOutstandingPendingAuthorizationsGlobal,
+  );
+
+  const explicit = captured[1] as {
+    readonly initialStorageLimitBytes?: unknown;
+  };
+  assert.equal(typeof explicit.initialStorageLimitBytes, 'bigint');
+  assert.equal(explicit.initialStorageLimitBytes, 1_073_741_824n);
+});
+
