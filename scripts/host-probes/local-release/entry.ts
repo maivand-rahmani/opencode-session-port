@@ -18,6 +18,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { posix } from "node:path";
+import { pathToFileURL } from "node:url";
 import { encodeJson, type ByteSource, type SessionRecord } from "../../../src/core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../../src/core/crypto/index.ts";
 import { createRemappedIdDeriver, type RemappedIdDeriver } from "../../../src/core/restore/index.ts";
@@ -30,6 +31,7 @@ import {
 	createSessionReadAdapter,
 	createSessionReferenceInventoryPort,
 	probeSessionDeleteCapability,
+	type SessionDependencyReadPort,
 } from "../../../src/tui/adapters/index.ts";
 import {
 	createReplacementDeletePortFactory,
@@ -85,6 +87,39 @@ function fail(code: string): never {
 
 function isRecord(value: unknown): value is JsonRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Only an explicit 404 means absence; every other exception is unreadable. */
+export function isExplicit404(error: unknown): boolean {
+	return isRecord(error) && error["status"] === 404;
+}
+
+/** A successful public PATCH may be 200 or 204. */
+export function patchSucceeded(status: number): boolean {
+	return status === 200 || status === 204;
+}
+
+/** Parent-owned independent copy for external recovery verification. */
+export function makeFlowPassword(base: Uint8Array): Uint8Array {
+	return Uint8Array.from(base);
+}
+
+/** Exact full-record read with 404-as-absence and fail-closed other errors. */
+export async function readExactRecord(
+	port: SessionDependencyReadPort,
+	sessionID: string,
+	policy: SessionCollectionPolicy,
+): Promise<SessionRecord | undefined> {
+	let info: unknown;
+	try {
+		info = await port.getSession(sessionID);
+	} catch (error) {
+		if (isExplicit404(error)) return undefined;
+		throw error;
+	}
+	if (info === undefined || info === null) return undefined;
+	const messages = await collectSessionMessages(port, sessionID, policy, 0);
+	return { info: info as any, messages: [...messages] };
 }
 
 function authHeader(password: string): string {
@@ -407,6 +442,7 @@ export async function run(): Promise<JsonRecord> {
 	const profileDir = posix.join(PROFILE_ROOT, `run-${randomBytes(8).toString("hex")}`);
 	const passwordString = randomBytes(32).toString("base64url");
 	const passwordBytes = randomBytes(32);
+	const externalRecoveryPassword = makeFlowPassword(passwordBytes);
 	const otherDir = posix.join(PROFILE_ROOT, `other-${randomBytes(4).toString("hex")}`);
 	let child: Awaited<ReturnType<typeof startHost>> | undefined;
 	let stopped = false;
@@ -458,6 +494,7 @@ export async function run(): Promise<JsonRecord> {
 		const removesBefore1 = bridge.removeInputs.length;
 		const previews1: any[] = [];
 		const reports1: any[] = [];
+		const flowPassword1 = makeFlowPassword(passwordBytes);
 		const ui1: LocalRestoreUiPort = {
 			async confirm(preview) {
 				previews1.push(preview);
@@ -496,7 +533,7 @@ export async function run(): Promise<JsonRecord> {
 			cryptoFactory,
 			cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
 			readEncryptedArtifact,
-			requestPassword: async () => passwordBytes,
+			requestPassword: async () => flowPassword1,
 			readDestination: async (projectID) =>
 				(await collectCheckpointPayload(readPort, { projectID, policy: EXPERIMENTAL_COLLECTION_POLICY })).sessions,
 			readGloballyVisibleSessionIDs: () =>
@@ -506,11 +543,7 @@ export async function run(): Promise<JsonRecord> {
 					selectedProjectID: destProjectID,
 					policy: { ...EXPERIMENTAL_COLLECTION_POLICY, sessionPageSize: 2 },
 				}).readGloballyVisibleSessionIDs(),
-			readSession: async (sessionID) => {
-				const info = await dependencyPort.getSession(sessionID);
-				const messages = await collectSessionMessages(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY, 0);
-				return { info: info as any, messages: [...messages] };
-			},
+			readSession: (sessionID) => readExactRecord(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY),
 			readReferenceInventory: createReplacementReferenceInventoryReader(referencePort),
 			importer: createSessionImportAdapter(bridge.client),
 			deletePortFactory: createReplacementDeletePortFactory(bridge.client),
@@ -528,7 +561,7 @@ export async function run(): Promise<JsonRecord> {
 		const old1Now = await exists(bridge, old1ID);
 		const report1 = reports1[0];
 		const recoveryPath = report1?.recoveryPath;
-		const recovery1 = typeof recoveryPath === "string" ? await readRecovery(cryptoFactory, EXPERIMENTAL_CRYPTO_POLICY, recoveryPath, passwordBytes) : undefined;
+		const recovery1 = typeof recoveryPath === "string" ? await readRecovery(cryptoFactory, EXPERIMENTAL_CRYPTO_POLICY, recoveryPath, externalRecoveryPassword) : undefined;
 		const recoveryOld = recovery1?.find((record) => record.info["id"] === old1ID);
 		const recoveryText = recoveryOld !== undefined ? textOf(recoveryOld.messages) : "";
 		checks["case1"] = {
@@ -596,6 +629,7 @@ export async function run(): Promise<JsonRecord> {
 		const removesBefore2 = bridge.removeInputs.length;
 		const previews2: any[] = [];
 		const reports2: any[] = [];
+		const flowPassword2 = makeFlowPassword(passwordBytes);
 		const ui2: LocalRestoreUiPort = { async confirm(preview) { previews2.push(preview); return true; }, async report(report) { reports2.push(report); } };
 		const outcome2 = await runLocalRestore({
 			artifactPath: checkpointPath2,
@@ -604,10 +638,10 @@ export async function run(): Promise<JsonRecord> {
 			cryptoFactory,
 			cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
 			readEncryptedArtifact,
-			requestPassword: async () => passwordBytes,
+			requestPassword: async () => flowPassword2,
 			readDestination: async (projectID) => (await collectCheckpointPayload(readPort, { projectID, policy: EXPERIMENTAL_COLLECTION_POLICY })).sessions,
 			readGloballyVisibleSessionIDs: () => createSessionIdInventory({ readPort, projects: [{ projectID: destProjectID }], selectedProjectID: destProjectID, policy: EXPERIMENTAL_COLLECTION_POLICY }).readGloballyVisibleSessionIDs(),
-			readSession: async (sessionID) => ({ info: await dependencyPort.getSession(sessionID) as any, messages: [...await collectSessionMessages(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY, 0)] }),
+			readSession: (sessionID) => readExactRecord(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY),
 			readReferenceInventory: createReplacementReferenceInventoryReader(referencePort),
 			importer: createSessionImportAdapter(bridge.client),
 			deletePortFactory: createReplacementDeletePortFactory(bridge.client),
@@ -652,10 +686,11 @@ export async function run(): Promise<JsonRecord> {
 		let patchResponse: unknown = null;
 		const removesBefore3 = bridge.removeInputs.length;
 		const reports3: any[] = [];
+		const flowPassword3 = makeFlowPassword(passwordBytes);
 		const ui3: LocalRestoreUiPort = {
 			async confirm() {
 				patchResponse = await requestRaw(passwordString, "PATCH", `/api/session/${old3ID}`, { title: "late changed title" });
-				patchApplied = patchResponse.status === 200;
+				patchApplied = patchSucceeded(patchResponse.status);
 				return true;
 			},
 			async report(report) { reports3.push(report); },
@@ -667,10 +702,10 @@ export async function run(): Promise<JsonRecord> {
 			cryptoFactory,
 			cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
 			readEncryptedArtifact,
-			requestPassword: async () => passwordBytes,
+			requestPassword: async () => flowPassword3,
 			readDestination: async (projectID) => (await collectCheckpointPayload(readPort, { projectID, policy: EXPERIMENTAL_COLLECTION_POLICY })).sessions,
 			readGloballyVisibleSessionIDs: () => createSessionIdInventory({ readPort, projects: [{ projectID: destProjectID }], selectedProjectID: destProjectID, policy: EXPERIMENTAL_COLLECTION_POLICY }).readGloballyVisibleSessionIDs(),
-			readSession: async (sessionID) => ({ info: await dependencyPort.getSession(sessionID) as any, messages: [...await collectSessionMessages(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY, 0)] }),
+			readSession: (sessionID) => readExactRecord(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY),
 			readReferenceInventory: createReplacementReferenceInventoryReader(referencePort),
 			importer: createSessionImportAdapter(bridge.client),
 			deletePortFactory: createReplacementDeletePortFactory(bridge.client),
@@ -710,6 +745,7 @@ export async function run(): Promise<JsonRecord> {
 		const removesBefore4 = bridge.removeInputs.length;
 		const reports4: any[] = [];
 		const previews4: any[] = [];
+		const flowPassword4 = makeFlowPassword(passwordBytes);
 		const ui4: LocalRestoreUiPort = { async confirm(preview) { previews4.push(preview); return true; }, async report(report) { reports4.push(report); } };
 		const outcome4 = await runLocalRestore({
 			artifactPath: checkpointPath4,
@@ -718,10 +754,10 @@ export async function run(): Promise<JsonRecord> {
 			cryptoFactory,
 			cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
 			readEncryptedArtifact,
-			requestPassword: async () => passwordBytes,
+			requestPassword: async () => flowPassword4,
 			readDestination: async (projectID) => (await collectCheckpointPayload(readPort, { projectID, policy: EXPERIMENTAL_COLLECTION_POLICY })).sessions,
 			readGloballyVisibleSessionIDs: () => createSessionIdInventory({ readPort, projects: [{ projectID: destProjectID }], selectedProjectID: destProjectID, policy: EXPERIMENTAL_COLLECTION_POLICY }).readGloballyVisibleSessionIDs(),
-			readSession: async (sessionID) => ({ info: await dependencyPort.getSession(sessionID) as any, messages: [...await collectSessionMessages(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY, 0)] }),
+			readSession: (sessionID) => readExactRecord(dependencyPort, sessionID, EXPERIMENTAL_COLLECTION_POLICY),
 			readReferenceInventory: createReplacementReferenceInventoryReader(referencePort),
 			importer: createSessionImportAdapter(bridge.client),
 			deletePortFactory: createReplacementDeletePortFactory(noRemoveBridge.client),
@@ -760,6 +796,7 @@ export async function run(): Promise<JsonRecord> {
 		}
 		checks["cleanup"] = { hostStopped: stopped, profileRemoved };
 		passwordBytes.fill(0);
+		externalRecoveryPassword.fill(0);
 	}
 }
 
@@ -806,12 +843,19 @@ function requiredPass(result: JsonRecord): boolean {
 	);
 }
 
-const result = await run().catch((error) => ({
-	status: "failed",
-	errorCode: error instanceof FixedError ? error.code : "E_INTERNAL",
-	label: "production-functions-on-public-http-bridge; NOT packaged-TUI; NOT actual-SDK",
-}));
-(result as JsonRecord)["allRequiredCasesPassed"] = requiredPass(result as JsonRecord);
-(result as JsonRecord)["status"] = (result as JsonRecord)["status"] === "failed" ? "failed" : (result as JsonRecord)["allRequiredCasesPassed"] ? "ok" : "failed";
-process.stdout.write(`${JSON.stringify(result)}\n`);
-process.exitCode = (result as JsonRecord)["status"] === "ok" ? 0 : 1;
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+	const result = await run().catch((error) => ({
+		status: "failed",
+		errorCode: error instanceof FixedError ? error.code : "E_INTERNAL",
+		label: "production-functions-on-public-http-bridge; NOT packaged-TUI; NOT actual-SDK",
+	}));
+	(result as JsonRecord)["allRequiredCasesPassed"] = requiredPass(result as JsonRecord);
+	(result as JsonRecord)["status"] =
+		(result as JsonRecord)["status"] === "failed"
+			? "failed"
+			: (result as JsonRecord)["allRequiredCasesPassed"]
+				? "ok"
+				: "failed";
+	process.stdout.write(`${JSON.stringify(result)}\n`);
+	process.exitCode = (result as JsonRecord)["status"] === "ok" ? 0 : 1;
+}
