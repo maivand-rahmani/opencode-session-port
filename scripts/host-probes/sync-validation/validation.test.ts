@@ -645,7 +645,50 @@ describe("interactive console TUI launch", () => {
 });
 
 describe.skipIf(!HAS_POWERSHELL)("validation-only default is NOT-STARTED", () => {
-	function runValidation(extra: string[]): { code: number; out: string } {
+	/**
+	 * Additive Windows PowerShell 5.1 environment normalization for the child
+	 * runner. CI executes `bun test` under pwsh 7; `powershell.exe` must be able
+	 * to resolve its own module and executable paths. Only canonical existing
+	 * entries are prepended; nothing is removed and the runner's exit code is
+	 * still the sole pass/fail signal.
+	 */
+	function normalizedChildEnvironment(): Record<string, string> {
+		const env: Record<string, string> = {};
+		for (const [key, value] of Object.entries(process.env)) {
+			if (typeof value === "string") env[key] = value;
+		}
+		const systemRoot = process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows";
+		const system32 = join(systemRoot, "System32");
+		const shellDirectory = join(system32, "WindowsPowerShell", "v1.0");
+		const prepend = (name: string, entry: string): void => {
+			let key = name;
+			for (const existing of Object.keys(env)) {
+				if (existing.toLowerCase() === name.toLowerCase()) {
+					key = existing;
+					break;
+				}
+			}
+			const current = env[key];
+			const entries = (current ?? "").split(";").filter((part) => part.length > 0);
+			if (entries.some((part) => part.toLowerCase() === entry.toLowerCase())) return;
+			env[key] = current === undefined || current.length === 0 ? entry : `${entry};${current}`;
+		};
+		prepend("PATH", shellDirectory);
+		prepend("PATH", system32);
+		prepend("PSModulePath", join(shellDirectory, "Modules"));
+		return env;
+	}
+
+	/** Bounded, fixed-shape diagnostic; no credentials, prompts, or env dumps. */
+	function reportIfFailed(result: { code: number; out: string }, label: string): void {
+		if (result.code === 0) return;
+		const bounded = result.out.replace(/\u001b\[[0-9;]*m/g, "").slice(0, 4000);
+		console.error(
+			`[validation-runner-diagnostic] ${label} exit=${result.code}\n${bounded}\n[/validation-runner-diagnostic]`,
+		);
+	}
+
+	function runValidation(extra: string[], label: string): { code: number; out: string } {
 		const result = Bun.spawnSync(
 			[
 				"powershell.exe",
@@ -656,16 +699,23 @@ describe.skipIf(!HAS_POWERSHELL)("validation-only default is NOT-STARTED", () =>
 				RUNNER,
 				...extra,
 			],
-			{ cwd: join(HERE, "..", "..", ".."), stdout: "pipe", stderr: "pipe" },
+			{
+				cwd: join(HERE, "..", "..", ".."),
+				env: normalizedChildEnvironment(),
+				stdout: "pipe",
+				stderr: "pipe",
+			},
 		);
-		return {
+		const output = {
 			code: result.exitCode ?? 1,
 			out: `${result.stdout.toString()}\n${result.stderr.toString()}`,
 		};
+		reportIfFailed(output, label);
+		return output;
 	}
 
 	test("default mode validates without launching", () => {
-		const result = runValidation([]);
+		const result = runValidation([], "default");
 		expect(result.code).toBe(0);
 		expect(result.out).toContain("run: NOT-STARTED");
 		expect(result.out).toContain("root prefix: sp-command-");
@@ -673,7 +723,7 @@ describe.skipIf(!HAS_POWERSHELL)("validation-only default is NOT-STARTED", () =>
 	}, 120000);
 
 	test("native mode validates fixed staging and pinned keyring without launching", () => {
-		const result = runValidation(["-NativeSyncValidation"]);
+		const result = runValidation(["-NativeSyncValidation"], "native-sync-validation");
 		expect(result.code).toBe(0);
 		expect(result.out).toContain("run: NOT-STARTED");
 		expect(result.out).toContain("native-sync-validation");

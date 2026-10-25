@@ -8,22 +8,33 @@ import {
 	readFile,
 	readdir,
 	rename,
-	rm,
 	symlink,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { join } from "node:path";
 import {
 	acquireSessionOwner,
 	SessionOwnerError,
 	type SessionOwnerErrorCode,
 } from "../../../src/cloud/auth/session-owner.ts";
+import {
+	WINDOWS,
+	createPrivateDirectory,
+	createPrivateDirectoryAt,
+	createPrivateRoot,
+	createUnsafeDirectory,
+	currentWindowsAccountName,
+	grantUsersRead,
+	isSyntheticRoot,
+	removeSyntheticRoot,
+	SYNTHETIC_TEMP_ROOT,
+	trackRoot,
+	windowsAclFingerprint,
+} from "../../helpers/private-state-directory.ts";
 
-const WINDOWS = process.platform === "win32";
 const CHILD_FIXTURE = join(import.meta.dir, "fixtures", "session-owner-child.ts");
-const TEST_ROOT_PARENT = join(tmpdir(), "opencode");
+const TEST_ROOT_PARENT = SYNTHETIC_TEMP_ROOT;
 const NONCE_FILE_NAME = "nonce";
 
 const syntheticRoots = new Set<string>();
@@ -35,71 +46,23 @@ interface ChildRun {
 	readonly exited: Promise<number>;
 }
 
-function isSyntheticRoot(path: string): boolean {
-	return resolve(path).startsWith(`${resolve(TEST_ROOT_PARENT)}${sep}`);
-}
-
-function trackRoot(root: string): string {
-	if (!isSyntheticRoot(root)) throw new Error("refusing to track a non-synthetic path");
-	syntheticRoots.add(root);
-	return root;
-}
-
-let cachedWindowsSid: string | undefined;
-
-function currentWindowsSid(): string {
-	if (cachedWindowsSid !== undefined) return cachedWindowsSid;
-	const result = Bun.spawnSync({
-		cmd: ["whoami", "/user", "/fo", "csv", "/nh"],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	if (result.exitCode !== 0) throw new Error("whoami failed");
-	const text = result.stdout.toString();
-	const match = /"(S-1-[^"]+)"/.exec(text);
-	if (match === null) throw new Error("current SID not found");
-	cachedWindowsSid = match[1]!;
-	return cachedWindowsSid;
-}
-
-function icacls(args: readonly string[]): void {
-	const result = Bun.spawnSync({
-		cmd: ["icacls", ...args],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	if (result.exitCode !== 0) {
-		throw new Error(`icacls failed: ${result.stderr.toString()}`);
-	}
-}
-
-function restrictWindowsAcl(directory: string): void {
-	icacls([
-		directory,
-		"/inheritance:r",
-		"/grant:r",
-		`*${currentWindowsSid()}:(OI)(CI)F`,
-	]);
-}
-
-function grantWindowsUsersRead(directory: string): void {
-	icacls([directory, "/grant:r", "*S-1-5-32-545:(OI)(CI)R"]);
+function trackAndRemember(root: string): string {
+	const tracked = trackRoot(root);
+	syntheticRoots.add(tracked);
+	return tracked;
 }
 
 async function createRoot(label: string): Promise<string> {
-	const root = trackRoot(join(TEST_ROOT_PARENT, `${label}-${randomUUID()}`));
-	await mkdir(root, { recursive: true, mode: 0o700 });
-	if (WINDOWS) restrictWindowsAcl(root);
-	else await chmod(root, 0o700);
-	return root;
+	return trackAndRemember(await createPrivateRoot(label));
 }
 
 async function createPrivateStateDirectory(root: string, name = "state"): Promise<string> {
-	const directory = join(root, name);
-	await mkdir(directory, { recursive: true, mode: 0o700 });
-	if (WINDOWS) restrictWindowsAcl(directory);
-	else await chmod(directory, 0o700);
-	return directory;
+	return createPrivateDirectory(root, name);
+}
+
+/** Local alias kept for the existing unsafe-fixture assertion. */
+async function grantWindowsUsersRead(directory: string): Promise<void> {
+	await grantUsersRead(directory);
 }
 
 function probeSymlinkSupport(): boolean {
@@ -227,7 +190,7 @@ afterEach(async () => {
 
 	for (const root of syntheticRoots) {
 		if (!isSyntheticRoot(root)) throw new Error("refusing non-synthetic cleanup");
-		await rm(root, { recursive: true, force: true, maxRetries: 3 });
+		await removeSyntheticRoot(root);
 	}
 	syntheticRoots.clear();
 });
@@ -376,7 +339,7 @@ describe("session owner lock primitive", () => {
 			const root = await createRoot("owner-nonprivate");
 			const directory = join(root, "loose");
 			await mkdir(directory, { recursive: true, mode: 0o700 });
-			if (WINDOWS) grantWindowsUsersRead(directory);
+			if (WINDOWS) await grantWindowsUsersRead(directory);
 			else await chmod(directory, 0o755);
 
 			const run = spawnOwnerChild(["--state-directory", directory, "--mode", "hold"]);
@@ -402,9 +365,7 @@ describe("session owner lock primitive", () => {
 
 			const realAncestor = join(root, "real-ancestor");
 			const nestedState = join(realAncestor, "nested-state");
-			await mkdir(nestedState, { recursive: true, mode: 0o700 });
-			if (WINDOWS) restrictWindowsAcl(nestedState);
-			else await chmod(nestedState, 0o700);
+			await createPrivateDirectoryAt(nestedState);
 			const ancestorLink = join(root, "ancestor-link");
 			await symlink(realAncestor, ancestorLink, WINDOWS ? "junction" : "dir");
 
@@ -472,5 +433,47 @@ describe("session owner lock primitive", () => {
 
 		await expectOwnerError(owner.release(), "ownership-lost");
 		expect(await readFile(nonceFile, "utf8")).toBe(nonceText);
+	});
+
+	// Regression coverage for the CI-only fixture failure: a fresh directory must
+	// be created with an explicitly private ACL (current user + SYSTEM +
+	// Administrators on Windows) instead of inheriting the generic temp ACL.
+	test("a helper-created private directory carries the exact private ACL and is admitted", async () => {
+		const root = await createRoot("owner-regression-positive");
+		const stateDirectory = await createPrivateDirectory(root);
+		const parentFingerprint = WINDOWS ? windowsAclFingerprint(root) : "";
+
+		if (WINDOWS) {
+			const fingerprint = windowsAclFingerprint(stateDirectory);
+			expect(fingerprint.toLowerCase()).toContain(currentWindowsAccountName().toLowerCase());
+		} else {
+			expect((await lstat(stateDirectory)).mode & 0o077).toBe(0);
+		}
+
+		const owner = await acquireSessionOwner({ stateDirectory });
+		await owner.release();
+		expect(await readdir(stateDirectory)).toEqual([]);
+		expect(await readdir(root)).toEqual(["state"]);
+		if (WINDOWS) expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
+	});
+
+	test("an owned but unsafe child directory is refused without touching its parent ACL", async () => {
+		const root = await createRoot("owner-regression-negative");
+		const parentFingerprint = WINDOWS ? windowsAclFingerprint(root) : "";
+		const unsafe = await createUnsafeDirectory(root, "unsafe");
+		if (WINDOWS) {
+			const count = (value: string) =>
+				value.split("|").filter((line) => line.length > 0).length;
+			// Exactly one extra ACE: the deliberately unsafe BUILTIN\Users read.
+			expect(count(windowsAclFingerprint(unsafe))).toBe(
+				count(windowsAclFingerprint(root)) + 1,
+			);
+		} else {
+			expect((await lstat(unsafe)).mode & 0o077).not.toBe(0);
+		}
+
+		await expectOwnerError(acquireSessionOwner({ stateDirectory: unsafe }), "invalid-state-directory");
+		expect(await readdir(unsafe)).toEqual([]);
+		if (WINDOWS) expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
 	});
 });

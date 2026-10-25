@@ -16,9 +16,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { readFile, readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { acquireSessionOwner, SessionOwnerError } from "../../../src/cloud/auth/session-owner.ts";
 import {
@@ -34,9 +33,14 @@ import {
 	sealRawState,
 	testStateKey,
 } from "./fixtures/test-codec.ts";
+import {
+	createPrivateDirectoryAt,
+	removeSyntheticRoot,
+	SYNTHETIC_TEMP_ROOT,
+	trackRoot,
+} from "../../helpers/private-state-directory.ts";
 
-const WINDOWS = process.platform === "win32";
-const TEST_ROOT = join(tmpdir(), "opencode");
+const TEST_ROOT = SYNTHETIC_TEMP_ROOT;
 const SNAPSHOT_FILE = "state.enc";
 const CHILD_FIXTURE = fileURLToPath(
 	new URL("../auth/fixtures/session-owner-child.ts", import.meta.url),
@@ -45,50 +49,11 @@ const CHILD_FIXTURE = fileURLToPath(
 const roots = new Set<string>();
 const stores = new Set<StateStore>();
 const children = new Set<ReturnType<typeof Bun.spawn>>();
-let cachedWindowsSid: string | undefined;
 
-function trackRoot(root: string): string {
-	const resolved = resolve(root);
-	if (!resolved.startsWith(`${resolve(TEST_ROOT)}${sep}`)) {
-		throw new Error("refusing to use a non-synthetic test root");
-	}
+function rememberRoot(root: string): string {
+	const resolved = trackRoot(root);
 	roots.add(resolved);
 	return resolved;
-}
-
-function currentWindowsSid(): string {
-	if (cachedWindowsSid !== undefined) return cachedWindowsSid;
-	const result = Bun.spawnSync({
-		cmd: ["whoami", "/user", "/fo", "csv", "/nh"],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const match = /"(S-1-[^"]+)"/.exec(result.stdout.toString());
-	if (result.exitCode !== 0 || match === null) throw new Error("could not read current SID");
-	cachedWindowsSid = match[1]!;
-	return cachedWindowsSid;
-}
-
-function restrictWindowsAcl(directory: string): void {
-	const result = Bun.spawnSync({
-		cmd: [
-			"icacls",
-			directory,
-			"/inheritance:r",
-			"/grant:r",
-			`*${currentWindowsSid()}:(OI)(CI)F`,
-		],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	if (result.exitCode !== 0) throw new Error("icacls failed");
-}
-
-async function privateDirectory(path: string): Promise<string> {
-	await mkdir(path, { recursive: true, mode: 0o700 });
-	if (WINDOWS) restrictWindowsAcl(path);
-	else await chmod(path, 0o700);
-	return path;
 }
 
 interface StoreFixture {
@@ -102,8 +67,8 @@ interface StoreFixture {
 }
 
 async function fixture(label: string, hooks?: StateStoreConfig["testHooks"]): Promise<StoreFixture> {
-	const root = trackRoot(join(TEST_ROOT, `state-${label}-${randomUUID()}`));
-	const stateDirectory = await privateDirectory(join(root, "state"));
+	const root = rememberRoot(join(TEST_ROOT, `state-${label}-${randomUUID()}`));
+	const stateDirectory = await createPrivateDirectoryAt(join(root, "state"));
 	const codec = await createTestStateCodec();
 	const key = testStateKey(7);
 	const holder = createTestKeyHolder(key);
@@ -201,7 +166,7 @@ afterEach(async () => {
 	}
 	stores.clear();
 	for (const root of roots) {
-		await rm(root, { recursive: true, force: true }).catch(() => undefined);
+		await removeSyntheticRoot(root).catch(() => undefined);
 	}
 	roots.clear();
 });

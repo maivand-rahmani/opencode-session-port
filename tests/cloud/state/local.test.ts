@@ -7,9 +7,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { readFile, readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	LOCAL_STATE_MAX_SNAPSHOT_BYTES,
 	LOCAL_STATE_SNAPSHOT_FILE_NAME,
@@ -18,47 +17,21 @@ import {
 	StateStoreError,
 } from "../../../src/cloud/state/index.ts";
 import type { SecureVault, VaultEntry } from "../../../src/cloud/vault/types.ts";
+import {
+	createPrivateDirectoryAt,
+	removeSyntheticRoot,
+	SYNTHETIC_TEMP_ROOT,
+	trackRoot,
+} from "../../helpers/private-state-directory.ts";
 
-const WINDOWS = process.platform === "win32";
-const TEST_ROOT = join(tmpdir(), "opencode");
+const TEST_ROOT = SYNTHETIC_TEMP_ROOT;
 const roots = new Set<string>();
 const stores = new Set<StateStore>();
-let cachedWindowsSid: string | undefined;
 
-function trackRoot(root: string): string {
-	const resolved = resolve(root);
-	if (!resolved.startsWith(`${resolve(TEST_ROOT)}${sep}`)) throw new Error("non-synthetic test root");
+function rememberRoot(root: string): string {
+	const resolved = trackRoot(root);
 	roots.add(resolved);
 	return resolved;
-}
-
-function currentWindowsSid(): string {
-	if (cachedWindowsSid !== undefined) return cachedWindowsSid;
-	const result = Bun.spawnSync({
-		cmd: ["whoami", "/user", "/fo", "csv", "/nh"],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const match = /"(S-1-[^"]+)"/.exec(result.stdout.toString());
-	if (result.exitCode !== 0 || match === null) throw new Error("could not read current SID");
-	cachedWindowsSid = match[1]!;
-	return cachedWindowsSid;
-}
-
-function restrictWindowsAcl(directory: string): void {
-	const result = Bun.spawnSync({
-		cmd: ["icacls", directory, "/inheritance:r", "/grant:r", `*${currentWindowsSid()}:(OI)(CI)F`],
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	if (result.exitCode !== 0) throw new Error("icacls failed");
-}
-
-async function privateDirectory(path: string): Promise<string> {
-	await mkdir(path, { recursive: true, mode: 0o700 });
-	if (WINDOWS) restrictWindowsAcl(path);
-	else await chmod(path, 0o700);
-	return path;
 }
 
 class MemoryVault implements SecureVault {
@@ -108,8 +81,8 @@ interface Fixture {
 }
 
 async function fixture(label: string): Promise<Fixture> {
-	const root = trackRoot(join(TEST_ROOT, `local-${label}-${randomUUID()}`));
-	const stateDirectory = await privateDirectory(join(root, "state"));
+	const root = rememberRoot(join(TEST_ROOT, `local-${label}-${randomUUID()}`));
+	const stateDirectory = await createPrivateDirectoryAt(join(root, "state"));
 	const hostScope = `host-instance-${label}`;
 	return {
 		root,
@@ -146,7 +119,7 @@ const encoder = new TextEncoder();
 afterEach(async () => {
 	for (const store of stores) await store.close().catch(() => undefined);
 	stores.clear();
-	for (const root of roots) await rm(root, { recursive: true, force: true }).catch(() => undefined);
+	for (const root of roots) await removeSyntheticRoot(root).catch(() => undefined);
 	roots.clear();
 });
 
