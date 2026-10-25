@@ -39,7 +39,10 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        shell: pwsh
+        # Windows PowerShell 5.1, matching the production ACL reader
+        # (`powershell.exe` + `Get-Acl`) instead of pwsh 7. Environment
+        # alignment only; no module-load cause is claimed for prior runs.
+        shell: powershell
     steps:
       - name: Checkout tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,6 +72,9 @@ jobs:
 
       - name: Assert pinned toolchain versions
         run: |
+          $winPs = $PSVersionTable.PSVersion
+          Write-Host "powershell=$($winPs.Major).$($winPs.Minor)"
+          if (-not ($winPs.Major -eq 5 -and $winPs.Minor -eq 1)) { throw "Windows PowerShell 5.1 is required for the ACL-dependent tests (found $($winPs.Major).$($winPs.Minor))" }
           $bun = (bun --version).Trim()
           $node = (node --version).Trim()
           $npm = (npm --version).Trim()

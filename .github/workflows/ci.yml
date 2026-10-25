@@ -34,7 +34,13 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        shell: pwsh
+        # Windows PowerShell 5.1, not pwsh 7: the production state-directory
+        # ACL reader invokes `powershell.exe` (Windows PowerShell 5.1) and
+        # depends on `Get-Acl`. Running the suite under the same Windows
+        # PowerShell dependency removes the pwsh 7 environment boundary; this
+        # is an environment alignment, not a claim about a specific module-load
+        # defect in the previous configuration.
+        shell: powershell
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,6 +62,9 @@ jobs:
 
       - name: Assert pinned toolchain versions
         run: |
+          $winPs = $PSVersionTable.PSVersion
+          Write-Host "powershell=$($winPs.Major).$($winPs.Minor)"
+          if (-not ($winPs.Major -eq 5 -and $winPs.Minor -eq 1)) { throw "Windows PowerShell 5.1 is required for the ACL-dependent tests (found $($winPs.Major).$($winPs.Minor))" }
           $bun = (bun --version).Trim()
           $node = (node --version).Trim()
           $npm = (npm --version).Trim()
