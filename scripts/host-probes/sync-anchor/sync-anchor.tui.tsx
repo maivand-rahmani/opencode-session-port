@@ -1,11 +1,19 @@
 import { randomBytes } from "node:crypto"
-import { renameSync, writeFileSync } from "node:fs"
+import { readFileSync, renameSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context } from "@opencode/plugin/tui/context"
 import { createEffect, createSignal } from "solid-js"
 import { initialRedirectGuard, recordRedirect, sameOrderedIDs } from "./route-guard"
+import {
+  ANCHOR_TITLE,
+  CHILD_TITLES,
+  INSPECTION_MANIFEST_VERSION,
+  parseInspectionManifest,
+  validateInspectionGraph,
+  type InspectionManifest,
+} from "./phase2"
 
 const PLUGIN_ID = "sync-anchor-probe"
 const PROBE_NAME = "sessionport-sync-anchor-public-route-cache"
@@ -13,12 +21,14 @@ const USER_TEXT = "synthetic sync-anchor user message"
 const ASSISTANT_TEXT = "synthetic sync-anchor assistant reply"
 const SUPPLIED_PROJECT_ID = "sync-anchor-probe-supplied-project"
 const RESULT_LIMIT_BYTES = 16 * 1024
+const MANIFEST_LIMIT_BYTES = 4 * 1024
 const ROUTE_WAIT_MS = 500
 const POLL_MS = 25
 const syntheticIDs: string[] = []
 
 type ProbeResult = {
   probe: string
+  phase: "probe" | "inspect"
   ok: boolean
   stage: string
   failure: string | null
@@ -34,7 +44,7 @@ type ProbeResult = {
   children: { count: number; retained: boolean; messagesSettled: boolean }
   cache: { refreshed: boolean; messageCount: number | null }
   route: { redirects: number; rootSelectionReachedHead: boolean; tabFocusReachedHead: boolean | null }
-  tabs: { enabled: boolean; result: "passed" | "skipped-disabled" | "failed" }
+  tabs: { enabled: boolean; result: "passed" | "skipped-disabled" | "failed" | "not-tested" }
   renderReadiness: {
     nativeSessionRouteObserved: boolean
     messageCacheReady: boolean
@@ -56,6 +66,35 @@ function fixedError(_error: unknown): string {
   return "probe-runtime-error"
 }
 
+function createResult(phase: "probe" | "inspect"): ProbeResult {
+  return {
+    probe: PROBE_NAME,
+    phase,
+    ok: false,
+    stage: phase === "inspect" ? "inspection-manifest" : "isolation-gate",
+    failure: null,
+    imports: { attempted: 0, returned: 0 },
+    anchor: {
+      originalPreserved: false,
+      messageCount: null,
+      rootCount: null,
+      initialRouteObserved: false,
+      initialCacheReady: false,
+      initialCacheMessageCount: null,
+    },
+    children: { count: 0, retained: false, messagesSettled: false },
+    cache: { refreshed: false, messageCount: null },
+    route: { redirects: 0, rootSelectionReachedHead: false, tabFocusReachedHead: null },
+    tabs: { enabled: false, result: "failed" },
+    renderReadiness: {
+      nativeSessionRouteObserved: false,
+      messageCacheReady: false,
+      composerObserved: false,
+      ordinaryContinuation: "not-tested",
+    },
+  }
+}
+
 function writeResult(file: string, result: ProbeResult, ids: readonly string[], paths: readonly string[]) {
   const serialized = JSON.stringify(result)
   if (Buffer.byteLength(serialized, "utf8") > RESULT_LIMIT_BYTES) throw new Error("result-limit")
@@ -65,6 +104,16 @@ function writeResult(file: string, result: ProbeResult, ids: readonly string[], 
 
   const temporary = `${file}.tmp`
   writeFileSync(temporary, JSON.stringify(result, null, 2), { encoding: "utf8", flag: "wx" })
+  renameSync(temporary, file)
+}
+
+function writeManifest(file: string, manifest: InspectionManifest, paths: readonly string[]) {
+  const serialized = JSON.stringify(manifest)
+  if (Buffer.byteLength(serialized, "utf8") > MANIFEST_LIMIT_BYTES) throw new Error("manifest-limit")
+  if ([USER_TEXT, ASSISTANT_TEXT].some((text) => serialized.includes(text))) throw new Error("manifest-leak-guard")
+  if (paths.some((item) => item.length > 0 && serialized.includes(item))) throw new Error("manifest-leak-guard")
+  const temporary = `${file}.tmp`
+  writeFileSync(temporary, serialized, { encoding: "utf8", flag: "wx" })
   renameSync(temporary, file)
 }
 
@@ -203,11 +252,14 @@ function RouteController(props: { context: Context }) {
   createEffect(() => {
     if (started) return
     started = true
-    void runProbe(props.context, {
+    const routeState = {
       publishHeads: setHeads,
       redirects: () => redirects,
       loopDetected: () => loopDetected,
-    })
+    }
+    void (process.env.SP_PROBE_PHASE === "inspect"
+      ? runInspection(props.context, routeState)
+      : runProbe(props.context, routeState))
   })
 
   return null
@@ -245,6 +297,177 @@ async function waitForHome(context: Context, loopDetected: () => boolean): Promi
   return context.ui.router.current().type === "home"
 }
 
+async function runInspection(
+  context: Context,
+  routeState: {
+    publishHeads: (value: Record<string, string>) => Record<string, string>
+    redirects: () => number
+    loopDetected: () => boolean
+  },
+) {
+  const env = process.env
+  const root = env.SP_PROBE_ROOT ?? ""
+  const resultPath = env.SP_PROBE_RESULT ?? ""
+  const project = env.SP_PROBE_PROJECT ?? ""
+  const manifestPath = env.SP_PROBE_MANIFEST ?? ""
+  const contextDirectory = context.location?.directory ?? ""
+  const paths = [
+    root,
+    resultPath,
+    manifestPath,
+    project,
+    contextDirectory,
+    os.homedir(),
+    os.tmpdir(),
+    process.cwd(),
+    env.HOME ?? "",
+    env.USERPROFILE ?? "",
+    env.APPDATA ?? "",
+    env.LOCALAPPDATA ?? "",
+    env.TEMP ?? "",
+    env.TMP ?? "",
+    env.TMPDIR ?? "",
+    env.XDG_DATA_HOME ?? "",
+    env.XDG_CACHE_HOME ?? "",
+    env.XDG_CONFIG_HOME ?? "",
+    env.XDG_STATE_HOME ?? "",
+    env.OPENCODE_CONFIG_DIR ?? "",
+  ].filter(Boolean)
+  const result = createResult("inspect")
+  try {
+    if (
+      !root || !resultPath || !project || !manifestPath ||
+      paths.some((candidate) => !under(candidate, root)) ||
+      !samePath(contextDirectory, project)
+    ) {
+      result.failure = "isolation-gate-failed"
+      if (root && resultPath && under(resultPath, root)) writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+
+    result.stage = "inspection-capability"
+    if (
+      typeof context.client.session.get !== "function" ||
+      typeof context.client.session.list !== "function" ||
+      typeof context.client.message.list !== "function"
+    ) {
+      result.failure = "public-client-capability-missing"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+
+    result.stage = "inspection-manifest"
+    const parsed = parseInspectionManifest(readFileSync(manifestPath, "utf8"))
+    if (!parsed.ok) {
+      result.failure = "inspection-manifest-invalid"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+    const manifest = parsed.manifest
+
+    result.stage = "inspection-readback"
+    const anchor = await context.client.session.get({ sessionID: manifest.anchorID })
+    const anchorMessagesResponse = await context.client.message.list({ sessionID: manifest.anchorID, limit: 50, order: "asc" })
+    const anchorMessages = Array.isArray(anchorMessagesResponse?.data) ? anchorMessagesResponse.data : []
+    const projectID = typeof anchor?.projectID === "string" ? anchor.projectID : ""
+    if (!projectID) {
+      result.failure = "inspection-readback-mismatch"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+    const listResponse = await context.client.session.list({ project: projectID, limit: 50 })
+    const sessions = Array.isArray(listResponse?.data) ? listResponse.data : []
+    const childMessages: string[][] = []
+    const childSettled: boolean[] = []
+    for (const childID of manifest.childIDs) {
+      const response = await context.client.message.list({ sessionID: childID, limit: 50, order: "asc" })
+      const messages = Array.isArray(response?.data) ? response.data : []
+      childMessages.push(messages.map((message) => message.id))
+      childSettled.push(settled(messages))
+    }
+    const graph = validateInspectionGraph(manifest, {
+      anchor: {
+        id: anchor?.id,
+        parentID: anchor?.parentID,
+        title: anchor?.title,
+        projectID: anchor?.projectID,
+      },
+      anchorMessageIDs: anchorMessages.map((message) => message.id),
+      anchorSettled: settled(anchorMessages),
+      directoryMatches: samePath(anchor?.location?.directory ?? "", project),
+      sessions,
+      childMessageIDs: childMessages,
+      childSettled,
+    })
+    result.anchor.originalPreserved = graph.ok
+    result.anchor.messageCount = anchorMessages.length
+    result.anchor.rootCount = sessions.filter((session) => !session.parentID).length
+    result.children.count = sessions.filter((session) => session.parentID === manifest.anchorID).length
+    result.children.retained = graph.ok
+    result.children.messagesSettled = graph.ok
+    if (!graph.ok) {
+      result.failure = "inspection-readback-mismatch"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+
+    result.stage = "inspection-cache"
+    const headID = manifest.childIDs[1]
+    await context.data.session.sync(headID)
+    await context.data.session.message.sync(headID)
+    const cachedMessages = context.data.session.message.list(headID)
+    result.cache.refreshed = true
+    result.cache.messageCount = cachedMessages.length
+    const cacheReady =
+      cachedMessages.length === manifest.expected.childMessages &&
+      sameOrderedIDs(cachedMessages.map((message) => message.id), manifest.childMessageIDs[1]) &&
+      settled(cachedMessages)
+    result.anchor.initialCacheReady = cacheReady
+    if (!cacheReady) {
+      result.failure = "inspection-cache-not-ready"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+
+    result.stage = "inspection-route"
+    routeState.publishHeads({ [manifest.anchorID]: headID })
+    const redirectsBefore = routeState.redirects()
+    context.ui.router.navigate({ type: "session", sessionID: manifest.anchorID })
+    const redirected = await waitForRedirectAfter(redirectsBefore, routeState.redirects, routeState.loopDetected)
+    result.route.rootSelectionReachedHead = redirected && await waitForHead(context, headID, routeState.loopDetected)
+    result.route.redirects = routeState.redirects()
+    if (!result.route.rootSelectionReachedHead || routeState.loopDetected()) {
+      result.failure = "inspection-route-not-observed"
+      writeResult(resultPath, result, syntheticIDs, paths)
+      return
+    }
+
+    result.tabs.enabled = context.ui.tabs.enabled()
+    result.tabs.result = "not-tested"
+    result.anchor.initialRouteObserved = true
+    const finalRoute = context.ui.router.current()
+    const finalCachedMessages = context.data.session.message.list(headID)
+    result.renderReadiness.nativeSessionRouteObserved = finalRoute.type === "session" && finalRoute.sessionID === headID
+    result.renderReadiness.messageCacheReady =
+      finalCachedMessages.length === manifest.expected.childMessages &&
+      sameOrderedIDs(finalCachedMessages.map((message) => message.id), manifest.childMessageIDs[1]) &&
+      settled(finalCachedMessages)
+    result.ok = result.renderReadiness.nativeSessionRouteObserved && result.renderReadiness.messageCacheReady
+    result.stage = "complete"
+    if (!result.ok) result.failure = "native-session-route-not-ready"
+    writeResult(resultPath, result, syntheticIDs, paths)
+  } catch {
+    result.ok = false
+    result.failure = "inspection-runtime-error"
+    result.route.redirects = routeState.redirects()
+    try {
+      writeResult(resultPath, result, syntheticIDs, paths)
+    } catch {
+      // The runner reports a bounded missing-result failure; no exception text is retained.
+    }
+  }
+}
+
 async function runProbe(
   context: Context,
   routeState: {
@@ -257,12 +480,14 @@ async function runProbe(
   const root = env.SP_PROBE_ROOT ?? ""
   const resultPath = env.SP_PROBE_RESULT ?? ""
   const project = env.SP_PROBE_PROJECT ?? ""
+  const manifestPath = env.SP_PROBE_MANIFEST ?? ""
   const home = os.homedir()
   const temp = os.tmpdir()
   const contextDirectory = context.location?.directory ?? ""
   const paths = [
     root,
     resultPath,
+    manifestPath,
     project,
     contextDirectory,
     home,
@@ -282,31 +507,7 @@ async function runProbe(
     env.OPENCODE_CONFIG_DIR ?? "",
   ].filter(Boolean)
 
-  const result: ProbeResult = {
-    probe: PROBE_NAME,
-    ok: false,
-    stage: "isolation-gate",
-    failure: null,
-    imports: { attempted: 0, returned: 0 },
-    anchor: {
-      originalPreserved: false,
-      messageCount: null,
-      rootCount: null,
-      initialRouteObserved: false,
-      initialCacheReady: false,
-      initialCacheMessageCount: null,
-    },
-    children: { count: 0, retained: false, messagesSettled: false },
-    cache: { refreshed: false, messageCount: null },
-    route: { redirects: 0, rootSelectionReachedHead: false, tabFocusReachedHead: null },
-    tabs: { enabled: false, result: "failed" },
-    renderReadiness: {
-      nativeSessionRouteObserved: false,
-      messageCacheReady: false,
-      composerObserved: false,
-      ordinaryContinuation: "not-tested",
-    },
-  }
+  const result = createResult("probe")
 
   try {
     if (
@@ -521,10 +722,24 @@ async function runProbe(
       sameOrderedIDs(finalCachedMessages.map((message) => message.id), expectedHeadMessageIDs) &&
       settled(finalCachedMessages)
     result.ok = result.renderReadiness.nativeSessionRouteObserved && result.renderReadiness.messageCacheReady
+    if (manifestPath) {
+      writeManifest(manifestPath, {
+        version: INSPECTION_MANIFEST_VERSION,
+        anchorID,
+        childIDs: [childIDs[0], childIDs[1]],
+        anchorMessageIDs: [anchorPayload.messages[0].id, anchorPayload.messages[1].id],
+        childMessageIDs: [
+          [childSnapshots[0].messages[0].id, childSnapshots[0].messages[1].id],
+          [childSnapshots[1].messages[0].id, childSnapshots[1].messages[1].id],
+        ],
+        expected: { rootCount: 1, childCount: 2, anchorMessages: 2, childMessages: 2 },
+      }, paths)
+    }
     result.stage = "complete"
     if (!result.ok) result.failure = "native-session-route-not-ready"
     writeResult(resultPath, result, syntheticIDs, paths)
   } catch (error) {
+    result.ok = false
     result.failure = fixedError(error)
     result.route.redirects = routeState.redirects()
     try {

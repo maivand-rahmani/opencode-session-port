@@ -2,9 +2,13 @@
 [CmdletBinding()]
 param(
     [switch]$RunProbe,
+    [switch]$CombinedRestartProbe,
+    [switch]$ArchiveProbe,
+    [ValidateSet("SyncAnchor", "NativeReplacement")]
+    [string]$ProbeMode = "SyncAnchor",
     [ValidateRange(30, 180)]
     [int]$TimeoutSeconds = 180,
-    [ValidateRange(0, 45)]
+    [ValidateRange(0, 90)]
     [int]$InspectSeconds = 20,
     [string]$OpenCodePath = "",
     [string]$ExpectedVersion = "2.0.22"
@@ -14,23 +18,33 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
 $ProbeName = "sessionport-sync-anchor-public-route-cache"
+$NativeProbeName = "sessionport-native-replacement-tui"
+$NativeArchiveProbeName = "sessionport-native-replacement-tui-archive"
 $ApprovedTempBase = "C:\Users\PC\AppData\Local\Temp\opencode"
+$ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
 $PluginFile = Join-Path $PSScriptRoot "sync-anchor.tui.tsx"
 $GuardFile = Join-Path $PSScriptRoot "route-guard.ts"
+$Phase2File = Join-Path $PSScriptRoot "phase2.ts"
+$NativeStageDirectoryName = "native-replacement-probe"
 $ExpectedPathKeys = @("home", "data", "cache", "config", "state", "tmp", "bin", "log", "repos", "db")
 $SupportedVersions = @("2.0.22", "2.1.1")
 $ResultLimitBytes = 16384
+$NativeResultLimitBytes = 4096
+$ManifestLimitBytes = 4096
 $script:SafeToDelete = $true
 $script:ExitCode = 4
 $script:Root = ""
 $script:RootCreated = $false
 $script:TuiLaunchAttempted = $false
 $script:TuiChild = $null
+$script:InspectLaunchAttempted = $false
+$script:InspectChild = $null
 $script:ProbeStage = "start"
 $script:ProbeStages = @(
     "start", "preconditions", "create-root", "compile-helper", "build-env", "version",
     "stage-plugin", "debug-capture", "debug-json", "debug-path-map", "debug-isolation",
-    "tui-launch", "result", "observation", "cleanup"
+    "tui-launch", "result", "observation", "phase1-stop", "inspect-manifest",
+    "inspect-launch", "inspect-result", "inspect-stop", "cleanup"
 )
 
 $ProcessJobSource = @'
@@ -397,12 +411,20 @@ function Get-ObservedOpenCodeVersion {
 }
 
 function New-ProbeEnvironmentBlock {
-    param([string]$Root, [string]$Executable)
+    param(
+        [string]$Root,
+        [string]$Executable,
+        [string]$Phase = "probe",
+        [string]$ResultPath = "",
+        [string]$ManifestPath = "",
+        [switch]$ArchiveProbe
+    )
     $rootFull = [System.IO.Path]::GetFullPath($Root)
     $driveRoot = [System.IO.Path]::GetPathRoot($rootFull)
     $homeDirectory = Join-Path $rootFull "home"
     $systemRoot = [string]$env:SystemRoot
     $exeDirectory = Split-Path -Parent $Executable
+    if ([string]::IsNullOrWhiteSpace($ResultPath)) { $ResultPath = Join-Path $rootFull "results\probe-result.json" }
     $values = [ordered]@{
         "APPDATA" = (Join-Path $homeDirectory "AppData\Roaming")
         "COMSPEC" = (Join-Path $systemRoot "System32\cmd.exe")
@@ -413,8 +435,9 @@ function New-ProbeEnvironmentBlock {
         "OPENCODE_CLI_CONFIG_CONTENT" = '{"debug":{"devtools":false,"timing":false,"turn_tokens":false}}'
         "OPENCODE_CONFIG_DIR" = (Join-Path $rootFull "config")
         "PATH" = ((Join-Path $systemRoot "System32") + ";" + $exeDirectory)
+        "SP_PROBE_PHASE" = $Phase
         "SP_PROBE_PROJECT" = (Join-Path $rootFull "project")
-        "SP_PROBE_RESULT" = (Join-Path $rootFull "results\probe-result.json")
+        "SP_PROBE_RESULT" = $ResultPath
         "SP_PROBE_ROOT" = $rootFull
         "SystemDrive" = $driveRoot.TrimEnd('\')
         "SystemRoot" = $systemRoot
@@ -428,6 +451,8 @@ function New-ProbeEnvironmentBlock {
         "XDG_DATA_HOME" = (Join-Path $rootFull "data")
         "XDG_STATE_HOME" = (Join-Path $rootFull "state")
     }
+    if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) { $values["SP_PROBE_MANIFEST"] = $ManifestPath }
+    if ($ArchiveProbe) { $values["SP_PROBE_ARCHIVE"] = "1" }
     $entries = New-Object System.Collections.Generic.List[string]
     foreach ($key in @($values.Keys | Sort-Object -CaseSensitive)) {
         $entries.Add(([string]$key + "=" + [string]$values[$key]))
@@ -573,23 +598,27 @@ function Get-SafeProbeResult {
     param([object]$Raw, [string]$ExpectedVersion)
     if ($null -eq $Raw -or [string]$Raw.probe -ne $ProbeName) { throw "probe-result-shape-invalid" }
     $stage = [string]$Raw.stage
-    if ($stage -notin @("isolation-gate", "capability-gate", "anchor-import", "initial-anchor-route", "child-imports", "cache-refresh", "root-route-selection", "tabs-route-selection", "complete")) {
+    if ($stage -notin @("isolation-gate", "capability-gate", "inspection-capability", "inspection-manifest", "inspection-readback", "inspection-cache", "inspection-route", "anchor-import", "initial-anchor-route", "child-imports", "cache-refresh", "root-route-selection", "tabs-route-selection", "complete")) {
         $stage = "unknown"
     }
     $knownFailures = @(
         "isolation-gate-failed", "public-client-capability-missing", "anchor-seed-readback-mismatch", "anchor-cache-not-ready",
         "route-redirect-loop-guard", "initial-anchor-route-not-observed", "public-readback-verification-failed",
         "head-cache-not-ready", "root-route-did-not-reach-head", "tab-focus-did-not-reach-head",
-        "tab-home-route-not-observed", "native-session-route-not-ready", "probe-runtime-error"
+        "tab-home-route-not-observed", "native-session-route-not-ready", "probe-runtime-error",
+        "inspection-manifest-invalid", "inspection-readback-mismatch", "inspection-cache-not-ready",
+        "inspection-route-not-observed", "inspection-runtime-error"
     )
     $failure = $null
     if ($null -ne $Raw.failure) {
         $failure = if ([string]$Raw.failure -in $knownFailures) { [string]$Raw.failure } else { "unknown" }
     }
+    $phase = if ([string]$Raw.phase -in @("probe", "inspect")) { [string]$Raw.phase } else { "probe" }
     $tabResult = [string]$Raw.tabs.result
-    if ($tabResult -notin @("passed", "skipped-disabled", "failed")) { $tabResult = "failed" }
+    if ($tabResult -notin @("passed", "skipped-disabled", "failed", "not-tested")) { $tabResult = "failed" }
     return [pscustomobject]@{
         probe = $ProbeName
+        phase = $phase
         ok = ($Raw.ok -is [bool] -and $Raw.ok)
         stage = $stage
         failure = $failure
@@ -633,6 +662,133 @@ function Get-SafeProbeResult {
     }
 }
 
+function Get-NativeReplacementStageSet {
+    # Fixed native-replacement artifact resolution. Only the reviewed bundle location and
+    # the known new-source entry (plus one whitelisted fixture helper) are eligible; no
+    # caller-supplied path, glob, or whole-project scan is accepted.
+    param([string]$ProjectRoot)
+    $bundle = Join-Path $ProjectRoot ".package-verify-work\m1-native-tui-plugin-20261024\tui.tsx"
+    $source = Join-Path $ProjectRoot "scripts\host-probes\native-replacement\tui\tui.tsx"
+    $fixture = Join-Path $ProjectRoot "scripts\host-probes\native-replacement\tui\fixtures.ts"
+    $files = New-Object System.Collections.Generic.List[object]
+    $entry = ""
+    if (Test-Path -LiteralPath $bundle -PathType Leaf) {
+        $entry = $bundle
+    } elseif (Test-Path -LiteralPath $source -PathType Leaf) {
+        $entry = $source
+    }
+    if (-not [string]::IsNullOrWhiteSpace($entry)) {
+        $files.Add([pscustomobject]@{ Source = $entry; Name = "tui.tsx" })
+        if ($entry -eq $source -and (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+            $files.Add([pscustomobject]@{ Source = $fixture; Name = "fixtures.ts" })
+        }
+    }
+    return [pscustomobject]@{
+        Ready = ($files.Count -ge 1)
+        EntrySource = $entry
+        Files = $files.ToArray()
+    }
+}
+
+function Get-SafeNativeProbeResult {
+    # Exact native-replacement result allowlist. Unknown stage/reason values are downgraded
+    # to fixed failed/internal labels; extra keys, IDs, message content, and arbitrary
+    # strings never survive. A pass requires the complete 2/2/3 history plus observed
+    # parentless and native-route evidence. Pixels, archive, composer, and picker are never
+    # claimed here.
+    param([object]$Raw)
+    if ($null -eq $Raw -or [string]$Raw.probe -ne $NativeProbeName) { throw "native-probe-result-shape-invalid" }
+    if ($null -eq $Raw.version -or [int]$Raw.version -ne 1) { throw "native-probe-result-version-invalid" }
+    $stage = [string]$Raw.stage
+    if ($stage -notin @("preflight", "import-old", "import-candidate", "verify-history", "navigate", "complete", "failed")) {
+        $stage = "failed"
+    }
+    $reason = [string]$Raw.reason
+    if ($reason -notin @("none", "isolation", "capability", "import", "history", "navigation", "internal")) {
+        $reason = "internal"
+    }
+    $imported = if ($null -eq $Raw.importedCount) { 0 } else { [Math]::Min(2, [Math]::Max(0, [int]$Raw.importedCount)) }
+    $oldCount = if ($null -eq $Raw.oldMessageCount) { 0 } else { [Math]::Min(3, [Math]::Max(0, [int]$Raw.oldMessageCount)) }
+    $candidateCount = if ($null -eq $Raw.candidateMessageCount) { 0 } else { [Math]::Min(4, [Math]::Max(0, [int]$Raw.candidateMessageCount)) }
+    $routeObserved = ($Raw.nativeRouteObserved -is [bool] -and $Raw.nativeRouteObserved)
+    $parentless = ($Raw.parentlessVerified -is [bool] -and $Raw.parentlessVerified)
+    $rawOk = ($Raw.ok -is [bool] -and $Raw.ok)
+    $complete = $stage -eq "complete" -and $reason -eq "none" -and $imported -eq 2 -and $oldCount -eq 2 -and
+        $candidateCount -eq 3 -and $parentless -and $routeObserved
+    return [pscustomobject]@{
+        probe = $NativeProbeName
+        version = 1
+        ok = ($rawOk -and $complete)
+        stage = $stage
+        reason = $reason
+        importedCount = $imported
+        oldMessageCount = $oldCount
+        candidateMessageCount = $candidateCount
+        nativeRouteObserved = $routeObserved
+        parentlessVerified = $parentless
+        archiveNotTested = $true
+        composerNotTested = $true
+        pickerNotTested = $true
+    }
+}
+
+function Get-SafeNativeArchiveProbeResult {
+    # Archive-v2 fixed schema. Extra keys, IDs, content, paths, and arbitrary strings
+    # never survive. A pass requires archive+recovery evidence, not a 204 response.
+    param([object]$Raw)
+    if ($null -eq $Raw -or [string]$Raw.probe -ne $NativeArchiveProbeName) { throw "native-archive-result-shape-invalid" }
+    if ($null -eq $Raw.version -or [int]$Raw.version -ne 2) { throw "native-archive-result-version-invalid" }
+    $stage = [string]$Raw.stage
+    if ($stage -notin @("preflight", "import-old", "import-candidate", "verify-history", "archive", "verify-archive", "navigate", "recovery", "verify-recovery", "complete", "failed")) {
+        $stage = "failed"
+    }
+    $reason = [string]$Raw.reason
+    if ($reason -notin @("none", "isolation", "capability", "import", "history", "archive", "navigation", "recovery", "internal")) {
+        $reason = "internal"
+    }
+    $imported = if ($null -eq $Raw.importedCount) { 0 } else { [Math]::Min(2, [Math]::Max(0, [int]$Raw.importedCount)) }
+    $oldCount = if ($null -eq $Raw.oldMessageCount) { 0 } else { [Math]::Min(3, [Math]::Max(0, [int]$Raw.oldMessageCount)) }
+    $candidateCount = if ($null -eq $Raw.candidateMessageCount) { 0 } else { [Math]::Min(4, [Math]::Max(0, [int]$Raw.candidateMessageCount)) }
+    $routeObserved = ($Raw.nativeRouteObserved -is [bool] -and $Raw.nativeRouteObserved)
+    $parentless = ($Raw.parentlessVerified -is [bool] -and $Raw.parentlessVerified)
+    $archiveCall = [string]$Raw.archiveCall
+    if ($archiveCall -notin @("not-attempted", "accepted", "error", "unsupported")) { $archiveCall = "not-attempted" }
+    $archiveReadback = [string]$Raw.archiveReadback
+    if ($archiveReadback -notin @("active", "archived", "unknown", "not-read")) { $archiveReadback = "unknown" }
+    $recoveryReadback = [string]$Raw.recoveryReadback
+    if ($recoveryReadback -notin @("active", "archived", "unknown", "not-read")) { $recoveryReadback = "unknown" }
+    $recoveryVerified = ($Raw.recoveryVerified -is [bool] -and $Raw.recoveryVerified)
+    $mutationOldOnly = ($Raw.mutationTargetOldOnly -is [bool] -and $Raw.mutationTargetOldOnly)
+    $archiveNotTested = $true
+    if ($Raw.archiveNotTested -is [bool] -and $Raw.archiveNotTested -eq $false -and $archiveCall -in @("accepted", "error")) {
+        $archiveNotTested = $false
+    }
+    $rawOk = ($Raw.ok -is [bool] -and $Raw.ok)
+    $complete = $stage -eq "complete" -and $reason -eq "none" -and $imported -eq 2 -and $oldCount -eq 2 -and
+        $candidateCount -eq 3 -and $parentless -and $routeObserved -and $archiveReadback -eq "archived" -and
+        (-not $archiveNotTested) -and $recoveryReadback -eq "active" -and $recoveryVerified -and $mutationOldOnly
+    return [pscustomobject]@{
+        probe = $NativeArchiveProbeName
+        version = 2
+        ok = ($rawOk -and $complete)
+        stage = $stage
+        reason = $reason
+        importedCount = $imported
+        oldMessageCount = $oldCount
+        candidateMessageCount = $candidateCount
+        nativeRouteObserved = $routeObserved
+        parentlessVerified = $parentless
+        archiveNotTested = $archiveNotTested
+        composerNotTested = $true
+        pickerNotTested = $true
+        archiveCall = $archiveCall
+        archiveReadback = $archiveReadback
+        recoveryReadback = $recoveryReadback
+        recoveryVerified = $recoveryVerified
+        mutationTargetOldOnly = $mutationOldOnly
+    }
+}
+
 function Test-RootDeletionSet {
     param([string]$Root)
     if (-not (Test-PhysicalDirectoryChain -Path $Root)) { return [pscustomobject]@{ Ok = $false; Count = 0 } }
@@ -672,6 +828,20 @@ function Get-SafeProbeStage {
     return "unknown"
 }
 
+function Get-CombinedProbeGate {
+    param(
+        [bool]$Phase1ResultOk,
+        [bool]$Phase1StopVerified,
+        [bool]$Phase2Started,
+        [bool]$Phase2StopVerified
+    )
+    return [pscustomobject]@{
+        LaunchPhase2 = $Phase1ResultOk -and $Phase1StopVerified
+        DeleteRoot = $Phase1StopVerified -and ((-not $Phase2Started) -or $Phase2StopVerified)
+        RetryAllowed = $false
+    }
+}
+
 function Get-SafeFailureCategory {
     param([object]$ErrorRecord)
     try {
@@ -689,16 +859,67 @@ function Get-SafeFailureCategory {
     }
 }
 
+function Invoke-NativeReplacementValidationOnly {
+    $failures = New-Object System.Collections.Generic.List[string]
+    $stageSet = Get-NativeReplacementStageSet -ProjectRoot $ProjectRoot
+    if (-not $stageSet.Ready) {
+        $failures.Add("native-replacement plugin artifact is missing at the fixed bundle/source path (.package-verify-work/m1-native-tui-plugin-20261024/tui.tsx or scripts/host-probes/native-replacement/tui/tui.tsx)")
+    } else {
+        foreach ($file in @($stageSet.Files)) {
+            $name = [string]$file.Name
+            if ($name -notin @("tui.tsx", "fixtures.ts")) { $failures.Add("native-replacement staging name is not allowlisted") }
+            if ($name -match '[\\/]') { $failures.Add("native-replacement staging name contains a path separator") }
+            $source = [string]$file.Source
+            if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                $failures.Add("native-replacement staged source is missing")
+                continue
+            }
+            $item = Get-Item -LiteralPath $source -ErrorAction Stop
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $failures.Add("native-replacement staged source is a reparse point")
+            }
+            if ($item.Length -le 0) { $failures.Add("native-replacement staged source is empty") }
+        }
+        $entryText = [System.IO.File]::ReadAllText([string]$stageSet.EntrySource)
+        foreach ($marker in @("sessionport-native-replacement-tui", "SP_PROBE_RESULT")) {
+            if (-not $entryText.Contains($marker)) { $failures.Add("native-replacement plugin marker missing: " + $marker) }
+        }
+        if ($ArchiveProbe) {
+            foreach ($marker in @("sessionport-native-replacement-tui-archive", "SP_PROBE_ARCHIVE", "archiveNotTested", "recoveryVerified", "mutationTargetOldOnly")) {
+                if (-not $entryText.Contains($marker)) { $failures.Add("native-replacement archive marker missing: " + $marker) }
+            }
+        }
+        $scriptText = [System.IO.File]::ReadAllText($PSCommandPath)
+        foreach ($marker in @("CreateProcessW", "AssignProcessToJobObject", "TerminateJobObject", "StopAndVerify", "KILL", "SP_PROBE_RESULT")) {
+            if (-not $scriptText.Contains($marker)) { $failures.Add("native-replacement process-safety marker missing: " + $marker) }
+        }
+    }
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) { Write-Host ("VALIDATION-FAILED: " + $failure) }
+        return 1
+    }
+    Write-Host ("EXPECTED-VERSION: " + $ExpectedVersion)
+    Write-Host "VALIDATION-OK"
+    Write-Host "RUN-NOT-STARTED: pass -RunProbe only after parent and host-safety review."
+    return 0
+}
+
 function Invoke-ValidationOnly {
+    if ($ProbeMode -eq "NativeReplacement") { return (Invoke-NativeReplacementValidationOnly) }
     $failures = New-Object System.Collections.Generic.List[string]
     if (-not (Test-Path -LiteralPath $PluginFile -PathType Leaf)) { $failures.Add("probe plugin is missing") }
     if (-not (Test-Path -LiteralPath $GuardFile -PathType Leaf)) { $failures.Add("route guard module is missing") }
+    if (-not (Test-Path -LiteralPath $Phase2File -PathType Leaf)) { $failures.Add("phase2 inspection helper is missing") }
     if ($failures.Count -eq 0) {
         $pluginText = [System.IO.File]::ReadAllText($PluginFile)
         $guardText = [System.IO.File]::ReadAllText($GuardFile)
+        $phase2Text = [System.IO.File]::ReadAllText($Phase2File)
         $scriptText = [System.IO.File]::ReadAllText($PSCommandPath)
-        foreach ($marker in @("Plugin.define", "context.client.session.import", "context.data.session.message.sync", "context.ui.router.navigate", "context.ui.tabs.focus")) {
+        foreach ($marker in @("Plugin.define", "context.client.session.import", "context.data.session.message.sync", "context.ui.router.navigate", "context.ui.tabs.focus", "SP_PROBE_PHASE")) {
             if (-not $pluginText.Contains($marker)) { $failures.Add("plugin marker missing: " + $marker) }
+        }
+        foreach ($marker in @("parseInspectionManifest", "validateInspectionGraph")) {
+            if (-not $phase2Text.Contains($marker)) { $failures.Add("phase2 marker missing: " + $marker) }
         }
         foreach ($marker in @("500", "10", "blocked")) {
             if (-not $guardText.Contains($marker)) { $failures.Add("route-guard marker missing: " + $marker) }
@@ -724,22 +945,32 @@ function Invoke-Probe {
     $script:RootCreated = $false
     $script:TuiLaunchAttempted = $false
     $script:TuiChild = $null
+    $script:InspectLaunchAttempted = $false
+    $script:InspectChild = $null
     $rootRemoved = $false
     $tuiStopVerified = $false
+    $inspectStopVerified = $true
+    $inspectStarted = $false
     $result = $null
+    $inspectResult = $null
     try {
         $script:ProbeStage = "preconditions"
         if ($env:OS -ne "Windows_NT") { throw "windows-required" }
+        if ($ProbeMode -eq "NativeReplacement" -and $CombinedRestartProbe) { throw "combined-restart-probe-not-supported" }
+        if ($ArchiveProbe -and $ProbeMode -ne "NativeReplacement") { throw "archive-probe-requires-native-replacement" }
+        if ($ArchiveProbe -and $InspectSeconds -lt 90) { throw "archive-observation-window-too-short" }
         if (-not (Test-PhysicalDirectoryChain -Path $ApprovedTempBase)) { throw "approved-temp-base-missing-or-redirected" }
         $executable = Resolve-OpenCodeExe -RequestedPath $OpenCodePath
         if ([string]::IsNullOrWhiteSpace($executable)) { throw "installed-opencode-exe-not-found" }
 
         $script:ProbeStage = "create-root"
         $suffix = [guid]::NewGuid().ToString("N")
-        $script:Root = Join-Path $ApprovedTempBase ("sync-anchor-" + $suffix)
+        $rootPrefix = if ($ProbeMode -eq "NativeReplacement") { "native-replacement-" } else { "sync-anchor-" }
+        $pluginStageName = if ($ProbeMode -eq "NativeReplacement") { $NativeStageDirectoryName } else { "sync-anchor-probe" }
+        $script:Root = Join-Path $ApprovedTempBase ($rootPrefix + $suffix)
         if (Test-Path -LiteralPath $script:Root) { throw "generated-root-already-exists" }
         $directories = @(
-            "cache", "config", "config\plugins\sync-anchor-probe", "data", "db", "home",
+            "cache", "config", ("config\plugins\" + $pluginStageName), "data", "db", "home",
             "home\AppData\Local", "home\AppData\Roaming", "log", "project", "repos", "results", "state", "tmp", "bin"
         )
         New-Item -ItemType Directory -Path $script:Root -ErrorAction Stop | Out-Null
@@ -752,9 +983,11 @@ function Invoke-Probe {
         Initialize-ProcessJobHelper
 
         $script:ProbeStage = "build-env"
-        $environmentBlock = New-ProbeEnvironmentBlock -Root $script:Root -Executable $executable
         $projectDirectory = Join-Path $script:Root "project"
         $resultFile = Join-Path $script:Root "results\probe-result.json"
+        $manifestFile = Join-Path $script:Root "results\probe-manifest.json"
+        $inspectResultFile = Join-Path $script:Root "results\probe-inspect-result.json"
+        $environmentBlock = New-ProbeEnvironmentBlock -Root $script:Root -Executable $executable -Phase "probe" -ResultPath $resultFile -ManifestPath $(if ($CombinedRestartProbe) { $manifestFile } else { "" }) -ArchiveProbe:$ArchiveProbe
 
         $script:ProbeStage = "version"
         Write-Host "preflight: isolated process environment created; no inherited provider credential variables"
@@ -766,10 +999,23 @@ function Invoke-Probe {
         Write-Host ("preflight: installed-version=" + $observedVersion + " expected-version=" + $ExpectedVersion)
 
         $script:ProbeStage = "stage-plugin"
-        $pluginTarget = Join-Path $script:Root "config\plugins\sync-anchor-probe\tui.tsx"
-        $guardTarget = Join-Path $script:Root "config\plugins\sync-anchor-probe\route-guard.ts"
-        Copy-Item -LiteralPath $PluginFile -Destination $pluginTarget -ErrorAction Stop
-        Copy-Item -LiteralPath $GuardFile -Destination $guardTarget -ErrorAction Stop
+        if ($ProbeMode -eq "NativeReplacement") {
+            $stageSet = Get-NativeReplacementStageSet -ProjectRoot $ProjectRoot
+            if (-not $stageSet.Ready) { throw "native-replacement-plugin-artifact-missing" }
+            $nativeStageTarget = Join-Path $script:Root ("config\plugins\" + $NativeStageDirectoryName)
+            foreach ($stageFile in @($stageSet.Files)) {
+                $stageName = [string]$stageFile.Name
+                if ($stageName -notin @("tui.tsx", "fixtures.ts") -or $stageName -match '[\\/]') { throw "native-replacement-stage-name-invalid" }
+                Copy-Item -LiteralPath ([string]$stageFile.Source) -Destination (Join-Path $nativeStageTarget $stageName) -ErrorAction Stop
+            }
+        } else {
+            $pluginTarget = Join-Path $script:Root "config\plugins\sync-anchor-probe\tui.tsx"
+            $guardTarget = Join-Path $script:Root "config\plugins\sync-anchor-probe\route-guard.ts"
+            $phase2Target = Join-Path $script:Root "config\plugins\sync-anchor-probe\phase2.ts"
+            Copy-Item -LiteralPath $PluginFile -Destination $pluginTarget -ErrorAction Stop
+            Copy-Item -LiteralPath $GuardFile -Destination $guardTarget -ErrorAction Stop
+            Copy-Item -LiteralPath $Phase2File -Destination $phase2Target -ErrorAction Stop
+        }
 
         $script:ProbeStage = "debug-capture"
         $pathText = Invoke-BoundedCapture -Executable $executable -Arguments @("debug", "paths") -WorkingDirectory $projectDirectory -EnvironmentBlock $environmentBlock -TimeoutMilliseconds 30000
@@ -787,19 +1033,30 @@ function Invoke-Probe {
         if ($escaped.Count -gt 0) { throw "debug-paths-isolation-gate-failed" }
         Write-Host "preflight: all ten reported OpenCode paths are inside the disposable root"
 
-        Write-Host "staging: synthetic-only public TUI route/cache probe"
+        if ($ProbeMode -eq "NativeReplacement") {
+            Write-Host "staging: fixed native-replacement TUI probe artifact only; no whole-project copy"
+        } else {
+            Write-Host "staging: synthetic-only public TUI route/cache probe"
+        }
         $script:ProbeStage = "tui-launch"
         $script:TuiLaunchAttempted = $true
         $script:TuiChild = Start-ProbeChild -Executable $executable -Arguments @("--standalone", $projectDirectory) -WorkingDirectory $projectDirectory -EnvironmentBlock $environmentBlock
         $script:ProbeStage = "result"
+        $resultLimit = if ($ProbeMode -eq "NativeReplacement") { $NativeResultLimitBytes } else { $ResultLimitBytes }
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
         while ([DateTime]::UtcNow -lt $deadline) {
             if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
                 $info = Get-Item -LiteralPath $resultFile -ErrorAction Stop
                 if (($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-UnderRoot -Child $info.FullName -Root $script:Root)) { throw "probe-result-path-invalid" }
-                if ($info.Length -gt $ResultLimitBytes) { throw "probe-result-over-cap" }
+                if ($info.Length -gt $resultLimit) { throw "probe-result-over-cap" }
                 $rawResult = [System.IO.File]::ReadAllText($resultFile) | ConvertFrom-Json -ErrorAction Stop
-                $result = Get-SafeProbeResult -Raw $rawResult -ExpectedVersion $ExpectedVersion
+                if ($ArchiveProbe) {
+                    $result = Get-SafeNativeArchiveProbeResult -Raw $rawResult
+                } elseif ($ProbeMode -eq "NativeReplacement") {
+                    $result = Get-SafeNativeProbeResult -Raw $rawResult
+                } else {
+                    $result = Get-SafeProbeResult -Raw $rawResult -ExpectedVersion $ExpectedVersion
+                }
                 break
             }
             if ($script:TuiChild.HasExited()) { break }
@@ -808,10 +1065,84 @@ function Invoke-Probe {
         if ($null -eq $result) { throw "probe-result-missing-or-timeout" }
         if ($InspectSeconds -gt 0) {
             $script:ProbeStage = "observation"
-            Write-Host ("TUI-OBSERVATION-WINDOW: " + [string]$InspectSeconds + " seconds; inspect the native session view only; do not submit a prompt")
+            if ($ArchiveProbe) {
+                Write-Host ("TUI-ARCHIVE-OBSERVATION-WINDOW: " + [string]$InspectSeconds + " seconds; 0-60s observe archived old in the native picker, then observe recovery; do not submit")
+            } else {
+                Write-Host ("TUI-OBSERVATION-WINDOW: " + [string]$InspectSeconds + " seconds; inspect the native session view only; do not submit a prompt")
+            }
             Start-Sleep -Seconds $InspectSeconds
         }
-        $script:ExitCode = if ($result.ok -eq $true) { 0 } else { 6 }
+
+        if ($ArchiveProbe) {
+            # The initial archive result starts the owner window; the plugin writes the final
+            # recovery-verified result during it. Re-read only the fixed result path after the
+            # window so the runner reports the actual recovery outcome.
+            if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
+                $finalInfo = Get-Item -LiteralPath $resultFile -ErrorAction Stop
+                if (($finalInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-UnderRoot -Child $finalInfo.FullName -Root $script:Root)) { throw "probe-result-path-invalid" }
+                if ($finalInfo.Length -gt $resultLimit) { throw "probe-result-over-cap" }
+                $finalRaw = [System.IO.File]::ReadAllText($resultFile) | ConvertFrom-Json -ErrorAction Stop
+                $result = Get-SafeNativeArchiveProbeResult -Raw $finalRaw
+            }
+        }
+
+        if ($CombinedRestartProbe -and $result.ok -eq $true) {
+            $script:ProbeStage = "phase1-stop"
+            $phase1Stop = Stop-ProbeChild -Child $script:TuiChild -TimeoutMilliseconds 10000
+            if (-not $phase1Stop) {
+                $script:SafeToDelete = $false
+                throw "phase1-stop-unverified"
+            }
+            try { $script:TuiChild.Dispose() } catch {
+                $script:SafeToDelete = $false
+                throw "phase1-dispose-unverified"
+            }
+            $script:TuiChild = $null
+
+            $script:ProbeStage = "inspect-manifest"
+            $manifestInfo = Get-Item -LiteralPath $manifestFile -ErrorAction Stop
+            if (($manifestInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not (Test-UnderRoot -Child $manifestInfo.FullName -Root $script:Root) -or
+                $manifestInfo.Length -gt $ManifestLimitBytes) {
+                throw "phase1-manifest-invalid"
+            }
+
+            $script:ProbeStage = "inspect-launch"
+            $inspectEnvironmentBlock = New-ProbeEnvironmentBlock -Root $script:Root -Executable $executable -Phase "inspect" -ResultPath $inspectResultFile -ManifestPath $manifestFile
+            $script:InspectLaunchAttempted = $true
+            $script:InspectChild = Start-ProbeChild -Executable $executable -Arguments @("--standalone", $projectDirectory) -WorkingDirectory $projectDirectory -EnvironmentBlock $inspectEnvironmentBlock
+            $inspectStarted = $true
+            $script:ProbeStage = "inspect-result"
+            $inspectDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ([DateTime]::UtcNow -lt $inspectDeadline) {
+                if (Test-Path -LiteralPath $inspectResultFile -PathType Leaf) {
+                    $inspectInfo = Get-Item -LiteralPath $inspectResultFile -ErrorAction Stop
+                    if (($inspectInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not (Test-UnderRoot -Child $inspectInfo.FullName -Root $script:Root)) { throw "inspect-result-path-invalid" }
+                    if ($inspectInfo.Length -gt $ResultLimitBytes) { throw "inspect-result-over-cap" }
+                    $rawInspect = [System.IO.File]::ReadAllText($inspectResultFile) | ConvertFrom-Json -ErrorAction Stop
+                    $inspectResult = Get-SafeProbeResult -Raw $rawInspect -ExpectedVersion $ExpectedVersion
+                    break
+                }
+                if ($script:InspectChild.HasExited()) { break }
+                Start-Sleep -Milliseconds 200
+            }
+            if ($null -eq $inspectResult) { throw "inspect-result-missing-or-timeout" }
+
+            $script:ProbeStage = "inspect-stop"
+            $inspectStopVerified = Stop-ProbeChild -Child $script:InspectChild -TimeoutMilliseconds 10000
+            if (-not $inspectStopVerified) {
+                $script:SafeToDelete = $false
+                throw "inspect-stop-unverified"
+            }
+            try { $script:InspectChild.Dispose() } catch {
+                $script:SafeToDelete = $false
+                throw "inspect-dispose-unverified"
+            }
+            $script:InspectChild = $null
+            $script:ExitCode = if ($inspectResult.ok -eq $true) { 0 } else { 6 }
+        } else {
+            $script:ExitCode = if ($result.ok -eq $true) { 0 } else { 6 }
+        }
     } catch {
         $safeStage = Get-SafeProbeStage -Stage $script:ProbeStage
         $safeCategory = Get-SafeFailureCategory -ErrorRecord $_
@@ -829,11 +1160,20 @@ function Invoke-Probe {
         } else {
             $tuiStopVerified = $true
         }
-        Write-Host ("stop: verified=" + [string]($tuiStopVerified -and $script:SafeToDelete))
+        if ($null -ne $script:InspectChild) {
+            $inspectStopVerified = Stop-ProbeChild -Child $script:InspectChild -TimeoutMilliseconds 10000
+            if (-not $inspectStopVerified) { $script:SafeToDelete = $false }
+            try { $script:InspectChild.Dispose() } catch { $script:SafeToDelete = $false }
+            $script:InspectChild = $null
+        } elseif (-not $inspectStarted) {
+            $inspectStopVerified = $true
+        }
+        $gate = Get-CombinedProbeGate -Phase1ResultOk:($null -ne $result -and $result.ok -eq $true) -Phase1StopVerified:$tuiStopVerified -Phase2Started:$inspectStarted -Phase2StopVerified:$inspectStopVerified
+        Write-Host ("stop: verified=" + [string]($gate.DeleteRoot -and $script:SafeToDelete))
         if ([string]::IsNullOrWhiteSpace($script:Root) -or -not $script:RootCreated) {
             if ($script:ExitCode -eq 4) { $script:ExitCode = 1 }
             if (-not [string]::IsNullOrWhiteSpace($script:Root)) { Write-Host "cleanup: no owned root was created; no directory removed" }
-        } elseif (-not $script:SafeToDelete -or -not $tuiStopVerified) {
+        } elseif (-not $script:SafeToDelete -or -not $gate.DeleteRoot) {
             Write-Host ("cleanup: FAILED; disposable root retained at " + $script:Root)
             $script:ExitCode = 3
         } else {
@@ -848,14 +1188,45 @@ function Invoke-Probe {
     }
 
     if ($null -ne $result) {
-        $result | ConvertTo-Json -Depth 8 -Compress | ForEach-Object { Write-Host ("PROBE-RESULT-JSON: " + $_) }
+        if ($ProbeMode -eq "NativeReplacement") {
+            $nativeJson = $result | ConvertTo-Json -Depth 4 -Compress
+            if ($nativeJson.Length -gt $NativeResultLimitBytes) {
+                Write-Host "PROBE-NATIVE-RESULT-OVER-CAP"
+                if ($script:ExitCode -eq 0) { $script:ExitCode = 6 }
+            } else {
+                Write-Host ("PROBE-NATIVE-RESULT-JSON: " + $nativeJson)
+            }
+        } else {
+            $result | ConvertTo-Json -Depth 8 -Compress | ForEach-Object { Write-Host ("PROBE-RESULT-JSON: " + $_) }
+        }
     }
-    if ($script:ExitCode -eq 0 -and (-not $rootRemoved -or -not $tuiStopVerified)) { $script:ExitCode = 3 }
+    if ($null -ne $inspectResult) {
+        $inspectResult | ConvertTo-Json -Depth 8 -Compress | ForEach-Object { Write-Host ("PROBE-INSPECT-JSON: " + $_) }
+    }
+    if ($script:ExitCode -eq 0 -and (-not $rootRemoved -or -not $gate.DeleteRoot)) { $script:ExitCode = 3 }
+    if ($ArchiveProbe -and $ProbeMode -eq "NativeReplacement") {
+        Write-Host ("ARCHIVE-RECEIPT: exit=" + [string]$script:ExitCode + " safe=" + [string]$script:SafeToDelete + " stop=" + [string]$tuiStopVerified + " cleanup=" + [string]([bool]$rootRemoved) + " finalOk=" + [string]($null -ne $result -and $result.ok -eq $true))
+    }
     return $script:ExitCode
 }
 
 if ($SupportedVersions -notcontains $ExpectedVersion) {
     Write-Host "VALIDATION-FAILED: expected-version-not-supported"
+    exit 1
+}
+
+if ($ProbeMode -eq "NativeReplacement" -and $CombinedRestartProbe) {
+    Write-Host "VALIDATION-FAILED: combined-restart-probe-not-supported-in-native-replacement-mode"
+    exit 1
+}
+
+if ($ArchiveProbe -and $ProbeMode -ne "NativeReplacement") {
+    Write-Host "VALIDATION-FAILED: archive-probe-requires-native-replacement"
+    exit 1
+}
+
+if ($ArchiveProbe -and $CombinedRestartProbe) {
+    Write-Host "VALIDATION-FAILED: archive-probe-does-not-support-combined-restart"
     exit 1
 }
 

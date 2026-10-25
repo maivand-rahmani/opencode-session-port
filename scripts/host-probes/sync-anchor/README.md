@@ -43,14 +43,84 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\host-probes\sync-anc
 `-ExpectedVersion` is an exact allowlist, not a wildcard: `2.0.22` (default; original
 preparation baseline) or `2.1.1` (explicit current-runtime compatibility trial). The
 runner requires the parsed `opencode --version` to equal it exactly before starting the
-TUI, includes `expectedVersion` in the sanitized runtime result, and rejects any other
-value during static validation before host side effects. The runner does not install,
+TUI, includes `expectedVersion` in the sanitized SyncAnchor runtime result, and rejects
+any other value during static validation before host side effects. The runner does not install,
 upgrade, or downgrade OpenCode; `-OpenCodePath` must point at an already-installed `.exe`.
 
-Optional bounds: `-TimeoutSeconds` (30–180, default 180), `-InspectSeconds` (0–45,
+Optional bounds: `-TimeoutSeconds` (30–180, default 180), `-InspectSeconds` (0–90,
 default 20), and `-OpenCodePath` (an installed `.exe`; otherwise `opencode.exe` must be
 on `PATH`). There is deliberately no `-KeepRoot` option. Do not retry an actual run
 without a new review.
+
+## Probe modes
+
+`-ProbeMode` is a fixed two-value switch. `SyncAnchor` (default) is the original probe
+above and its validation path is unchanged. `NativeReplacement` selects the fixed
+native-replacement TUI lane added on 2026-10-24.
+
+Native mode never accepts a caller-supplied plugin file, directory, or glob. It resolves
+exactly two reviewed locations from the repository root:
+
+1. `.package-verify-work/m1-native-tui-plugin-20261024/tui.tsx` (preferred single-file
+   bundle from the plugin lane), or
+2. `scripts/host-probes/native-replacement/tui/tui.tsx` (known new-source entry), plus
+   `scripts/host-probes/native-replacement/tui/fixtures.ts` only when the source entry is
+   used.
+
+The staged plugin directory is the fixed `config/plugins/native-replacement-probe`; only
+the allowlisted destination names `tui.tsx` and `fixtures.ts` are copied. No unrelated
+project file is read or staged. If neither fixed entry exists, static validation fails
+closed with `VALIDATION-FAILED: native-replacement plugin artifact is missing`; that is
+the remaining plugin-integration gate for this lane.
+
+Native mode reuses the same disposable root, version/debug-paths preflight, isolated
+environment allowlist, Job Object stop/verify, inspection window, cleanup, and exit
+codes. Its result is a separate exact schema, capped at 4 KiB and printed once as
+`PROBE-NATIVE-RESULT-JSON`:
+
+```json
+{"probe":"sessionport-native-replacement-tui","version":1,"ok":false,"stage":"preflight","reason":"none","importedCount":0,"oldMessageCount":0,"candidateMessageCount":0,"nativeRouteObserved":false,"parentlessVerified":false,"archiveNotTested":true,"composerNotTested":true,"pickerNotTested":true}
+```
+
+`stage` is one of `preflight`, `import-old`, `import-candidate`, `verify-history`,
+`navigate`, `complete`, `failed`; `reason` is one of `none`, `isolation`, `capability`,
+`import`, `history`, `navigation`, `internal`. Counts are clamped (`importedCount` 0–2,
+`oldMessageCount` 0–3, `candidateMessageCount` 0–4). Unknown values, extra keys, IDs,
+message text, and arbitrary strings are dropped or mapped to fixed labels. `ok` is true
+only for `stage=complete` with two imports, old/candidate history counts 2/3,
+`parentlessVerified=true`, and `nativeRouteObserved=true`. The archive, composer, and
+picker fields are always recorded as `true` (not tested); this probe claims no pixels.
+
+`-CombinedRestartProbe` is rejected in native mode before any host side effect. The
+separate API restart readback already showed it is not evidence about the current UI;
+the first native UI lane stays single-launch. Do not add archive or restart coverage
+here.
+
+## Native replacement wrapper
+
+`scripts/host-probes/native-replacement/run-tui-probe.ps1` is a thin fixed wrapper: native
+mode, expected version `2.1.1`, the observed installed
+`C:\Users\PC\AppData\Roaming\npm\node_modules\@opencode\cli\bin\opencode.exe`, timeout 180
+seconds (max 180), and inspection window 90 seconds (range 60–90). It exposes no mode,
+version, plugin-path, or combined-restart override, and it starts nothing unless
+`-RunProbe` is passed explicitly.
+
+From the project root, static validation only:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\host-probes\native-replacement\run-tui-probe.ps1
+```
+
+A later owner-approved single run, only after the parent/host-safety review and after the
+fixed plugin artifact exists:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\host-probes\native-replacement\run-tui-probe.ps1 -RunProbe
+```
+
+During the owner window, the native TUI is visible for 60–90 seconds; type only an
+UNSENT draft and press no Enter. This lane does not claim that terminal residue or mode
+restoration is fixed.
 
 ## Failure diagnostics and focused checks
 
@@ -102,6 +172,26 @@ The checks run no actual probe, start no OpenCode process, and create only a
 compiler-only Windows PowerShell 5.1 child; that folder is removed after a verified path
 and reparse-point check.
 
+## Opt-in combined restart readback
+
+`-CombinedRestartProbe` is off by default, so the existing single-phase run is unchanged.
+When enabled, one invocation runs the normal import/cache/route phase, opens the manual
+observation window (focus and draft only; never submit), then stops the phase-1 job and
+verifies zero active processes before starting anything else. Only after that verification
+does it relaunch the same isolated root in `SP_PROBE_PHASE=inspect`.
+
+Phase 2 is read-only: it reads one bounded manifest of synthetic session/message IDs and
+fixed counts, checks the public sessions/messages/cache/route by exact IDs, and writes a
+separate `PROBE-INSPECT-JSON` result with `phase:"inspect"` and zero imports. It does not
+import, update, delete, replay history, submit a message, or call a model. The root is
+removed only after both jobs are verified stopped; no root is retained across invocations
+and there is no `-KeepRoot` option. A phase-1 stop failure blocks phase 2 and deletion; a
+phase-2 stop failure blocks deletion.
+
+This proves a clean stop/relaunch readback only. It does not close crash-mid-import restart
+ambiguity, ordinary continuation, permissions/forms, concurrency, same-ID update, or
+history-merge/new-tail evidence.
+
 ## Probe and observable result
 
 The plugin checks `os.homedir()`, `os.tmpdir()`, the process working directory, the
@@ -147,8 +237,10 @@ credentials.
 ## Isolation and cleanup
 
 An approved `-RunProbe` uses only a fresh
-`C:\Users\PC\AppData\Local\Temp\opencode\sync-anchor-<guid>` root. The runner refuses
-missing/reparse-point ancestors, stages only this plugin and its pure guard, and uses
+`C:\Users\PC\AppData\Local\Temp\opencode\sync-anchor-<guid>` root (native mode uses the
+same base with `native-replacement-<guid>`). The runner refuses
+missing/reparse-point ancestors, stages only this plugin and its pure guard (native mode
+stages only the fixed allowlist above), and uses
 an environment allowlist with isolated HOME/XDG/OpenCode roots. Provider-credential
 environment variables and inherited OpenCode service/config overrides are not passed
 to children. The documented inline CLI config sets only `debug.devtools`, `debug.timing`,

@@ -131,6 +131,18 @@
     Required to start OpenCode. Without it the script only validates its own
     preconditions and prints usage (no root, no child process, no environment change).
 
+.PARAMETER NativeSyncValidation
+    Selects the fixed native `/sync` validation mode. The default checkpoint/restore
+    probe is unchanged. In this mode the runner stages the pinned keyring package and
+    win32-x64-msvc native binary as regular files (no install/update/junction), installs
+    the real TUI wiring with an explicit test-only cloud configuration, and leaves all
+    `/sync login`, `/sync status`, and `/sync logout` actions to the owner in the
+    native UI. The runner never dispatches a command and never captures dialog content,
+    codes, URLs, tokens, or identity. After the verified process-tree stop it may
+    delete exactly the run-unique vault service/account entry through the real pinned
+    keyring; an unproven state retains the private root and exits 3. The owner window
+    is bounded to 300 seconds.
+
 .PARAMETER KeepRoot
     Diagnostic only and not part of the authorized single run: skip deletion of the
     disposable root (prints the path for inspection of runner mechanics; the caller
@@ -165,7 +177,10 @@
 param(
     [switch]$RunProbe,
     [switch]$KeepRoot,
-    [ValidateRange(30, 900)]
+    # Fixed native /sync validation mode (no checkpoint/restore round trip). The
+    # default mode is unchanged. In this mode the owner window is bounded to 300s.
+    [switch]$NativeSyncValidation,
+    [ValidateRange(1, 900)]
     [int]$TimeoutSeconds = 180,
     [string]$OpenCodePath = ""
 )
@@ -175,8 +190,39 @@ $ErrorActionPreference = "Stop"
 
 $ProbeName = "sessionport-command-integration"
 $ApprovedTempBase = "C:\Users\PC\AppData\Local\Temp\opencode"
-$RootNamePrefix = "sp-command-"
-$StagedPluginName = "sp-command-probe"
+$script:NativeSyncValidation = [bool]$NativeSyncValidation
+# Fixed mode selection only: no plugin path, origin, vault name, or state path is a
+# caller-controlled parameter. Default mode stays byte-for-byte the checkpoint/restore probe.
+$RootNamePrefix = if ($script:NativeSyncValidation) { "sp-native-sync-" } else { "sp-command-" }
+$StagedPluginName = if ($script:NativeSyncValidation) { "sp-native-sync-probe" } else { "sp-command-probe" }
+$NativeSyncProbeName = "sessionport-native-sync-validation"
+$NativeSyncPluginRelativePath = "scripts\host-probes\sync-validation\tui-sync-probe.ts"
+$NativeSyncCleanupRelativePath = "scripts\host-probes\sync-validation\cleanup-entry.mjs"
+$NativeSyncOrigin = "http://127.0.0.1:43117"
+$NativeSyncVaultAccount = "credential"
+$NativeSyncMaxSecretBytes = 8192
+# Runtime limits explicitly mirrored from the test-only cloud wiring configuration
+# (tests/tui/wiring/install.test.ts, real-controller case). These are NOT production
+# defaults and are not inferred from the environment or a Host header.
+$NativeSyncRequestTimeoutMillis = 1000
+$NativeSyncMaxResponseBytes = 4096
+$NativeSyncMaxCredentialBytes = 4096
+# Pinned keyring package + win32-x64-msvc native binary copied as regular files from
+# the developer checkout into the staged source copy (never a junction/symlink, never
+# installed/updated). Only these four files are copied; hashes and manifest versions
+# are verified on both source and destination.
+$NativeSyncKeyringManifest = @(
+    @{ Package = "@napi-rs/keyring"; Version = "2.1.2"; File = "package.json"; Bytes = 3325; Sha256 = "4BA8C90AC72BE27FCB3337ED7BC0159C68747E0824294DF5F2AAAEB03130CD4F" },
+    @{ Package = "@napi-rs/keyring"; Version = "2.1.2"; File = "index.js"; Bytes = 29176; Sha256 = "8A89DB37F981D05B484EB063ADAE3399660AE7734AD38797463E5691382F5036" },
+    @{ Package = "@napi-rs/keyring-win32-x64-msvc"; Version = "2.1.2"; File = "package.json"; Bytes = 641; Sha256 = "1552C08589EEAEBC3680642883A8CAFEA8C72F80ED62908DE814177498562121" },
+    @{ Package = "@napi-rs/keyring-win32-x64-msvc"; Version = "2.1.2"; File = "keyring.win32-x64-msvc.node"; Bytes = 1912832; Sha256 = "52B16658275B7848F8081A6542FEE3448F1B1C5D3A36487107AE0E7CEC95AC6F" }
+)
+$NativeSyncCleanupWaitSeconds = 30
+# Native mode uses the explicit CLI executable already proven by M1 (same host), not
+# the npm PowerShell shim, so the TUI can inherit the caller's console. -OpenCodePath
+# remains an override but must resolve to an .exe and pass the version gate.
+$NativeSyncExpectedVersion = "2.1.1"
+$NativeSyncDefaultOpenCodeExe = "C:\Users\PC\AppData\Roaming\npm\node_modules\@opencode\cli\bin\opencode.exe"
 # Bounded in-memory capture cap for the 'opencode debug paths' stdout (the synthetic
 # ten-key path-map diagnostic). Runner-side harness-output guard only - NOT a product
 # crypto/payload limit. The ten-key map is normally well under 4 KiB; 64 KiB bounds
@@ -198,7 +244,10 @@ $ProbeEnvNames = @(
     "APPDATA", "LOCALAPPDATA", "TMP", "TEMP", "TMPDIR",
     "SP_PROBE_ROOT", "SP_PROBE_RESULT", "SP_PROBE_PROJECT", "SP_PROBE_TARGET",
     "SP_PROBE_ARTIFACT", "SP_PROBE_REPO", "SP_PROBE_SESSION_ID",
-    "SP_PROBE_MESSAGE_ID_1", "SP_PROBE_MESSAGE_ID_2"
+    "SP_PROBE_MESSAGE_ID_1", "SP_PROBE_MESSAGE_ID_2",
+    "SP_SYNC_ROOT", "SP_SYNC_RESULT", "SP_SYNC_REPO", "SP_SYNC_ORIGIN",
+    "SP_SYNC_VAULT_SERVICE", "SP_SYNC_VAULT_ACCOUNT", "SP_SYNC_STATE_DIR",
+    "SP_SYNC_MAX_SECRET_BYTES"
 )
 
 $script:ExitCode = 4
@@ -2290,7 +2339,11 @@ function Start-ProbeChildProcess {
         [string]$FilePath,
         [string[]]$Arguments,
         [string]$WorkingDirectory,
-        [switch]$CaptureStdOut
+        [switch]$CaptureStdOut,
+        # Fixed-mode TUI only: inherit the parent console's stdin/stdout/stderr so the
+        # owner can see and operate the native TUI. No streams are redirected, drained,
+        # captured, or persisted on this path. Applies only to the native TUI launch.
+        [switch]$InteractiveConsole
     )
     # Launches a child with UseShellExecute=false (the no-new-window equivalent) and
     # redirected stdio, then drains both streams in memory only: stdout is either
@@ -2301,27 +2354,44 @@ function Start-ProbeChildProcess {
     # private copy at creation time) and the runner's original values are restored in
     # finally immediately after the child is started, on every launch path. A normal
     # invocation does not leave the caller's environment changed.
+    if ($InteractiveConsole -and ($CaptureStdOut -or $FilePath -match '\.(cmd|bat|ps1)$')) {
+        throw "interactive console mode requires an explicit executable and no capture"
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
     $psi.WorkingDirectory = $WorkingDirectory
-    $quotedArgs = @()
-    foreach ($argument in $Arguments) {
-        if ($argument -match '[\s"]') { $quotedArgs += ('"' + $argument + '"') } else { $quotedArgs += $argument }
-    }
-    $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
-    if ($extension -eq ".cmd" -or $extension -eq ".bat") {
-        $inner = '"' + $FilePath + '"'
-        if ($quotedArgs.Count -gt 0) { $inner = $inner + " " + ($quotedArgs -join " ") }
-        $psi.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
-        $psi.Arguments = "/d /s /c " + $inner
-    } elseif ($extension -eq ".ps1") {
-        $psi.FileName = "powershell.exe"
-        $psi.Arguments = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $FilePath) + $quotedArgs) -join " "
-    } else {
+    if ($InteractiveConsole) {
+        # Inherit the runner's console handles. The owner's keyboard input and the
+        # native TUI render stay in the same console; nothing is redirected or read.
+        $psi.RedirectStandardInput = $false
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError = $false
         $psi.FileName = $FilePath
+        $quotedArgs = @()
+        foreach ($argument in $Arguments) {
+            if ($argument -match '[\s"]') { $quotedArgs += ('"' + $argument + '"') } else { $quotedArgs += $argument }
+        }
         $psi.Arguments = $quotedArgs -join " "
+    } else {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $quotedArgs = @()
+        foreach ($argument in $Arguments) {
+            if ($argument -match '[\s"]') { $quotedArgs += ('"' + $argument + '"') } else { $quotedArgs += $argument }
+        }
+        $extension = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+        if ($extension -eq ".cmd" -or $extension -eq ".bat") {
+            $inner = '"' + $FilePath + '"'
+            if ($quotedArgs.Count -gt 0) { $inner = $inner + " " + ($quotedArgs -join " ") }
+            $psi.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
+            $psi.Arguments = "/d /s /c " + $inner
+        } elseif ($extension -eq ".ps1") {
+            $psi.FileName = "powershell.exe"
+            $psi.Arguments = (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $FilePath) + $quotedArgs) -join " "
+        } else {
+            $psi.FileName = $FilePath
+            $psi.Arguments = $quotedArgs -join " "
+        }
     }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
@@ -2336,6 +2406,10 @@ function Start-ProbeChildProcess {
     }
     if (-not $started) {
         throw "the child process could not be started"
+    }
+    if ($InteractiveConsole) {
+        # No in-memory drains and no persistent files: the child owns the console.
+        return [pscustomobject]@{ Process = $process; StdOutDrain = $null; StdOutCapture = $null; StdErrDrain = $null }
     }
     # Continuous in-memory draining (nothing is persisted): the child never blocks on
     # a full pipe. stderr is always discarded to Stream.Null; stdout is either captured
@@ -2523,6 +2597,294 @@ function Read-ResultField {
     $prop = $Object.PSObject.Properties[$Name]
     if ($null -eq $prop) { return $null }
     return $prop.Value
+}
+
+function Get-ResolvedPackageDirectoryPath {
+    # Resolves a package directory that may be a normal directory (npm layout) or a
+    # relative directory symlink/junction (the bun isolated layout). Only the link
+    # itself is resolved here; callers still require regular non-reparse files inside.
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return "" }
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer) { return "" }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+            return $fullPath
+        }
+        $target = @($item.Target)[0]
+        if ([string]::IsNullOrWhiteSpace($target)) { return "" }
+        if (-not [System.IO.Path]::IsPathRooted($target)) {
+            $parent = [System.IO.Directory]::GetParent($fullPath)
+            if ($null -eq $parent) { return "" }
+            $target = Join-Path $parent.FullName $target
+        }
+        $target = [System.IO.Path]::GetFullPath($target)
+        if (-not (Test-Path -LiteralPath $target)) { return "" }
+        return $target
+    } catch {
+        return ""
+    }
+}
+
+function Get-NativeSyncKeyringStagingPlan {
+    # Builds the explicit four-file copy plan for the pinned keyring package and its
+    # win32-x64-msvc native binary. Every source file must be a regular file (no
+    # reparse point), match its pinned byte length and SHA-256, and the package
+    # manifests must name the pinned versions. No install/update/junction is used.
+    $plan = [pscustomobject]@{ Ok = $false; Reason = ""; Entries = @() }
+    if ($env:OS -ne "Windows_NT") {
+        $plan.Reason = "native sync validation requires Windows_NT"
+        return $plan
+    }
+    $keyringLink = Join-Path $script:RepoRoot "node_modules\@napi-rs\keyring"
+    $keyringRoot = Get-ResolvedPackageDirectoryPath -Path $keyringLink
+    if ([string]::IsNullOrWhiteSpace($keyringRoot)) {
+        $plan.Reason = "the pinned keyring package directory could not be resolved"
+        return $plan
+    }
+    $nativeRoot = Get-ResolvedPackageDirectoryPath -Path (Join-Path (Split-Path $keyringRoot -Parent) "keyring-win32-x64-msvc")
+    if ([string]::IsNullOrWhiteSpace($nativeRoot)) {
+        $plan.Reason = "the pinned native keyring package directory could not be resolved"
+        return $plan
+    }
+    $entries = @()
+    foreach ($item in $NativeSyncKeyringManifest) {
+        $root = if ($item.Package -eq "@napi-rs/keyring") { $keyringRoot } else { $nativeRoot }
+        $source = Join-Path $root $item.File
+        if (-not (Test-Path -LiteralPath $source)) {
+            $plan.Reason = "missing pinned keyring file: " + $item.Package + "/" + $item.File
+            return $plan
+        }
+        $fileItem = $null
+        try { $fileItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop } catch { $fileItem = $null }
+        if ($null -eq $fileItem -or $fileItem.PSIsContainer -or (($fileItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            $plan.Reason = "pinned keyring file is not a regular file: " + $item.Package + "/" + $item.File
+            return $plan
+        }
+        if ([int64]$fileItem.Length -ne [int64]$item.Bytes) {
+            $plan.Reason = "pinned keyring file length mismatch: " + $item.Package + "/" + $item.File
+            return $plan
+        }
+        $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ($hash -ne $item.Sha256) {
+            $plan.Reason = "pinned keyring file hash mismatch: " + $item.Package + "/" + $item.File
+            return $plan
+        }
+        $entries += [pscustomobject]@{
+            Package = $item.Package
+            Version = $item.Version
+            File = $item.File
+            Bytes = $item.Bytes
+            Sha256 = $item.Sha256
+            SourcePath = $source
+        }
+    }
+    foreach ($package in @($entries | Group-Object Package)) {
+        $manifestEntry = @($package.Group | Where-Object { $_.File -eq "package.json" })[0]
+        if ($null -eq $manifestEntry) {
+            $plan.Reason = "pinned keyring manifest is missing: " + $package.Name
+            return $plan
+        }
+        try {
+            $manifest = [System.IO.File]::ReadAllText($manifestEntry.SourcePath) | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            $plan.Reason = "pinned keyring manifest could not be parsed: " + $package.Name
+            return $plan
+        }
+        if ([string]$manifest.name -ne $package.Name -or [string]$manifest.version -ne $manifestEntry.Version) {
+            $plan.Reason = "pinned keyring manifest name/version mismatch: " + $package.Name
+            return $plan
+        }
+    }
+    $plan.Entries = $entries
+    $plan.Ok = $true
+    return $plan
+}
+
+function Copy-NativeSyncKeyringPackages {
+    # Copies only the planned regular files into the staged source copy and verifies
+    # destination hashes. The destination location is a resolution-precedence staging
+    # directory inside the copied source (repo/src/node_modules); the reviewed
+    # dependency junction remains the fallback for every other package.
+    param([object]$Plan, [string]$RepoStage)
+    foreach ($entry in $Plan.Entries) {
+        try {
+            $relative = "src\node_modules\" + $entry.Package.Replace("/", "\")
+            $destinationDir = Join-Path $RepoStage $relative
+            if (-not (Test-Path -LiteralPath $destinationDir)) {
+                New-Item -ItemType Directory -Path $destinationDir -Force -ErrorAction Stop | Out-Null
+            }
+            $destination = Join-Path $destinationDir $entry.File
+            if (Test-Path -LiteralPath $destination) {
+                return [pscustomobject]@{ Ok = $false; Reason = "staged keyring file already exists: " + $entry.Package + "/" + $entry.File }
+            }
+            [System.IO.File]::Copy($entry.SourcePath, $destination, $false)
+            $stagedItem = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+            if (($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return [pscustomobject]@{ Ok = $false; Reason = "staged keyring file is a reparse point: " + $entry.Package + "/" + $entry.File }
+            }
+            if ([int64]$stagedItem.Length -ne [int64]$entry.Bytes) {
+                return [pscustomobject]@{ Ok = $false; Reason = "staged keyring file length mismatch: " + $entry.Package + "/" + $entry.File }
+            }
+            $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($hash -ne $entry.Sha256) {
+                return [pscustomobject]@{ Ok = $false; Reason = "staged keyring file hash mismatch: " + $entry.Package + "/" + $entry.File }
+            }
+        } catch {
+            return [pscustomobject]@{ Ok = $false; Reason = "staged keyring copy failed: " + $entry.Package + "/" + $entry.File }
+        }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = "" }
+}
+
+function Set-PrivateDirectoryAcl {
+    # Private ACL for the cloud-auth state directory: inheritance removed, only the
+    # current user, SYSTEM, and Administrators granted full control (SIDs, so this is
+    # independent of localized group names). No secret is written by this runner.
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        if ($sid -notmatch '^S-1-[0-9-]+$') { return $false }
+        & icacls.exe $Path /inheritance:r /grant:r ("*" + $sid + ":(OI)(CI)F") "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-NativeSyncCleanupRuntime {
+    foreach ($name in @("node", "bun")) {
+        $command = @(Get-Command -Name $name -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            return [string]$command.Source
+        }
+    }
+    return ""
+}
+
+function Invoke-NativeSyncVaultCleanupGuard {
+    # Runs only AFTER the verified TUI process-tree stop. The guard reads and, when
+    # present, deletes exactly the run-unique service/account pair through the real
+    # pinned AsyncEntry. It never enumerates credentials, never writes a secret, and
+    # never retries. Unproven state leaves the private root retained (caller fails).
+    param([string]$Root, [string]$RepoStage, [string]$Service, [string]$Account, [object]$PreflightAbsent)
+    $receipt = [pscustomobject]@{ Attempted = $false; Ok = $false; Presence = $null; Removed = $null; Reason = "not-attempted" }
+    if ($PreflightAbsent -ne $true) {
+        $receipt.Reason = "preflight-absence-not-proven"
+        return $receipt
+    }
+    $runtime = Get-NativeSyncCleanupRuntime
+    if ([string]::IsNullOrWhiteSpace($runtime)) {
+        $receipt.Reason = "cleanup-runtime-unavailable"
+        return $receipt
+    }
+    $scriptPath = Join-Path $RepoStage "src\cleanup-entry.mjs"
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        $receipt.Reason = "cleanup-script-missing"
+        return $receipt
+    }
+    $receiptPath = Join-Path $Root "results\vault-cleanup.json"
+    if (Test-Path -LiteralPath $receiptPath) {
+        $receipt.Reason = "cleanup-receipt-preexisting"
+        return $receipt
+    }
+    $receipt.Attempted = $true
+    try {
+        $launch = Start-ProbeChildProcess -EnvMap @{} -FilePath $runtime -Arguments @($scriptPath, $Service, $Account, $receiptPath) -WorkingDirectory $RepoStage
+        $cleanupProcess = $launch.Process
+        $exited = $cleanupProcess.WaitForExit($NativeSyncCleanupWaitSeconds * 1000)
+        if (-not $exited) {
+            $receipt.Reason = "cleanup-timeout"
+            return $receipt
+        }
+        $exitCode = $cleanupProcess.ExitCode
+        $receiptText = ""
+        try { $receiptText = [System.IO.File]::ReadAllText($receiptPath) } catch { $receiptText = "" }
+        if ([string]::IsNullOrWhiteSpace($receiptText)) {
+            $receipt.Reason = "cleanup-receipt-missing"
+            return $receipt
+        }
+        $parsed = $receiptText | ConvertFrom-Json -ErrorAction Stop
+        $presence = $parsed.PSObject.Properties["presence"]
+        $removed = $parsed.PSObject.Properties["removed"]
+        $exact = $parsed.PSObject.Properties["exactTargetOnly"]
+        if ($null -eq $presence -or $null -eq $removed -or $null -eq $exact -or $exact.Value -ne $true) {
+            $receipt.Reason = "cleanup-receipt-invalid"
+            return $receipt
+        }
+        if (-not ($presence.Value -is [bool]) -and $null -ne $presence.Value) {
+            $receipt.Reason = "cleanup-receipt-invalid"
+            return $receipt
+        }
+        if (-not ($removed.Value -is [bool]) -and $null -ne $removed.Value) {
+            $receipt.Reason = "cleanup-receipt-invalid"
+            return $receipt
+        }
+        $receipt.Presence = $presence.Value
+        $receipt.Removed = $removed.Value
+        if ([int]$exitCode -ne 0) {
+            $receipt.Reason = "cleanup-exit-nonzero"
+            return $receipt
+        }
+        if (($presence.Value -eq $false -and $removed.Value -eq $false) -or ($presence.Value -eq $true -and $removed.Value -eq $true)) {
+            $receipt.Ok = $true
+            $receipt.Reason = ""
+            return $receipt
+        }
+        $receipt.Reason = "cleanup-state-unproven"
+        return $receipt
+    } catch {
+        $receipt.Reason = "cleanup-error"
+        return $receipt
+    }
+}
+
+function Resolve-NativeSyncOpenCodeExe {
+    # Explicit .exe only (no .ps1/.cmd shim): the native TUI must inherit the parent
+    # console. Override is preserved but bounded to a real executable file.
+    param([string]$RequestedPath)
+    $candidate = $RequestedPath
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        if (Test-Path -LiteralPath $NativeSyncDefaultOpenCodeExe -PathType Leaf) {
+            $candidate = $NativeSyncDefaultOpenCodeExe
+        } else {
+            $commands = @(Get-Command -Name "opencode.exe" -CommandType Application -ErrorAction SilentlyContinue)
+            if ($commands.Count -gt 0) { $candidate = [string]$commands[0].Source }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { return "" }
+    try { $resolved = (Resolve-Path -LiteralPath $candidate).Path } catch { return "" }
+    if ([System.IO.Path]::GetExtension($resolved).ToLowerInvariant() -ne ".exe") { return "" }
+    return $resolved
+}
+
+function Get-NativeSyncOpenCodeVersion {
+    # Bounded in-memory version gate for the explicit executable. The capture is a
+    # short CLI diagnostic only; it is never written, logged, or persisted.
+    param([string]$Executable, [hashtable]$EnvMap, [string]$WorkingDirectory)
+    $launch = Start-ProbeChildProcess -EnvMap $EnvMap -FilePath $Executable -Arguments @("--version") -WorkingDirectory $WorkingDirectory -CaptureStdOut
+    $process = $launch.Process
+    if (-not $process.WaitForExit(30000)) {
+        return [pscustomobject]@{ Ok = $false; Version = ""; Reason = "version-timeout" }
+    }
+    $capture = $launch.StdOutCapture
+    if ($null -eq $capture) { return [pscustomobject]@{ Ok = $false; Version = ""; Reason = "version-capture-missing" } }
+    $deadline = (Get-Date).AddSeconds(5)
+    while (-not $capture.Completed -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    if (-not $capture.Completed -or $capture.Faulted -or $capture.Overflow) {
+        return [pscustomobject]@{ Ok = $false; Version = ""; Reason = "version-capture-invalid" }
+    }
+    if ([int]$process.ExitCode -ne 0) {
+        return [pscustomobject]@{ Ok = $false; Version = ""; Reason = "version-exit-nonzero" }
+    }
+    $text = $capture.GetCapturedText()
+    $clean = [System.Text.RegularExpressions.Regex]::Replace($text, "\x1B\[[0-9;]*[A-Za-z]", "")
+    $found = @([System.Text.RegularExpressions.Regex]::Matches($clean, '(?m)(?:^|\s)v?(\d+\.\d+\.\d+)(?:\s|$)') |
+        ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    if ($found.Count -ne 1) { return [pscustomobject]@{ Ok = $false; Version = ""; Reason = "version-unparsed" } }
+    return [pscustomobject]@{ Ok = ($found[0] -eq $NativeSyncExpectedVersion); Version = $found[0]; Reason = $(if ($found[0] -eq $NativeSyncExpectedVersion) { "" } else { "version-mismatch" }) }
 }
 
 function Get-RepoRootPath {
@@ -2846,8 +3208,136 @@ function Get-ValidationFailures {
     if (-not $inlineConfigOk) {
         $failures.Add("the child inline CLI config JSON must be valid and set only debug.devtools/debug.timing/debug.turn_tokens to boolean false")
     }
-    if ($RootNamePrefix -ne "sp-command-") {
-        $failures.Add("root prefix must be sp-command-")
+    if ($RootNamePrefix -ne "sp-command-" -and $RootNamePrefix -ne "sp-native-sync-") {
+        $failures.Add("root prefix is not an approved fixed prefix")
+    }
+    if ($script:NativeSyncValidation) {
+        if ($TimeoutSeconds -lt 1 -or $TimeoutSeconds -gt 300) {
+            $failures.Add("native sync validation owner window must be between 1 and 300 seconds")
+        }
+        if ($RootNamePrefix -ne "sp-native-sync-") {
+            $failures.Add("native sync validation must use the fixed sp-native-sync- root prefix")
+        }
+        $pluginPath = Join-Path $script:RepoRoot $NativeSyncPluginRelativePath
+        $cleanupPath = Join-Path $script:RepoRoot $NativeSyncCleanupRelativePath
+        if (-not (Test-Path -LiteralPath $pluginPath)) {
+            $failures.Add("native sync plugin source is missing")
+        } else {
+            $pluginText = ""
+            try { $pluginText = [System.IO.File]::ReadAllText($pluginPath) } catch { $pluginText = "" }
+            if ($pluginText.Length -eq 0) {
+                $failures.Add("native sync plugin source could not be read")
+            } else {
+                $requiredMarkers = @(
+                    "installSessionPortWiring(contextWrapper, { createCloudAuth: observedCloudAuthFactory })",
+                    "sessionportCloud: config",
+                    "origin: origin",
+                    "allowLoopbackHttp: true",
+                    "requestTimeoutMillis: 1000",
+                    "maxResponseBytes: 4096",
+                    "maxCredentialBytes: 4096",
+                    "vaultAccount: vaultAccount",
+                    "stateDirectory: stateDirectory",
+                    "createKeyringVault(AsyncEntry",
+                    "vault.read({ service: config.vaultService, account: config.vaultAccount })",
+                    "vault-entry-present",
+                    "vault-preflight-failed",
+                    "loginDispatchedByProbe: false",
+                    "dialogContentRead: false",
+                    "verificationCodeCaptured: false",
+                    "identityCaptured: false",
+                    "createNativeObservations",
+                    "terminalOutcome",
+                    "beginStatus",
+                    "pollLastStatus",
+                    "errorCategory",
+                    "vaultCommitOutcome",
+                    "createObservedFetch",
+                    "createCloudAuthController",
+                    "createCloudAuthHandlers",
+                    "createCloudAuthUi",
+                    "../../../repo/src/cloud/vault/keyring.ts",
+                    "../../../repo/src/node_modules/@napi-rs/keyring/index.js",
+                    "../../../repo/src/tui/wiring/install.ts",
+                    "../../../repo/src/tui/ui/sessionport-commands.tsx",
+                    "SESSIONPORT_COMMAND_IDS.sync"
+                )
+                foreach ($marker in $requiredMarkers) {
+                    if ($pluginText.IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+                        $failures.Add("native sync plugin is missing required marker: " + $marker)
+                    }
+                }
+                if ($pluginText.IndexOf("keymap.dispatch", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync plugin must not dispatch any command (owner issues /sync manually)")
+                }
+                if ($pluginText.IndexOf("dialog.show(", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync plugin must not wrap or call the host dialog")
+                }
+                if ($pluginText.IndexOf("console.", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync plugin must not write to the console")
+                }
+                if ($pluginText.IndexOf("fetch(", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync plugin must not call fetch directly")
+                }
+            }
+        }
+        if (-not (Test-Path -LiteralPath $cleanupPath)) {
+            $failures.Add("native sync cleanup guard source is missing")
+        } else {
+            $cleanupText = ""
+            try { $cleanupText = [System.IO.File]::ReadAllText($cleanupPath) } catch { $cleanupText = "" }
+            if ($cleanupText.Length -eq 0) {
+                $failures.Add("native sync cleanup guard source could not be read")
+            } else {
+                foreach ($marker in @("cleanupExactEntry", "deleteCredential()", "getSecret()", "exactTargetOnly", "removed")) {
+                    if ($cleanupText.IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+                        $failures.Add("native sync cleanup guard is missing required marker: " + $marker)
+                    }
+                }
+                if ($cleanupText.IndexOf("findCredentials", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync cleanup guard must not enumerate credentials")
+                }
+                if ($cleanupText.IndexOf("console.", [System.StringComparison]::Ordinal) -ge 0) {
+                    $failures.Add("native sync cleanup guard must not write to the console")
+                }
+            }
+        }
+        $keyringPlan = Get-NativeSyncKeyringStagingPlan
+        if (-not $keyringPlan.Ok) {
+            $failures.Add("native sync pinned keyring staging plan is unavailable: " + $keyringPlan.Reason)
+        }
+        if (@($NativeSyncKeyringManifest).Count -ne 4) {
+            $failures.Add("native sync pinned keyring manifest must contain exactly four regular files")
+        }
+        foreach ($marker in @(
+            "[switch]$InteractiveConsole",
+            "RedirectStandardInput = `$false",
+            "RedirectStandardOutput = `$false",
+            "RedirectStandardError = `$false",
+            "-InteractiveConsole:(`$script:NativeSyncValidation)",
+            "Resolve-NativeSyncOpenCodeExe",
+            "Get-NativeSyncOpenCodeVersion",
+            "2.1.1",
+            "opencode\cli\bin\opencode.exe"
+        )) {
+            if ($selfText.IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+                $failures.Add("native sync interactive-console wiring is missing: " + $marker)
+            }
+        }
+        if ($selfText.IndexOf(("CreateNo" + "Window"), [System.StringComparison]::Ordinal) -ge 0 -or $selfText.IndexOf(("NoNew" + "Window"), [System.StringComparison]::Ordinal) -ge 0) {
+            $failures.Add("native sync TUI launch must not request a hidden/no-window launch")
+        }
+        $interactiveCallSites = ([regex]::Matches($selfText, [regex]::Escape("-InteractiveConsole:(`$script:NativeSyncValidation)"))).Count
+        if ($interactiveCallSites -ne 1) {
+            $failures.Add("native sync interactive console must be requested only at the native TUI launch (found " + [string]$interactiveCallSites + " site(s))")
+        }
+    } else {
+        if ($TimeoutSeconds -lt 30 -or $TimeoutSeconds -gt 900) {
+            $failures.Add("timeout must be between 30 and 900 seconds in the default probe mode")
+        }
+        if ($RootNamePrefix -ne "sp-command-") {
+            $failures.Add("root prefix must be sp-command-")
+        }
     }
     if ([string]::IsNullOrWhiteSpace($ApprovedTempBase)) {
         $failures.Add("approved temp base is empty")
@@ -2862,8 +3352,13 @@ function Get-ValidationFailures {
 }
 
 function Invoke-ValidationOnly {
-    Write-Host ("probe: " + $ProbeName)
-    Write-Host "mode: validation-only (no OpenCode start; pass -RunProbe to execute)"
+    Write-Host ("probe: " + $(if ($script:NativeSyncValidation) { $NativeSyncProbeName } else { $ProbeName }))
+    if ($script:NativeSyncValidation) {
+        Write-Host "mode: native-sync-validation (fixed; no checkpoint/restore round trip)"
+    } else {
+        Write-Host "mode: validation-only (no OpenCode start; pass -RunProbe to execute)"
+    }
+    Write-Host "run: NOT-STARTED (no OpenCode process, no TUI, no keyring read, no network)"
     $script:RepoRoot = ""
     try { $script:RepoRoot = Get-RepoRootPath } catch { $script:RepoRoot = "" }
     $failures = @(Get-ValidationFailures)
@@ -2880,6 +3375,15 @@ function Invoke-ValidationOnly {
         Write-Host "temp base gate: base not present yet (ancestor gate runs before creation in -RunProbe mode)"
     }
     Write-Host ("root prefix: " + $RootNamePrefix)
+    if ($script:NativeSyncValidation) {
+        Write-Host ("native plugin: fixed staged source (" + $NativeSyncPluginRelativePath + ")")
+        Write-Host ("native cleanup guard: fixed staged source (" + $NativeSyncCleanupRelativePath + ")")
+        Write-Host "native config: loopback HTTP origin with explicit opt-in; test-only limits; fresh UUID vault service; account=credential; private state directory under the disposable root"
+        Write-Host "native keyring: pinned @napi-rs/keyring@2.1.2 + @napi-rs/keyring-win32-x64-msvc@2.1.2 native binary; regular-file copy only (no install/update/junction), source+destination hashes verified"
+        Write-Host ("owner window: " + [string]$TimeoutSeconds + "s (bounded 1-300s)")
+        Write-Host ("native TUI launch: inherited parent console (stdin/stdout/stderr not redirected; no capture/drain); explicit opencode .exe, expected version " + $NativeSyncExpectedVersion)
+        Write-Host "owner actions (manual, not by this runner): /sync login, browser approval, /sync status, /sync logout local-only"
+    }
     Write-Host "child inline CLI debug override: debug.devtools=false debug.timing=false debug.turn_tokens=false (explicit documented inline config; not a host-log disable control)"
     $resolved = ""
     if (-not [string]::IsNullOrWhiteSpace($OpenCodePath)) {
@@ -2893,7 +3397,11 @@ function Invoke-ValidationOnly {
     } else {
         Write-Host ("opencode: " + $resolved)
     }
-    Write-Host "would run: unique root under the approved temp base, 'opencode debug paths' preflight, in-root staging (repo src copy + dependency junction + probe plugin), actual TUI with --standalone, one synthetic /checkpoint -> /restore round trip invoked through public keymap dispatch with bounded completion waits (slash parsing/key input untested), stop/cleanup verification."
+    if ($script:NativeSyncValidation) {
+        Write-Host "would run: unique root under the approved temp base, 'opencode debug paths' preflight, in-root staging (repo src copy + dependency junction + pinned keyring regular-file copies + native sync plugin), actual TUI with --standalone, owner-driven /sync actions in the native UI, verified process-tree stop, exact-entry vault cleanup guard after stop."
+    } else {
+        Write-Host "would run: unique root under the approved temp base, 'opencode debug paths' preflight, in-root staging (repo src copy + dependency junction + probe plugin), actual TUI with --standalone, one synthetic /checkpoint -> /restore round trip invoked through public keymap dispatch with bounded completion waits (slash parsing/key input untested), stop/cleanup verification."
+    }
     Write-Host "VALIDATION-OK"
     return 0
 }
@@ -2952,7 +3460,13 @@ function Invoke-ProbeMain {
 
     # --- resolve the installed OpenCode command ---
     $resolved = ""
-    if (-not [string]::IsNullOrWhiteSpace($OpenCodePath)) {
+    if ($script:NativeSyncValidation) {
+        $resolved = Resolve-NativeSyncOpenCodeExe -RequestedPath $OpenCodePath
+        if ([string]::IsNullOrWhiteSpace($resolved)) {
+            Write-Host "PREFLIGHT-FAILED: native sync validation requires an explicit opencode .exe (default M1 path or -OpenCodePath); .ps1/.cmd shims are not used for the interactive TUI."
+            return 1
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($OpenCodePath)) {
         if (-not (Test-Path -LiteralPath $OpenCodePath)) {
             Write-Host "PREFLIGHT-FAILED: -OpenCodePath does not exist."
             return 1
@@ -2971,8 +3485,14 @@ function Invoke-ProbeMain {
         }
     }
     Write-Host ("opencode: " + $resolved)
-    Write-Host "mode: single synthetic /checkpoint -> /restore round trip"
-    Write-Host "invocation: public keymap dispatch(id, input) exactly once per registered command; dispatch returns void (asynchronous from the harness perspective) and completion is awaited on bounded UI captures; slash parsing and key input remain untested."
+    if ($script:NativeSyncValidation) {
+        Write-Host "mode: native /sync validation (owner-driven; no checkpoint/restore round trip)"
+        Write-Host "invocation: real installSessionPortWiring in the app slot; owner issues /sync login, /sync status, and /sync logout manually in the native UI; this runner never dispatches commands and never reads dialog content/codes"
+        Write-Host ("owner: act inside the native UI, then close/Exit normally; the runner verifies the process-tree stop and only then considers vault cleanup (window " + [string]$TimeoutSeconds + "s)")
+    } else {
+        Write-Host "mode: single synthetic /checkpoint -> /restore round trip"
+        Write-Host "invocation: public keymap dispatch(id, input) exactly once per registered command; dispatch returns void (asynchronous from the harness perspective) and completion is awaited on bounded UI captures; slash parsing and key input remain untested."
+    }
 
     # --- unique disposable root (created explicitly, then immediately gated) ---
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -3001,6 +3521,9 @@ function Invoke-ProbeMain {
         "repos", "db", "home", "home\AppData\Roaming", "home\AppData\Local",
         "project", "restore-target", "artifacts", "results", "repo"
     )
+    if ($script:NativeSyncValidation) {
+        $subdirs += "state\cloud-auth"
+    }
     foreach ($sub in $subdirs) {
         New-Item -ItemType Directory -Path (Join-Path $script:Root $sub) -Force | Out-Null
     }
@@ -3043,6 +3566,27 @@ function Invoke-ProbeMain {
         "SP_PROBE_MESSAGE_ID_1" = ("msg_" + (New-SyntheticHex64))
         "SP_PROBE_MESSAGE_ID_2" = ("msg_" + (New-SyntheticHex64))
     }
+    $syncVaultService = ""
+    $syncStateDir = Join-Path $script:Root "state\cloud-auth"
+    if ($script:NativeSyncValidation) {
+        # Run-unique vault target (fresh UUID) and the fixed account name. The
+        # preflight absence read happens later inside the plugin, at owner launch,
+        # and is not performed in this implementation/validation lane.
+        $syncVaultService = "sessionport-m3-" + ([guid]::NewGuid().ToString("D"))
+        if (-not (Set-PrivateDirectoryAcl -Path $syncStateDir)) {
+            $script:KeepRootForced = $true
+            Write-Host "PREFLIGHT-FAILED: the private cloud-auth state directory ACL could not be applied; root retained."
+            return 1
+        }
+        $envMap["SP_SYNC_ROOT"] = $script:Root
+        $envMap["SP_SYNC_RESULT"] = $resultPath
+        $envMap["SP_SYNC_REPO"] = $repoStage
+        $envMap["SP_SYNC_ORIGIN"] = $NativeSyncOrigin
+        $envMap["SP_SYNC_VAULT_SERVICE"] = $syncVaultService
+        $envMap["SP_SYNC_VAULT_ACCOUNT"] = $NativeSyncVaultAccount
+        $envMap["SP_SYNC_STATE_DIR"] = $syncStateDir
+        $envMap["SP_SYNC_MAX_SECRET_BYTES"] = [string]$NativeSyncMaxSecretBytes
+    }
     $rootFull = [System.IO.Path]::GetFullPath($script:Root)
     $driveRoot = [System.IO.Path]::GetPathRoot($rootFull)
     $envMap["HOMEDRIVE"] = $driveRoot.TrimEnd('\')
@@ -3052,6 +3596,15 @@ function Invoke-ProbeMain {
             Write-Host ("PREFLIGHT-FAILED: environment variable is not covered by the backup set: " + $name)
             return 1
         }
+    }
+
+    if ($script:NativeSyncValidation) {
+        $versionGate = Get-NativeSyncOpenCodeVersion -Executable $resolved -EnvMap $envMap -WorkingDirectory $projectDir
+        if ($versionGate.Ok -ne $true) {
+            Write-Host ("PREFLIGHT-FAILED: explicit opencode .exe version gate failed (" + $versionGate.Reason + "; expected " + $NativeSyncExpectedVersion + ").")
+            return 1
+        }
+        Write-Host ("preflight: opencode version=" + $versionGate.Version + " (explicit .exe; interactive TUI launch inherits the parent console)")
     }
 
     # --- preflight: 'opencode debug paths' must prove all ten paths are inside root ---
@@ -3199,10 +3752,50 @@ function Invoke-ProbeMain {
     }
     Write-Host "staging: repo src copy + package.json + dependency junction under root"
 
+    if ($script:NativeSyncValidation) {
+        $keyringPlan = Get-NativeSyncKeyringStagingPlan
+        if (-not $keyringPlan.Ok) {
+            $script:KeepRootForced = $true
+            Write-Host ("PREFLIGHT-FAILED: pinned keyring staging plan is unavailable: " + $keyringPlan.Reason + "; root retained.")
+            return 1
+        }
+        $keyringCopy = Copy-NativeSyncKeyringPackages -Plan $keyringPlan -RepoStage $repoStage
+        if (-not $keyringCopy.Ok) {
+            $script:KeepRootForced = $true
+            Write-Host ("PREFLIGHT-FAILED: " + $keyringCopy.Reason + "; root retained.")
+            return 1
+        }
+        $cleanupSource = Join-Path $script:RepoRoot $NativeSyncCleanupRelativePath
+        $cleanupStaged = Join-Path $repoStage "src\cleanup-entry.mjs"
+        if (-not (Test-Path -LiteralPath $cleanupSource) -or (Test-Path -LiteralPath $cleanupStaged)) {
+            $script:KeepRootForced = $true
+            Write-Host "PREFLIGHT-FAILED: the fixed cleanup guard source is unavailable; root retained."
+            return 1
+        }
+        Copy-Item -LiteralPath $cleanupSource -Destination $cleanupStaged -Force -ErrorAction Stop
+        Write-Host "staging: pinned keyring package + win32-x64-msvc native binary copied as regular files (hash/version verified)"
+    }
+
     $pluginDir = Join-Path $script:Root ("config\plugins\" + $StagedPluginName)
     $pluginPath = Join-Path $pluginDir "tui.ts"
     New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
-    [System.IO.File]::WriteAllText($pluginPath, $PluginSource, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+    if ($script:NativeSyncValidation) {
+        $pluginSourcePath = Join-Path $script:RepoRoot $NativeSyncPluginRelativePath
+        if (-not (Test-Path -LiteralPath $pluginSourcePath)) {
+            $script:KeepRootForced = $true
+            Write-Host "PREFLIGHT-FAILED: the fixed native sync plugin source is unavailable; root retained."
+            return 1
+        }
+        $nativePluginSource = [System.IO.File]::ReadAllText($pluginSourcePath)
+        if ($nativePluginSource.Length -eq 0) {
+            $script:KeepRootForced = $true
+            Write-Host "PREFLIGHT-FAILED: the fixed native sync plugin source is empty; root retained."
+            return 1
+        }
+        [System.IO.File]::WriteAllText($pluginPath, $nativePluginSource, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+    } else {
+        [System.IO.File]::WriteAllText($pluginPath, $PluginSource, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+    }
     $stagedPlugins = @(Get-ChildItem -LiteralPath (Join-Path $script:Root "config\plugins") -Force -ErrorAction Stop)
     if ($stagedPlugins.Count -ne 1 -or $stagedPlugins[0].Name -ne $StagedPluginName -or -not (Test-Path -LiteralPath $pluginPath)) {
         Write-Host "PREFLIGHT-FAILED: plugin staging verification failed."
@@ -3217,7 +3810,7 @@ function Invoke-ProbeMain {
     # no raw child output is captured or persisted; the launch and process-identity
     # mechanics are unchanged.
     $tuiArgs = @("--standalone", $projectDir)
-    $tuiLaunch = Start-ProbeChildProcess -EnvMap $envMap -FilePath $resolved -Arguments $tuiArgs -WorkingDirectory $projectDir
+    $tuiLaunch = Start-ProbeChildProcess -EnvMap $envMap -FilePath $resolved -Arguments $tuiArgs -WorkingDirectory $projectDir -InteractiveConsole:($script:NativeSyncValidation)
     $script:TuiProcess = $tuiLaunch.Process
     Write-Host ("tui: started pid=" + [string]$script:TuiProcess.Id)
     $tuiTicks = Get-ProcessCreationTicks -Process $script:TuiProcess
@@ -3246,7 +3839,12 @@ function Invoke-ProbeMain {
                 $raw = [System.IO.File]::ReadAllText($resultPath)
                 $script:ResultJson = $raw | ConvertFrom-Json -ErrorAction Stop
                 $resultSeen = $true
-                break
+                if (-not $script:NativeSyncValidation) { break }
+                # Native mode keeps the owner window open. A terminal plugin failure
+                # (isolation/config/preflight/import/registration) ends the wait early;
+                # the normal observing result does not.
+                $nativeStage = [string](Read-ResultField $script:ResultJson "stage")
+                if ($script:ResultJson.ok -ne $true -and $nativeStage -ne "observing") { break }
             } catch {
                 # result file still being finalized; keep polling
             }
@@ -3266,6 +3864,67 @@ function Invoke-ProbeMain {
     }
     $script:TuiStopVerified = $true
     Write-Host "stop: verified (process tree exited; root and descendants handle-verified)"
+
+    if ($script:NativeSyncValidation) {
+        # Final result read after the verified stop so owner actions observed during
+        # the window are included. Only fixed-safe facts are printed: no codes, URLs,
+        # tokens, identities, credentials, or paths.
+        $finalResult = $null
+        try {
+            if (Test-Path -LiteralPath $resultPath) {
+                $finalResult = [System.IO.File]::ReadAllText($resultPath) | ConvertFrom-Json -ErrorAction Stop
+            }
+        } catch {
+            $finalResult = $null
+        }
+        if ($null -eq $finalResult) {
+            $script:KeepRootForced = $true
+            Write-Host "RESULT-MISSING: no native sync result was recorded; root retained because vault state cannot be proven."
+            return 2
+        }
+        $vaultScope = Read-ResultField $finalResult "vaultScope"
+        $wiring = Read-ResultField $finalResult "wiring"
+        $commandsInfo = Read-ResultField $finalResult "commands"
+        $observations = Read-ResultField $finalResult "observations"
+        $failure = Read-ResultField $finalResult "failure"
+        $preflightAbsent = Read-ResultField $vaultScope "preflightAbsent"
+        Write-Host ("native: configured=true wiring=" + [string](Read-ResultField $wiring "installed") + " disposer=" + [string](Read-ResultField $wiring "disposerCallable") + " commands=" + [string](Read-ResultField $commandsInfo "registered") + "/" + [string](Read-ResultField $commandsInfo "expected"))
+        Write-Host ("vault-scope: preflightChecked=" + [string](Read-ResultField $vaultScope "preflightChecked") + " preflightAbsent=" + [string]$preflightAbsent + " bindingLoaded=" + [string](Read-ResultField $vaultScope "preflightBindingLoaded"))
+        Write-Host ("observations: notifications=" + [string](Read-ResultField $observations "notifications") + " dialogContentRead=" + [string](Read-ResultField $observations "dialogContentRead") + " verificationCodeCaptured=" + [string](Read-ResultField $observations "verificationCodeCaptured") + " identityCaptured=" + [string](Read-ResultField $observations "identityCaptured"))
+        $nativeOutcome = Read-ResultField $observations "native"
+        if ($null -ne $nativeOutcome) {
+            Write-Host ("native-outcome: login=" + [string](Read-ResultField $nativeOutcome "loginOutcome") + " terminal=" + [string](Read-ResultField $nativeOutcome "terminalOutcome") + " status=" + [string](Read-ResultField $nativeOutcome "statusResult") + " begin=" + [string](Read-ResultField $nativeOutcome "beginStatus") + " pollLast=" + [string](Read-ResultField $nativeOutcome "pollLastStatus") + " token=" + [string](Read-ResultField $nativeOutcome "tokenStatus") + " error=" + [string](Read-ResultField $nativeOutcome "errorCategory") + " vaultCommit=" + [string](Read-ResultField $nativeOutcome "vaultCommitOutcome"))
+        }
+
+        $cleanupGuard = $null
+        $vaultScopeCreated = $false
+        if ($preflightAbsent -eq $true) {
+            # Only a scope proven absent at owner launch can be a scope this run
+            # created. The guard targets exactly that unique service/account pair,
+            # after the verified controller process stop; there is no enumeration.
+            $cleanupGuard = Invoke-NativeSyncVaultCleanupGuard -Root $script:Root -RepoStage $repoStage -Service $syncVaultService -Account $NativeSyncVaultAccount -PreflightAbsent $preflightAbsent
+            $vaultScopeCreated = ($cleanupGuard.Presence -eq $true)
+            Write-Host ("vault-cleanup: attempted=" + [string]$cleanupGuard.Attempted + " presence=" + [string]$cleanupGuard.Presence + " removed=" + [string]$cleanupGuard.Removed)
+            if (-not $cleanupGuard.Ok) {
+                $script:KeepRootForced = $true
+                Write-Host ("CLEANUP-FAILED: the run-unique vault entry state could not be proven absent/removed (" + $cleanupGuard.Reason + "); private root retained and no unmanaged delete attempted.")
+                return 3
+            }
+        } else {
+            Write-Host "vault-cleanup: not-attempted (preflight absence not proven; no write, overwrite, or delete attempted)"
+        }
+        Write-Host ("native-summary: configured=true vaultScopeCreated=" + [string]$vaultScopeCreated + " stopVerified=" + [string]$script:TuiStopVerified + " cleanupVerified=" + [string]$($null -ne $cleanupGuard -and $cleanupGuard.Ok))
+
+        if ($finalResult.ok -ne $true) {
+            if ($null -ne $failure) {
+                Write-Host ("failure: class=" + [string](Read-ResultField $failure "class") + " code=" + [string](Read-ResultField $failure "code"))
+            }
+            Write-Host "native-sync: finished without a verified observing session (bounded result recorded)."
+            return 6
+        }
+        Write-Host "native-sync: wiring and read-only vault preflight verified; owner actions stayed in the native UI (no code, URL, token, or identity captured)."
+        return 0
+    }
 
     if (-not $resultSeen) {
         if ($exitedEarly) { Write-Host "RESULT-MISSING: TUI exited before writing the probe result." }

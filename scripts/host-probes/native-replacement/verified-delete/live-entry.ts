@@ -29,9 +29,11 @@ import {
   isRecord,
   isSessionID,
   toCheckpointPayload,
+  toNativeMessage,
   validateFixture,
   type FlatMessage,
   type FlatRoot,
+  type FlatSession,
   type VerifiedDeleteFixture,
 } from "./fixtures.ts"
 import { createEncryptedRecoveryPort } from "./recovery.ts"
@@ -231,10 +233,17 @@ function cursorEnvelope(value: unknown, parse: (item: unknown) => unknown): {
   return { items, next }
 }
 
-function createAdapter(request: GuardedRequest, ids: FixtureIDs, directory: string): VerifiedDeletePort & {
+function createAdapter(
+  request: GuardedRequest,
+  ids: FixtureIDs,
+  directory: string,
+  options: { importID?: string; allowRemove?: boolean } = {},
+): VerifiedDeletePort & {
   readInventory(): Promise<readonly InventorySession[]>
   removeSession(sessionID: string): Promise<void>
 } {
+  const importID = options.importID ?? ids.candidateSessionID
+  const allowRemove = options.allowRemove ?? true
   const allowed = new Set([ids.oldSessionID, ids.candidateSessionID])
   const scoped = (sessionID: string) => {
     if (typeof sessionID !== "string" || !allowed.has(sessionID)) fail("E_SCOPE")
@@ -283,11 +292,11 @@ function createAdapter(request: GuardedRequest, ids: FixtureIDs, directory: stri
     }),
     listMessages,
     async importSession(payload): Promise<{ id: string; projectID: string }> {
-      if (payload.info.id !== ids.candidateSessionID) fail("E_SCOPE")
+      if (payload.info.id !== importID) fail("E_SCOPE")
       const created = payload.messages.map((message) => message.time.created)
       const body = nativeImport(payload, Math.max(...created))
       const value = data(await request({ method: "POST", path: "/api/experimental/session/import", body }))
-      if (value.id !== ids.candidateSessionID) fail("E_IMPORT_RESPONSE")
+      if (value.id !== importID) fail("E_IMPORT_RESPONSE")
       if (typeof value.projectID !== "string" || !CANONICAL_PROJECT_ID.test(value.projectID)) fail("E_PROJECT_ID")
       return { id: value.id, projectID: value.projectID }
     },
@@ -325,9 +334,105 @@ function createAdapter(request: GuardedRequest, ids: FixtureIDs, directory: stri
       return entries
     },
     removeSession: (sessionID) => bridge("session-remove", async () => {
-      if (sessionID !== ids.oldSessionID) fail("E_SCOPE")
+      if (!allowRemove || sessionID !== ids.oldSessionID) fail("E_SCOPE")
       await request({ method: "DELETE", path: `/api/session/${sessionID}` })
     }),
+  }
+}
+
+const RECOVERED_SESSION_KEYS = ["id", "title", "projectID", "directory", "time"] as const
+const RECOVERED_MESSAGE_KEYS = ["id", "type", "text", "time"] as const
+
+/**
+ * Strict create-only request wrapper for the second fresh host. It rejects
+ * DELETE, PATCH, and every other non-GET verb before any host call, admits at
+ * most one POST to the public import endpoint, and passes GETs through.
+ */
+export function createRestoreGuard(base: GuardedRequest): {
+  request: GuardedRequest
+  postCount(): number
+} {
+  let posts = 0
+  return {
+    request: async (spec) => {
+      const method = String(spec?.method ?? "GET").toUpperCase()
+      if (method === "POST") {
+        if (!isRecord(spec) || spec.path !== "/api/experimental/session/import") fail("E_RESTORE_READONLY")
+        if (posts !== 0) fail("E_RESTORE_READONLY")
+        posts += 1
+      } else if (method !== "GET") {
+        fail("E_RESTORE_READONLY")
+      }
+      return base(spec)
+    },
+    postCount: () => posts,
+  }
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value)
+  return actual.length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+}
+
+/**
+ * Flat, text-only validation of the decrypted old checkpoint. Any injected
+ * tool, ref, part, or unknown field is rejected before an import is built.
+ */
+export function recoveredRoot(payload: CheckpointPayload): FlatRoot {
+  if (!isRecord(payload) || !Array.isArray(payload.sessions) || payload.sessions.length !== 1) {
+    fail("E_RESTORE_SHAPE")
+  }
+  const record = payload.sessions[0]
+  if (!isRecord(record) || !hasExactKeys(record, ["info", "messages"]) || !isRecord(record.info) ||
+      !Array.isArray(record.messages)) {
+    fail("E_RESTORE_SHAPE")
+  }
+  const info = record.info
+  if (!hasExactKeys(info, RECOVERED_SESSION_KEYS) || !isSessionID(info.id) ||
+      typeof info.title !== "string" || info.title.length === 0 ||
+      typeof info.projectID !== "string" || !CANONICAL_PROJECT_ID.test(info.projectID) ||
+      typeof info.directory !== "string" || info.directory.length === 0 ||
+      !isRecord(info.time) || !hasExactKeys(info.time, ["created", "updated"]) ||
+      !finite(info.time.created) || !finite(info.time.updated)) {
+    fail("E_RESTORE_SHAPE")
+  }
+  if (record.messages.length !== EXPECTED_COUNTS.oldMessages) fail("E_RESTORE_SHAPE")
+  const messages = record.messages.map((value, index): FlatMessage => {
+    if (!isRecord(value) || !hasExactKeys(value, RECOVERED_MESSAGE_KEYS) || !isMessageID(value.id)) {
+      fail("E_RESTORE_SHAPE")
+    }
+    const type = index === 1 ? "assistant" : "user"
+    if (value.type !== type || typeof value.text !== "string" || value.text.length === 0 ||
+        !isRecord(value.time)) {
+      fail("E_RESTORE_SHAPE")
+    }
+    if (type === "user") {
+      if (!hasExactKeys(value.time, ["created"]) || !finite(value.time.created)) fail("E_RESTORE_SHAPE")
+      return { id: value.id, type, text: value.text, time: { created: value.time.created } }
+    }
+    if (!hasExactKeys(value.time, ["created", "completed"]) || !finite(value.time.created) ||
+        !finite(value.time.completed)) {
+      fail("E_RESTORE_SHAPE")
+    }
+    return {
+      id: value.id, type, text: value.text,
+      time: { created: value.time.created, completed: value.time.completed },
+    }
+  })
+  const session: FlatSession = {
+    id: info.id, title: info.title, projectID: info.projectID, directory: info.directory,
+    time: { created: info.time.created, updated: info.time.updated },
+  }
+  return { session, messages }
+}
+
+function restorePayload(root: FlatRoot, directory: string): ProbeImportPayload {
+  return {
+    info: {
+      id: root.session.id, title: root.session.title, projectID: root.session.projectID,
+      directory, time: { created: root.session.time.created, updated: root.session.time.updated },
+    },
+    messages: root.messages.map(toNativeMessage),
   }
 }
 
@@ -398,18 +503,34 @@ export function validateManifest(value: unknown, fixture: VerifiedDeleteFixture)
   return isRecord(counts) && counts.oldMessages === 2 && counts.candidateMessages === 3
 }
 
-export function createLiveEntryCallbacks(input: { ids: FixtureIDs; projectID?: string }): {
+export function createLiveEntryCallbacks(input: {
+  ids: FixtureIDs
+  projectID?: string
+  restoreSessionID?: string
+}): {
   probe(context: GuardedContext): Promise<Record<string, unknown>>
   snapshot(context: GuardedContext): Promise<Record<string, unknown>>
-  state(): { fixture: VerifiedDeleteFixture | null; result: VerifiedDeleteResult | null; manifest: RestartManifest | null }
+  restore(context: GuardedContext): Promise<Record<string, unknown>>
+  state(): {
+    fixture: VerifiedDeleteFixture | null
+    result: VerifiedDeleteResult | null
+    manifest: RestartManifest | null
+    restoreSessionID: string
+  }
   dispose(): void
 } {
   const projectID = input.projectID ?? PROJECT_ID
+  const restoreSessionID = input.restoreSessionID ?? `ses_${randomBytes(32).toString("hex")}`
+  if (!isSessionID(restoreSessionID) || restoreSessionID === input.ids.oldSessionID ||
+      restoreSessionID === input.ids.candidateSessionID) {
+    throw new LifecycleError("E_CONFIG")
+  }
   let fixture: VerifiedDeleteFixture | null = null
   let result: VerifiedDeleteResult | null = null
   let manifest: RestartManifest | null = null
   let oldPayload: CheckpointPayload | null = null
   let recovery: RecoveryPort | null = null
+  let firstProfileDir: string | null = null
 
   const checkContext = (context: GuardedContext, phase: string) => {
     if (!Array.isArray(context.sessionIDs) || context.sessionIDs.length !== 2 ||
@@ -421,6 +542,7 @@ export function createLiveEntryCallbacks(input: { ids: FixtureIDs; projectID?: s
 
   const probe = async (context: GuardedContext) => {
     checkContext(context, "first")
+    firstProfileDir = context.profileDir
     const openapi = await context.request({ method: "GET", path: "/openapi.json" })
     verifyOpenApi(openapi)
     if (!isRecord(openapi) || !isRecord(openapi.paths) || !isRecord(openapi.paths["/api/session/{sessionID}"]) ||
@@ -535,10 +657,157 @@ export function createLiveEntryCallbacks(input: { ids: FixtureIDs; projectID?: s
     }
   }
 
+  const restore = async (context: GuardedContext): Promise<Record<string, unknown>> => {
+    if (!Array.isArray(context.sessionIDs) || context.sessionIDs.length !== 2 ||
+        context.sessionIDs[0] !== input.ids.oldSessionID || context.sessionIDs[1] !== restoreSessionID ||
+        typeof context.profileDir !== "string" || context.phase !== "first") {
+      throw new LifecycleError("E_CONFIG")
+    }
+    const steps: Array<Record<string, unknown>> = []
+    const failed = (step: string, category: string, posts = 0) => {
+      return {
+        status: "failed", outcome: "native-restore-failed", step, errorCategory: category, steps,
+        importPosts: posts, manifestRetained: manifest !== null,
+        nativeRestore: "not-verified", cryptoOpen: "not-verified",
+      }
+    }
+    if (!fixture || !result || result.outcome !== "delete-verified" || !manifest || !oldPayload || !recovery) {
+      return failed("precondition", "E_RESTORE_NOT_READY")
+    }
+    if (firstProfileDir === null || firstProfileDir === context.profileDir) {
+      return failed("profile-distinct", "E_RESTORE_PROFILE_REUSED")
+    }
+    if (!validateManifest(manifest, fixture) ||
+        manifest.oldPayloadDigest !== digest(oldPayload) ||
+        manifest.newPayloadDigest !== digest(toCheckpointPayload(fixture.candidateRoot))) {
+      return failed("manifest", "E_MANIFEST")
+    }
+
+    const guard = createRestoreGuard(context.request)
+    const adapter = createAdapter(
+      guard.request,
+      { ...input.ids, candidateSessionID: restoreSessionID },
+      context.profileDir,
+      { importID: input.ids.oldSessionID, allowRemove: false },
+    )
+
+    try {
+      const openapi = await guard.request({ method: "GET", path: "/openapi.json" })
+      if (!isRecord(openapi) || !isRecord(openapi.paths) ||
+          !isRecord(openapi.paths["/api/experimental/session/import"]) ||
+          !openapi.paths["/api/experimental/session/import"].post) {
+        return failed("contract", "E_RESTORE_CONTRACT", guard.postCount())
+      }
+    } catch {
+      return failed("contract", "E_RESTORE_CONTRACT", guard.postCount())
+    }
+
+    try {
+      const inventory = await adapter.readInventory()
+      if (inventory.length !== 0) return failed("fresh-profile", "E_RESTORE_PROFILE_NOT_EMPTY", guard.postCount())
+    } catch {
+      return failed("fresh-profile", "E_RESTORE_INVENTORY", guard.postCount())
+    }
+    steps.push({ step: "fresh-profile", status: "ok", sessions: 0 })
+
+    let root: FlatRoot
+    try {
+      if ((await recovery.verify(oldPayload)) !== true) {
+        return failed("recovery-verify", "E_RECOVERY_VERIFY", guard.postCount())
+      }
+      const recovered = await recovery.recover()
+      if (!jsonEqual(recovered, oldPayload)) {
+        return failed("recovery-payload", "E_RECOVERY_MISMATCH", guard.postCount())
+      }
+      root = recoveredRoot(recovered)
+    } catch (error) {
+      if (error instanceof LifecycleError && error.code === "E_RESTORE_SHAPE") {
+        return failed("recovery-shape", error.code, guard.postCount())
+      }
+      return failed("recovery-verify", "E_RECOVERY_VERIFY", guard.postCount())
+    }
+    steps.push({ step: "crypto-open", status: "ok" })
+    steps.push({ step: "recovery-payload", status: "ok" })
+    steps.push({ step: "flat-shape", status: "ok", messages: root.messages.length })
+
+    // The location is retargeted to the fresh profile working directory; the
+    // recovered creation time, title, project hint, and exact history are kept.
+    let imported: { id: string; projectID: string }
+    try {
+      imported = await adapter.importSession(restorePayload(root, context.profileDir))
+    } catch {
+      return failed("restore-import", "E_RESTORE_IMPORT", guard.postCount())
+    }
+    if (guard.postCount() !== 1) return failed("restore-import", "E_RESTORE_IMPORT_COUNT", guard.postCount())
+    if (imported.id !== input.ids.oldSessionID) return failed("restore-import", "E_RESTORE_ID", guard.postCount())
+    steps.push({ step: "restore-import", status: "ok", posts: 1 })
+
+    let session: ProbeSession
+    let messages: readonly ProbeMessage[]
+    try {
+      session = await adapter.getSession(input.ids.oldSessionID)
+      messages = await adapter.listMessages(input.ids.oldSessionID)
+    } catch {
+      return failed("restore-read", "E_RESTORE_READ", guard.postCount())
+    }
+    if (session.parentID !== null) return failed("restore-root", "E_RESTORE_PARENT", guard.postCount())
+    if (session.time.archived !== undefined) return failed("restore-root", "E_RESTORE_REFS", guard.postCount())
+    if (session.title !== root.session.title) return failed("restore-created", "E_RESTORE_TITLE", guard.postCount())
+    if (session.time.created !== root.session.time.created) {
+      return failed("restore-created", "E_RESTORE_CREATED", guard.postCount())
+    }
+    if (session.time.updated < session.time.created) return failed("restore-time", "E_RESTORE_TIME", guard.postCount())
+    if (imported.projectID !== session.projectID) {
+      return failed("restore-project", "E_RESTORE_PROJECT", guard.postCount())
+    }
+    if (messages.length !== root.messages.length) {
+      return failed("restore-history", "E_RESTORE_MESSAGE_MISMATCH", guard.postCount())
+    }
+    for (const [index, actual] of messages.entries()) {
+      const expected = root.messages[index]!
+      if (actual.id !== expected.id || actual.type !== expected.type || actual.text !== expected.text ||
+          actual.time.created !== expected.time.created ||
+          actual.time.completed !== expected.time.completed) {
+        return failed("restore-history", "E_RESTORE_MESSAGE_MISMATCH", guard.postCount())
+      }
+    }
+    steps.push({ step: "restore-created", status: "ok" })
+    steps.push({ step: "restore-history", status: "ok", messages: messages.length })
+
+    try {
+      const inventory = await adapter.readInventory()
+      const messageIDs = inventory[0]?.messageIDs ?? []
+      if (inventory.length !== 1 || inventory[0]!.id !== input.ids.oldSessionID ||
+          inventory[0]!.parentID !== null || inventory[0]!.projectID !== session.projectID ||
+          messageIDs.length !== root.messages.length ||
+          !messageIDs.every((id, index) => id === root.messages[index]!.id)) {
+        return failed("restore-inventory", "E_RESTORE_INVENTORY", guard.postCount())
+      }
+    } catch {
+      return failed("restore-inventory", "E_RESTORE_INVENTORY", guard.postCount())
+    }
+    steps.push({ step: "restore-inventory", status: "ok", sessions: 1 })
+
+    return {
+      status: "verified", outcome: "native-restore-verified", reason: null, steps,
+      importPosts: 1, messageCount: messages.length,
+      sessionIDMatch: true, messageIDMatch: true, roleOrderPreserved: true,
+      timestampsPreserved: true, createdPreserved: true, titlePreserved: true,
+      parentlessRoot: true, refsAbsent: true, locationRetargeted: true,
+      freshProfileEmpty: true, profileDistinct: true, noIDCollision: true,
+      canonicalProjectMatch: true,
+      projectRederived: imported.projectID !== fixture.projectID,
+      cryptoOpen: "verified", recoveryPayload: "strict-equal",
+      nativeRestore: "verified", restoreImportMutation: "once",
+      profile: "fresh-isolated", durability: "parent-memory-only",
+    }
+  }
+
   return {
     probe,
     snapshot,
-    state: () => ({ fixture, result, manifest }),
+    restore,
+    state: () => ({ fixture, result, manifest, restoreSessionID }),
     dispose() {
       if (recovery) recovery.destroy()
     },
@@ -637,6 +906,56 @@ export function finalizeRunResult(run: Record<string, unknown>) {
   }
 }
 
+/** A restore may start only after the bounded first run and its restart snapshot both verified. */
+export function canRunRestore(firstRun: unknown): boolean {
+  if (!isRecord(firstRun)) return false
+  return firstRun.status === "ok" && firstRun.cleanup === "profile-removed" &&
+    isRecord(firstRun.probe) && firstRun.probe.outcome === "api-verified" &&
+    firstRun.probe.restartManifestReady === true &&
+    isRecord(firstRun.snapshot) && firstRun.snapshot.status === "verified"
+}
+
+/**
+ * Combined result. The runner's own `status: "ok"` is never sufficient: the
+ * second run must carry a verified native-restore proof, both owned stops must
+ * have cleaned their private profile, and the expected no-second-restart
+ * snapshot state must be explicit.
+ */
+export function finalizeCombinedResult(firstRun: unknown, restoreRun: unknown) {
+  const first = finalizeRunResult(isRecord(firstRun) ? firstRun : {})
+  const second = isRecord(restoreRun) ? restoreRun : null
+  const proof = second && isRecord(second.probe) ? second.probe : null
+  const restoreVerified = first.status === "ok" && canRunRestore(firstRun) && second !== null &&
+    second.status === "ok" && second.cleanup === "profile-removed" &&
+    (second.probeFailure === null || second.probeFailure === undefined) &&
+    proof !== null && proof.status === "verified" && proof.outcome === "native-restore-verified" &&
+    proof.nativeRestore === "verified" && proof.cryptoOpen === "verified" &&
+    proof.profileDistinct === true &&
+    isRecord(second.snapshot) && second.snapshot.status === "not-run"
+  const failure = restoreVerified ? null
+    : first.status !== "ok" ? first.failure
+    : second === null ? "restore-not-run"
+    : isRecord(second.probeFailure) && typeof second.probeFailure.code === "string" ? second.probeFailure.code
+    : proof && typeof proof.errorCategory === "string" ? proof.errorCategory
+    : "E_RESTORE_VERIFY"
+  return {
+    status: restoreVerified ? "ok" : "failed",
+    failure,
+    first: {
+      status: first.status, failure: first.failure, probe: first.probe,
+      probeFailure: first.probeFailure, snapshot: first.snapshot, cleanup: first.cleanup,
+    },
+    restore: proof,
+    restoreRun: second === null ? null : {
+      status: second.status, cleanup: second.cleanup,
+      probeFailure: second.probeFailure ?? null,
+      snapshot: second.snapshot ?? null,
+    },
+    nativeRestore: restoreVerified ? "verified" : "not-proven",
+    cleanup: restoreVerified ? "both-profiles-removed" : "restore-incomplete",
+  }
+}
+
 export function exitCodeForResult(result: unknown): number {
   return isRecord(result) && result.status === "ok" ? 0 : 1
 }
@@ -644,22 +963,34 @@ export function exitCodeForResult(result: unknown): number {
 export async function runEntry() {
   const ids = generateFixtureIDs()
   const callbacks = createLiveEntryCallbacks({ ids })
+  let firstRun: unknown = null
+  let restoreRun: unknown = null
   try {
-    const run = await withIsolatedHost({
+    firstRun = await withIsolatedHost({
       sessionIDs: [ids.oldSessionID, ids.candidateSessionID],
       binaryPath: "/usr/local/bin/opencode",
       profileBase: "/run/sessionport",
       syntheticDeleteTarget: ids.oldSessionID,
       snapshot: callbacks.snapshot,
     }, callbacks.probe)
-    return finalizeRunResult(run as unknown as Record<string, unknown>)
+    // A failed first run skips the second host, restore, and any retry.
+    if (canRunRestore(firstRun)) {
+      restoreRun = await withIsolatedHost({
+        sessionIDs: [ids.oldSessionID, callbacks.state().restoreSessionID],
+        binaryPath: "/usr/local/bin/opencode",
+        profileBase: "/run/sessionport",
+        // No syntheticDeleteTarget, no snapshot, no second restart. The scoped
+        // wrapper rejects DELETE/PATCH entirely.
+      }, callbacks.restore)
+    }
+    return finalizeCombinedResult(firstRun, restoreRun)
   } catch (error) {
     if (error instanceof LifecycleError) {
       const facts = "facts" in error && isRecord((error as { facts?: unknown }).facts)
         ? (error as { facts: Record<string, unknown> }).facts : {}
-      return { ...facts, status: "error", code: error.code }
+      return { ...facts, status: "error", code: error.code, nativeRestore: "not-proven" }
     }
-    return { status: "error", code: "E_INTERNAL" }
+    return { status: "error", code: "E_INTERNAL", nativeRestore: "not-proven" }
   } finally {
     callbacks.dispose()
   }

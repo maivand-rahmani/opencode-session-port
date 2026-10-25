@@ -79,7 +79,7 @@ owner's direction; no credentials, identifiers, or private values are recorded.
 
 - The corrected r2 probe executed under the conditions above and passed: exit `0`,
   `status: "ok"`, `outcome: "api-verified"`, `phase: "complete"`. The sanitized result audit is
-  [`result-audit.json`](../../NEW.package-verify-work/m1-verified-delete-execution-20261024/r2/result-audit.json),
+  [`result-audit.json`](../../.package-verify-work/root-spill-20261024/NEW.package-verify-work/m1-verified-delete-execution-20261024/r2/result-audit.json),
   `7293` bytes, SHA-256 `8f599bca272b2b73cc6fb0c4b26380edb714ee704fd2c751454d5eba781df1a6`.
 - All nine probe checks passed (eight `verified`; `import` reported `created`). Exactly one DELETE
   was issued to the frozen old target only; candidate DELETE calls `0`; blind retries `0`. The

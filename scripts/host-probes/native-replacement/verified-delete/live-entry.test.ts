@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test"
 import { LifecycleError, createRequestPort } from "../lifecycle/runner.mjs"
 import {
+  canRunRestore,
   createLiveEntryCallbacks,
+  createRestoreGuard,
   exitCodeForResult,
+  finalizeCombinedResult,
   finalizeRunResult,
   generateFixtureIDs,
+  recoveredRoot,
   validateManifest,
   type GuardedRequest,
 } from "./live-entry.ts"
-import { OLD_MESSAGE_TEXT } from "./fixtures.ts"
+import { OLD_MESSAGE_TEXT, toCheckpointPayload } from "./fixtures.ts"
 
 const DIRECTORY = "/run/sessionport/run-test"
 const CANONICAL_PROJECT = "host-canonical-project-1"
@@ -47,6 +51,7 @@ class FakeHost {
   terminalNull = false
   emptyPages = 0
   anomaly: "repeat" | "malformed" | "unknown" | "duplicate" | null = null
+  afterImport: ((stored: Stored) => void) | null = null
 
   private paginate(items: unknown[], url: URL): { data: unknown[]; cursor: unknown } {
     const raw = url.searchParams.get("cursor")
@@ -98,6 +103,7 @@ class FakeHost {
         location: { directory: body.info.location.directory },
       }
       this.sessions.set(id, { info, messages: clone(body.messages) })
+      this.afterImport?.(this.sessions.get(id)!)
       return { data: { id, projectID: CANONICAL_PROJECT } }
     }
     const session = path.match(/^\/api\/session\/(ses_[0-9a-f]{64})(\/message)?$/)
@@ -132,7 +138,12 @@ function context(ids: ReturnType<typeof generateFixtureIDs>, request: GuardedReq
   }
 }
 
-function actualPort(host: FakeHost, ids: ReturnType<typeof generateFixtureIDs>, readonly = false) {
+function actualPort(
+  host: FakeHost,
+  ids: ReturnType<typeof generateFixtureIDs>,
+  readonly = false,
+  options: { restoreSessionID?: string; syntheticDelete?: boolean } = {},
+) {
   const fetch = async (input: string | URL | Request, init: RequestInit = {}) => {
     const url = new URL(String(input))
     const body = init.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body))
@@ -153,10 +164,10 @@ function actualPort(host: FakeHost, ids: ReturnType<typeof generateFixtureIDs>, 
   return createRequestPort({
     fetch,
     password: "p".repeat(43),
-    sessionIDs: [ids.oldSessionID, ids.candidateSessionID],
+    sessionIDs: [ids.oldSessionID, options.restoreSessionID ?? ids.candidateSessionID],
     baseUrl: "http://127.0.0.1:4096",
     readonly,
-    syntheticDeleteTarget: ids.oldSessionID,
+    ...(options.syntheticDelete === false ? {} : { syntheticDeleteTarget: ids.oldSessionID }),
   })
 }
 
@@ -181,7 +192,7 @@ async function probeFailure(options: Partial<Pick<FakeHost, "anomaly" | "extraSe
   } catch (error) {
     code = error instanceof LifecycleError ? error.code : "unexpected"
   }
-  return { code, probe, host, callbacks }
+  return { code, probe, host, callbacks, ids }
 }
 
 describe("live verified-delete entry", () => {
@@ -361,5 +372,167 @@ describe("live verified-delete entry", () => {
     expect(host.calls.filter((call) => call.method === "DELETE")).toHaveLength(1)
     expect(exitCodeForResult(finalizeRunResult({ probe, snapshot: { status: "not-run", reason: "probe-not-verified" } }))).toBe(1)
     callbacks.dispose()
+  })
+
+  test("second fresh host decrypts old memory and imports the exact old history exactly once", async () => {
+    const { ids, callbacks, host: firstHost } = await successHost()
+    const snapshot = await callbacks.snapshot(context(ids, firstHost.readonlyReadonly, "restart-readonly"))
+    expect(snapshot.status).toBe("verified")
+
+    const restoreSessionID = callbacks.state().restoreSessionID
+    const restoreHost = new FakeHost()
+    const restoreDir = "/run/sessionport/run-restore-test"
+    const request = actualPort(restoreHost, ids, false, { restoreSessionID, syntheticDelete: false })
+    const proof = await callbacks.restore({
+      request, sessionIDs: [ids.oldSessionID, restoreSessionID], profileDir: restoreDir, phase: "first",
+    })
+
+    expect(proof.status).toBe("verified")
+    expect(proof.outcome).toBe("native-restore-verified")
+    expect(proof.nativeRestore).toBe("verified")
+    expect(proof.cryptoOpen).toBe("verified")
+    expect(proof.importPosts).toBe(1)
+    expect(proof.profileDistinct).toBe(true)
+    expect(proof.noIDCollision).toBe(true)
+    expect(proof.messageIDMatch).toBe(true)
+    expect(restoreHost.imports).toHaveLength(1)
+    expect(restoreHost.imports[0]!.info.id).toBe(ids.oldSessionID)
+    expect(restoreHost.imports[0]!.messages.map((message: Record<string, unknown>) => message.id))
+      .toEqual([...ids.oldMessageIDs])
+    expect([...restoreHost.sessions.keys()]).toEqual([ids.oldSessionID])
+    expect(restoreHost.deletes).toEqual([])
+    expect(restoreHost.calls.some((call) => call.method === "DELETE" || call.method === "PATCH")).toBe(false)
+    expect(JSON.stringify(proof)).not.toContain("synthetic verified-delete")
+
+    const firstRun = {
+      status: "ok", cleanup: "profile-removed",
+      probe: { outcome: "api-verified", restartManifestReady: true },
+      snapshot: { status: "verified" },
+    }
+    const restoreRun = {
+      status: "ok", cleanup: "profile-removed", probe: proof, probeFailure: null,
+      snapshot: { status: "not-run", reason: "probe-not-verified" },
+    }
+    const combined = finalizeCombinedResult(firstRun, restoreRun)
+    expect(combined.status).toBe("ok")
+    expect(combined.nativeRestore).toBe("verified")
+    expect(exitCodeForResult(combined)).toBe(0)
+    expect(exitCodeForResult(finalizeCombinedResult(firstRun, {
+      ...restoreRun, probe: { ...proof, nativeRestore: "not-verified" },
+    }))).toBe(1)
+    expect(exitCodeForResult(finalizeCombinedResult(firstRun, {
+      ...restoreRun, status: "ok", probe: null,
+    }))).toBe(1)
+
+    callbacks.dispose()
+    const emptyHost = new FakeHost()
+    const afterDispose = await callbacks.restore({
+      request: actualPort(emptyHost, ids, false, { restoreSessionID, syntheticDelete: false }),
+      sessionIDs: [ids.oldSessionID, restoreSessionID],
+      profileDir: "/run/sessionport/run-restore-after-dispose",
+      phase: "first",
+    })
+    expect(afterDispose.status).toBe("failed")
+    expect(afterDispose.errorCategory).toBe("E_RECOVERY_VERIFY")
+    expect(emptyHost.imports).toHaveLength(0)
+  })
+
+  test("injected refs, tool fields, and drift are blocked before any restore import", async () => {
+    const { callbacks } = await successHost()
+    const payload = toCheckpointPayload(callbacks.state().fixture!.oldRoot)
+    const clone = () => structuredClone(payload) as Record<string, any>
+    const refs = clone()
+    refs.sessions[0].messages[0].refs = []
+    expect(() => recoveredRoot(refs as never)).toThrow()
+    const tool = clone()
+    tool.sessions[0].messages[1].tool = "shell"
+    expect(() => recoveredRoot(tool as never)).toThrow()
+    const extra = clone()
+    extra.sessions[0].info.extra = true
+    expect(() => recoveredRoot(extra as never)).toThrow()
+    expect(() => recoveredRoot({ sessions: [payload.sessions[0], payload.sessions[0]] } as never)).toThrow()
+    callbacks.dispose()
+  })
+
+  test("first failure skips the restore host with zero requests and zero imports", async () => {
+    const { ids, callbacks } = await probeFailure({ extraSession: true })
+    const restoreHost = new FakeHost()
+    const restoreSessionID = callbacks.state().restoreSessionID
+    const proof = await callbacks.restore({
+      request: actualPort(restoreHost, ids, false, { restoreSessionID, syntheticDelete: false }),
+      sessionIDs: [ids.oldSessionID, restoreSessionID],
+      profileDir: "/run/sessionport/run-restore-skip",
+      phase: "first",
+    })
+    expect(proof.status).toBe("failed")
+    expect(proof.errorCategory).toBe("E_RESTORE_NOT_READY")
+    expect(restoreHost.calls).toHaveLength(0)
+    expect(restoreHost.imports).toHaveLength(0)
+    expect(canRunRestore({
+      status: "ok", cleanup: "profile-removed",
+      probe: { outcome: "blocked", restartManifestReady: false },
+      snapshot: { status: "not-run", reason: "probe-not-verified" },
+    })).toBe(false)
+    const combined = finalizeCombinedResult({
+      status: "ok", cleanup: "profile-removed",
+      probe: { outcome: "blocked", restartManifestReady: false },
+      snapshot: { status: "not-run", reason: "probe-not-verified" },
+    }, null)
+    expect(combined.status).toBe("failed")
+    expect(exitCodeForResult(combined)).toBe(1)
+    callbacks.dispose()
+  })
+
+  test("restore drift is non-zero, retains the first manifest, and never retries", async () => {
+    const { ids, callbacks, host: firstHost } = await successHost()
+    const snapshot = await callbacks.snapshot(context(ids, firstHost.readonlyReadonly, "restart-readonly"))
+    expect(snapshot.status).toBe("verified")
+    const restoreSessionID = callbacks.state().restoreSessionID
+    const restoreHost = new FakeHost()
+    restoreHost.afterImport = (stored) => {
+      stored.messages[0]!.text = "drifted restore text"
+    }
+    const proof = await callbacks.restore({
+      request: actualPort(restoreHost, ids, false, { restoreSessionID, syntheticDelete: false }),
+      sessionIDs: [ids.oldSessionID, restoreSessionID],
+      profileDir: "/run/sessionport/run-restore-drift",
+      phase: "first",
+    })
+    expect(proof.status).toBe("failed")
+    expect(proof.step).toBe("restore-history")
+    expect(proof.errorCategory).toBe("E_RESTORE_MESSAGE_MISMATCH")
+    expect(proof.manifestRetained).toBe(true)
+    expect(restoreHost.imports).toHaveLength(1)
+    expect(restoreHost.deletes).toEqual([])
+    expect(callbacks.state().manifest).not.toBeNull()
+    expect(exitCodeForResult(finalizeCombinedResult({
+      status: "ok", cleanup: "profile-removed",
+      probe: { outcome: "api-verified", restartManifestReady: true },
+      snapshot: { status: "verified" },
+    }, {
+      status: "ok", cleanup: "profile-removed", probe: proof, probeFailure: null,
+      snapshot: { status: "not-run", reason: "probe-not-verified" },
+    }))).toBe(1)
+    callbacks.dispose()
+  })
+
+  test("scoped restore wrapper rejects DELETE, PATCH, and a second import", async () => {
+    const host = new FakeHost()
+    const guard = createRestoreGuard(host.request)
+    const path = `/api/session/ses_${"a".repeat(64)}`
+    await expect(guard.request({ method: "DELETE", path })).rejects.toThrow()
+    await expect(guard.request({ method: "PATCH", path, body: { archived: true } })).rejects.toThrow()
+    expect(host.calls).toHaveLength(0)
+    const body = {
+      info: {
+        id: `ses_${"b".repeat(64)}`, title: "synthetic", time: { created: 1, updated: 2 },
+        location: { directory: "/run/sessionport/run-test" },
+      },
+      messages: [],
+    }
+    await guard.request({ method: "POST", path: "/api/experimental/session/import", body })
+    await expect(guard.request({ method: "POST", path: "/api/experimental/session/import", body })).rejects.toThrow()
+    expect(host.imports).toHaveLength(1)
+    expect(guard.postCount()).toBe(1)
   })
 })
