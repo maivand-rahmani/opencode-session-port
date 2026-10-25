@@ -27,11 +27,13 @@ import {
 	currentWindowsAccountName,
 	currentWindowsSid,
 	grantUsersRead,
+	hasUsersReadAcl,
 	isSyntheticRoot,
 	removeSyntheticRoot,
 	setWindowsOwner,
 	SYNTHETIC_TEMP_ROOT,
 	trackRoot,
+	windowsAclEntries,
 	windowsAclFingerprint,
 	windowsAclOwnerSid,
 } from "../../helpers/private-state-directory.ts";
@@ -469,19 +471,34 @@ describe("session owner lock primitive", () => {
 		const parentFingerprint = WINDOWS ? windowsAclFingerprint(root) : "";
 		const unsafe = await createUnsafeDirectory(root, "unsafe");
 		if (WINDOWS) {
-			const count = (value: string) =>
-				value.split("|").filter((line) => line.length > 0).length;
-			// Exactly one extra ACE: the deliberately unsafe BUILTIN\Users read.
-			expect(count(windowsAclFingerprint(unsafe))).toBe(
-				count(windowsAclFingerprint(root)) + 1,
-			);
+			// Semantic SID/access readback, not a raw ACE count: Windows can
+			// canonicalize or merge entries, so totals are not portable.
+			expect(windowsAclOwnerSid(unsafe)).toBe(currentWindowsSid());
+			const unsafeEntries = windowsAclEntries(unsafe);
+			expect(unsafeEntries).toContainEqual({
+				sid: "S-1-5-32-545",
+				allow: true,
+				grantsRead: true,
+			});
+			// The parent remains private: no BUILTIN\Users allow-read ACE.
+			const parentEntries = windowsAclEntries(root);
+			expect(parentEntries).not.toContainEqual({
+				sid: "S-1-5-32-545",
+				allow: true,
+				grantsRead: true,
+			});
+			expect(hasUsersReadAcl(root)).toBe(false);
 		} else {
 			expect((await lstat(unsafe)).mode & 0o077).not.toBe(0);
 		}
 
 		await expectOwnerError(acquireSessionOwner({ stateDirectory: unsafe }), "invalid-state-directory");
+		// No lock directory or nonce was created in the refused target.
 		expect(await readdir(unsafe)).toEqual([]);
-		if (WINDOWS) expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
+		if (WINDOWS) {
+			// Exact parent ACL unchanged after the refusal.
+			expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
+		}
 	});
 
 	test("a pre-existing Administrators-owned directory is refused, never re-owned", async () => {

@@ -143,6 +143,70 @@ export function windowsAclOwnerSid(directory: string): string {
 	return output;
 }
 
+export interface AclEntry {
+	readonly sid: string | null;
+	readonly allow: boolean;
+	/** ACE grants read/list (ReadData/ListDirectory bit). */
+	readonly grantsRead: boolean;
+}
+
+/**
+ * Semantic ACL readback through the same fixed `Get-Acl` child. Only SIDs,
+ * access types, and read capability cross the boundary; no names or paths.
+ * Total ACE counts are not used because Windows may canonicalize, merge, or
+ * drop entries depending on host policy.
+ */
+export function windowsAclEntries(directory: string): AclEntry[] {
+	if (!WINDOWS) throw new Error("windowsAclEntries is Windows-only");
+	const script = [
+		"$ErrorActionPreference='Stop'",
+		"$acl=Get-Acl -LiteralPath $env:PRIVATE_DIRECTORY_PROBE",
+		"$out=@()",
+		"foreach($a in $acl.Access){",
+		"  $sid=$null",
+		"  try { $sid=$a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $sid=$null }",
+		"  $rights=0",
+		"  try { $rights=[int]$a.FileSystemRights } catch { $rights=0 }",
+		"  $out += [pscustomobject]@{sid=$sid;allow=($a.AccessControlType -eq 'Allow');grantsRead=(($rights -band 1) -eq 1)}",
+		"}",
+		"$out | ConvertTo-Json -Depth 3 -Compress",
+	].join("\n");
+	const text = runAclPowerShell(script, directory).stdout;
+	if (text.length === 0) return [];
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch {
+		throw new Error("private-directory-helper: ACL entries are not valid JSON");
+	}
+	const list: unknown[] = Array.isArray(value) ? value : value === null ? [] : [value];
+	const entries: AclEntry[] = [];
+	for (const item of list) {
+		if (item === null || typeof item !== "object" || Array.isArray(item)) {
+			throw new Error("private-directory-helper: invalid ACL entry");
+		}
+		const record = item as Record<string, unknown>;
+		const sid = record.sid;
+		const allow = record.allow;
+		const grantsRead = record.grantsRead;
+		if (sid !== null && typeof sid !== "string") {
+			throw new Error("private-directory-helper: invalid ACL entry SID");
+		}
+		if (typeof allow !== "boolean" || typeof grantsRead !== "boolean") {
+			throw new Error("private-directory-helper: invalid ACL entry flags");
+		}
+		entries.push({ sid: sid as string | null, allow, grantsRead });
+	}
+	return entries;
+}
+
+/** True when the directory lets BUILTIN\Users read. */
+export function hasUsersReadAcl(directory: string): boolean {
+	return windowsAclEntries(directory).some(
+		(entry) => entry.sid === USERS_SID && entry.allow && entry.grantsRead,
+	);
+}
+
 /**
  * Sets the owner of a directory this test just created. Used for private test
  * fixtures and, in one regression test, to build a deliberately unsafe
@@ -222,7 +286,7 @@ function assertWindowsAclTooling(directory: string): void {
 	aclToolDiagnostic = "ok";
 }
 
-function applyWindowsPrivateAcl(directory: string, options: PrivateAclOptions = {}): void {
+function applyWindowsPrivateAcl(directory: string): void {
 	assertWindowsAclTooling(directory);
 	const args = [
 		directory,
@@ -231,7 +295,6 @@ function applyWindowsPrivateAcl(directory: string, options: PrivateAclOptions = 
 		`*${currentWindowsSid()}:(OI)(CI)F`,
 		...ACL_GRANT_SIDS.map((sid) => `*${sid}:(OI)(CI)F`),
 	];
-	if (options.grantUsersRead === true) args.push("/grant:r", `*${USERS_SID}:(OI)(CI)R`);
 	const result = Bun.spawnSync({
 		cmd: ["icacls", ...args],
 		stdout: "pipe",
@@ -376,7 +439,13 @@ export async function makePrivate(directory: string, options: PrivateAclOptions 
 		if (windowsAclOwnerSid(directory) !== currentWindowsSid()) {
 			throw new Error("private-directory-helper: could not establish current-user ownership");
 		}
-		applyWindowsPrivateAcl(directory, options);
+		applyWindowsPrivateAcl(directory);
+		if (options.grantUsersRead === true) {
+			await grantUsersRead(directory);
+			if (!hasUsersReadAcl(directory)) {
+				throw new Error("private-directory-helper: unsafe BUILTIN\\Users read grant was not applied");
+			}
+		}
 	} else if (options.grantUsersRead === true) {
 		await chmod(directory, 0o755);
 	} else {
@@ -428,17 +497,22 @@ export async function createUnsafeDirectory(root: string, name = "loose"): Promi
 export async function grantUsersRead(directory: string): Promise<void> {
 	await assertPhysicalDirectory(directory);
 	if (WINDOWS) {
-		const result = Bun.spawnSync({
-			cmd: ["icacls", directory, "/grant:r", `*${USERS_SID}:(OI)(CI)R`],
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (result.exitCode !== 0) {
-			throw new Error(
-				`private-directory-helper: icacls grant failed (exit ${result.exitCode}): ${bounded(result.stderr)}`,
-			);
+		// Some hosts canonicalize grants aggressively; verify the semantic ACE
+		// (Users + allow + read) and retry once with the additive form.
+		for (const flag of ["/grant:r", "/grant"]) {
+			const result = Bun.spawnSync({
+				cmd: ["icacls", directory, flag, `*${USERS_SID}:(OI)(CI)R`],
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) {
+				throw new Error(
+					`private-directory-helper: icacls grant failed (exit ${result.exitCode}): ${bounded(result.stderr)}`,
+				);
+			}
+			if (hasUsersReadAcl(directory)) return;
 		}
-		return;
+		throw new Error("private-directory-helper: BUILTIN\\Users read grant did not appear");
 	}
 	await chmod(directory, 0o755);
 }
