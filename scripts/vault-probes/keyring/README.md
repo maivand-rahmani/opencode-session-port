@@ -1,9 +1,17 @@
-# Synthetic keyring probe (review pending)
+# Synthetic keyring probes
 
-Status: **REVIEW PENDING — NOT EXECUTED. THIS DIRECTORY IS NOT A PROBE AUTHORIZATION.**
-No native binding was installed or loaded, no OS credential store was read or written,
-and no secret was created. Do not run this probe without an explicitly reviewed bounded
-probe plan and separate owner/orchestrator approval.
+Status: **synthetic-only scope, owner-authorized 2026-10-25.** The reviewed single-process
+probe was executed once on 2026-10-20 (see
+`docs/evidence/vault-windows-synthetic-20261020.md`). The two-process persistence probe made
+one store-access run on 2026-10-25 with the same `@napi-rs/keyring@2.1.2` pin and the same
+Windows x64 native binary hash; see
+`.package-verify-work/m3-quota-provision-config-20261024/deployment/vault-restart-result.json`.
+The credential-vault composition probe (real `CredentialStore` + real `CloudAuthController`)
+made one store-access run on 2026-10-25; see
+`.package-verify-work/m3-quota-provision-config-20261024/deployment/windows-credential-vault-result.json`.
+This directory still does not authorize production credentials, real SessionPort tokens,
+credential enumeration, or non-synthetic entries. It is not AUTH-02, locked-store, restart,
+platform-matrix, or support proof.
 
 ## Scope and non-claims
 
@@ -17,9 +25,10 @@ to the product package, tests, or exports.
   `sha512-9i1SR6tYeQ3o1beLeVMxhN6Fq513m9TZlTs+46+4JgvSNkaFoW9S4WrpV5MjzE+0CzVoC+dZ4RfZDIgW6+afnQ==`.
 - No lockfile is committed or generated here. Installing the isolated package would
   create one; that is a separate reviewed action.
-- Platform behavior, Bun compatibility, persistence, locked/unavailable classification,
-  size limits, and cancellation behavior remain **unverified** for the native binding.
-  Nothing in this directory is an OS-support, security, or AUTH-02 completion claim.
+- Cross-process persistence is evidenced only for the exact Windows x64/Bun synthetic case in
+  the 2026-10-25 result. Locked/unavailable classification, reboot/restart persistence, size
+  limits, cancellation behavior, and macOS/Linux behavior remain **unverified**. Nothing in
+  this directory is an OS-support, security, or AUTH-02 completion claim.
 
 ## Exact synthetic namespace
 
@@ -83,24 +92,104 @@ text, environment data, or arbitrary identifiers.
 | `2` | Internal deadline watchdog fired; no rollback/cancellation claim. |
 | `3` | Mutation outcome uncertain; retain the exact pair for review. |
 
-## Proposed commands (not authorized here)
+## Two-process persistence sequence
 
-> **WARNING:** The commands below are documentation of a proposed reviewed run, not
-> instructions to execute now. Installation and any real store access require explicit
-> owner/orchestrator approval, a reviewed bounded plan, and an outer timeout. Do not run
-> them while this README says REVIEW PENDING.
+The two-process probe reuses the exact namespace, 32-byte cap, exact-entry precheck, and
+readback comparisons above. The parent creates 32 CSPRNG bytes in memory and sends them
+only over child stdin:
 
-From this directory, after separate approval only:
+1. Child A preflights the exact derived pair, writes, verifies its own readback, and exits
+   **without deleting**.
+2. The parent verifies A's exact OS exit code and that A's process tree is stopped.
+3. Child B is a fresh process; it reads the same entry, compares bytes and SHA-256 with the
+   parent-expected stdin bytes, deletes exactly that entry, and verifies absence.
+4. If a failure may leave the owned entry, the parent runs at most one bounded cleanup child
+   only after all earlier children are stopped; cleanup re-reads and byte-compares the exact
+   entry before its single delete.
+
+No secret is written to a file, environment variable, argv, or log. Result JSON contains
+fixed booleans, exit codes, lengths, and the non-secret run id only.
 
 ```text
-bun install
-bun run probe.ts --run-synthetic-keyring-probe --run-id <canonical-uuid> --deadline-ms 30000
+bun run two-process.ts --run-two-process-probe --run-id <canonical-uuid> --deadline-ms 30000
+bun test two-process.test.ts
 ```
+
+The actual 2026-10-25 run used run id `1f1bce77-85dc-4378-b4ef-2ae3b3aa7bae`: A exit 0
+(`precheckAbsent`, `setSettled`, `readbackMatched`), B exit 0 (`bytesMatch`, `sha256Match`,
+delete settled, final absent), both trees stopped, no cleanup. This proves cooperating
+process persistence only; it is **not** an OS reboot/restart, locked/unavailable store,
+platform-matrix, product/TUI, or AUTH-02 result.
+
+## Credential-vault composition probe (2026-10-25)
+
+`credential-vault.ts` exercises the real pinned binding, the real
+`CredentialStore`, and the real optional `CloudAuthController` against one
+synthetic credential. It uses a distinct namespace:
+
+```text
+service = sessionport-m3-credential-probe-<run-id>
+account = synthetic-<run-id>
+```
+
+The parent creates a canonical synthetic credential in memory: two independent
+32-byte CSPRNG tokens as unpadded base64url, a positive expiry, and a canonical
+scope. It never writes the credential to a file, environment variable, argv, or
+log. A fixed binary frame is sent only over child stdin. Child processes run
+under a unique, outside-repository temporary profile with restricted Windows
+directory ACLs for the real process-owner lock.
+
+Sequence:
+
+1. **write** child checks the exact entry is absent, writes the synthetic ready
+   credential through the real `CredentialStore`, compares the exact stored
+   fields and serialized SHA-256 in memory, and exits without deleting.
+2. **fault** child wraps the scoped real vault read with one deterministic
+   `VaultError("unavailable")` and exercises the real `CredentialStore` and
+   controller. It asserts one failed read per operation, no retry, no HTTP, no
+   vault write/delete, no plaintext fallback, and unavailable/cancelled
+   controller outcomes. This is **fault injection on real composition, not an
+   OS lock test**.
+3. **read-logout** child is a fresh process. It reads and compares the same
+   credential, asserts controller `status()` is `signed-in` with no injected
+   fetch call, performs local-only logout, asserts `signed-out`, direct
+   exact-entry absence, and disposes the real owner lease.
+4. If any child fails after a proven write and all child trees are verified
+   stopped, one **cleanup** child re-reads and fingerprint-compares the exact
+   entry before its single delete. A foreign or mismatched entry is retained.
+   A timeout, unverified tree, or unproven write retains metadata and does not
+   blind-delete.
+
+```text
+bun run credential-vault.ts --run-credential-vault-probe --run-id <canonical-uuid> --deadline-ms 30000
+bun test credential-vault.test.ts
+```
+
+The 2026-10-25 run used run id `80bd6db9-dfcd-41aa-a30e-9c5257354250`. Exit 0;
+pin `@napi-rs/keyring@2.1.2` with native SHA-256
+`52b16658275b7848f8081a6542fee3448f1b1c5d3a36487107ae0e7cec95ac6f`; write child
+pass, fault child pass, read-logout child pass; controller `signed-in` then
+`signed-out`; exact entry absent; no cleanup; no residual profile directories;
+no secret leak. Fault injection outcome is labeled
+`fault-injection-on-real-composition-not-OS-lock`. This proves the synthetic
+Windows x64 composition only. It does not prove an OS locked/unavailable store,
+OS reboot persistence, cross-platform behavior, server revocation, provider or
+product integration, AUTH-02, presigned-URL M4, state-outbox SYNC01, or M3
+completion.
+
+## Bounded commands (synthetic scope only)
 
 Use an operator-supplied fresh UUID (for example, one generated locally with
 `crypto.randomUUID()`) and an outer OS/CI timeout. Record the run id and proposed exact
 pair before the run. A failed or uncertain result is not a pass and must not be converted
 into a platform, persistence, Bun, AUTH-02, or security claim.
+
+```text
+bun run probe.ts --run-synthetic-keyring-probe --run-id <canonical-uuid> --deadline-ms 30000
+```
+
+The existing single-process run used a reviewed isolated install. Do not install packages
+or run these probes outside the explicitly authorized synthetic scope.
 
 The adapter tests are separate and use injected fake entries only:
 `bun test tests/cloud/vault/keyring.test.ts`.

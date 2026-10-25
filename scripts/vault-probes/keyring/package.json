@@ -3,7 +3,7 @@
 	"version": "0.0.0",
 	"private": true,
 	"type": "module",
-	"description": "Isolated, review-pending synthetic probe for @napi-rs/keyring 2.1.2.",
+	"description": "Isolated synthetic probe for @napi-rs/keyring 2.1.2.",
 	"dependencies": {
 		"@napi-rs/keyring": "2.1.2"
 	},

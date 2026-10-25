@@ -1,9 +1,9 @@
 /**
- * REVIEW PENDING; NOT EXECUTED. Import-safe synthetic probe for keyring 2.1.2.
- * No native load or store access occurs unless run as the entrypoint with the
- * exact reviewed flags and a separate authorization. Results contain fixed
- * booleans/length and the operator's non-secret run id only: no bytes, entry
- * names, native errors, or environment data. See README.md for the exact pair.
+ * Import-safe synthetic probe for keyring 2.1.2; single-process run executed
+ * 2026-10-20 within synthetic-only scope. No native load or store access occurs
+ * unless run as the entrypoint with the exact flags and authorization. Results
+ * contain fixed booleans/length and the operator's non-secret run id only: no
+ * bytes, entry names, native errors, or environment data. See README.md.
  */
 import { randomBytes } from "node:crypto";
 import { createKeyringVault } from "../../../src/cloud/vault/keyring.ts";
