@@ -1,5 +1,7 @@
 # SessionPort Documentation
 
+> **Current direction (owner decision 2026-10-25): local-first 0.1.7 release.** See [local-release-0.1.7.md](local-release-0.1.7.md). Cloud/V2 is **PAUSED/FUTURE** until host issues are fixed; all cloud code/evidence is preserved. Existing M3 Windows-bounded evidence is historical, not an active published cloud feature. V2 below is retained as historical/future design, not the current release plan.
+
 > **V1 documentation is archived.** V1 is a historical record, not the active V2 specification. V2 documentation remains a proposed draft (full owner review unrecorded), with local source implementation for bounded M1–M3 slices and no deployment or runtime acceptance.
 
 The workspace [README](../README.md) gives the project summary.
@@ -25,6 +27,12 @@ The workspace [README](../README.md) gives the project summary.
 - The owner approved the V1 implementation baseline on 2026-10-09; documentation was never frozen, and PROPOSED/OPEN items remain unresolved exactly as recorded. Archiving closes nothing.
 - Status labels used inside the archived docs: **DECIDED** / **PROPOSED** / **OPEN** / **(CANDIDATE)** / **SUPERSEDED** — preserved as originally recorded.
 - Validation baseline as originally recorded: OpenCode **v2.0.22 (2026-10-09)**, Windows only, synthetic data, disposable environment; **not** a universal compatibility promise. Later evidence and platform limits (Linux untested; cross-OS artifact interchange unverified) remain exactly as recorded in the archived documents; archiving preserves evidence and does not upgrade any claim.
+
+## Archived cloud index (historical)
+
+| Path | Purpose | Archived status |
+| --- | --- | --- |
+| [archive/cloud/m3-launcher-preparation-20261024.md](archive/cloud/m3-launcher-preparation-20261024.md) | Former root README's 2026-10-24 M3 launcher preparation record: topology, launcher/guards, commands, hashes, tests, and evidence boundaries | Archived historical record; superseded by the local-first 0.1.7 direction |
 
 ## V2 (in progress — proposed, awaiting owner approval)
 

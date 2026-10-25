@@ -1,5 +1,8 @@
 # SessionPort 0.2.0 -- Architecture
 
+> **LOCAL-RELEASE QUALIFIER (owner decision 2026-10-25).** The current authoritative local policy is [docs/local-release-0.1.7.md](../local-release-0.1.7.md). Its explicit `/restore` backup-before-delete and confirmed-standalone deletion rules supersede the absolute “never delete native history” / “local artifact semantics unchanged” wording **only for local restore under that policy**. Cloud/native apply remains unchanged: no destructive overwrite of divergent histories and no cloud apply is authorized. Cloud is PAUSED/FUTURE.
+
+
 > **DRAFT -- awaiting owner approval. Architectural reference; local source implementation exists, but no deployment or runtime acceptance is claimed.**
 > SessionPort 0.2.0 (optional cloud sync/continuity) remains a proposed design. The local
 > checkpoint/restore engine described by the archived V1 record exists in this repository. Bounded

@@ -1,96 +1,110 @@
 # SessionPort
 
-**Encrypted session checkpoints for OpenCode.**
+Local-first encrypted checkpoint and restore for OpenCode sessions.
 
-SessionPort is a local plugin for the OpenCode TUI. It captures the sessions of your current project into a single password-encrypted artifact and restores them in another checkout, worktree, or machine. Artifacts travel with Git or any other channel you choose — SessionPort never runs Git commands itself.
+**Release status: candidate, publication pending.** `opencode-session-port` **0.1.7** is the current local-first release target. It is not published or registry-live; do not treat an install as 0.1.7 until a publication receipt exists.
 
-> **Status: experimental pre-release (0.1.6).** SessionPort completed one bounded synthetic checkpoint/restore round trip on Windows with OpenCode v2.0.22. That test used test-only password and project-selector seams and staged source, not the npm tarball. On one real Windows OpenCode v2.0.22 host, a bounded diagnostic observed both commands registered (`commands=yes`) but hidden from the command palette and slash list until the keymap layer opted into global mode; 0.1.2 applies that global-mode registration fix, with focused command-registration tests and the TUI build passing. 0.1.3 additionally enables the commands on macOS and Linux through an explicit platform allowlist (`win32`/`darwin`/`linux`). 0.1.2 through 0.1.6 are published to npm (0.1.6 latest, per a read-only registry check on 2026-10-18, which also observed the published 0.1.6 tarball's SHA-1 matching the local 0.1.6 candidate); the published package itself has not been host-tested. 0.1.4 was a diagnostics/copy patch: a failed checkpoint collection appends a fixed sanitized reason and the known machine code (`Reason: <fixed reason> (<code>).`) for the current collection codes; unknown codes keep the generic text and raw host/exception text is never shown. 0.1.5 adds a bare `/restore` default that uses the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time; no fallback to an older artifact on a corrupt file, wrong password, or read failure) and extends the same fixed-reason diagnostics to known restore plan/collection error codes. Collector behavior is unchanged, and no root cause is established for an earlier Windows collection failure; the concrete code behind an earlier restore rejection is likewise still pending a user runtime observation, and no planner correctness fix is claimed. macOS has one user-reported successful checkpoint only; Linux is untested; restore and cross-OS artifact interchange remain unestablished. End-to-end execution from the packed package has not been host-tested. Real modal interactions and loading the packed package in OpenCode have not been verified. The checkpoint format may change; no compatibility, security, or platform-support guarantee is made. **0.1.6 (published, observed 2026-10-18):** checkpoint collection now also includes sessions referenced through the collected sessions' schema-defined `parentID`/`fork.sessionID` links — even referenced sessions outside the current project — with each referenced session's full message history; a referenced session that cannot be captured fails the checkpoint instead of being dropped. This change shipped in the published 0.1.6 (observed 2026-10-18) but has synthetic verification only — no host run against the packed package; an independent source review returned GO scoped to source correctness (sole blocker fixed; no material remainder).
+SessionPort saves a project's session state to a password-protected artifact and restores it on the same Windows host. This release is for local self-use. Cloud sync is paused and is **not** part of the 0.1.7 claim.
 
-## Commands
+## What it preserves
 
-- **`/checkpoint [artifact-path]`** — collects the current project's sessions as returned by the host (child/subagent and archived sessions included when the host returns them) and recursively includes only the sessions those records reference through `parentID`/`fork.sessionID` — including referenced sessions outside the current project — with each referenced session's full message history; it never scans unrelated projects. It fails cleanly, with no artifact, when the set is empty, a session (including a referenced dependency) cannot be captured completely, or the output file already exists. The dependency-closure inclusion shipped in the published 0.1.6 (observed 2026-10-18); it has synthetic verification only, with no host run against the packed package.
-- **`/restore [artifact-path]`** — decrypts and validates the artifact before session imports, then restores it into an existing project you select. Without a path, `/restore` uses the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time; an exact tie is broken deterministically by filename). Restore does not overwrite existing sessions: exact destination matches are skipped, conflicting IDs are remapped deterministically, and parents are imported before children.
+- One encrypted artifact per checkpoint, created from the selected project's current OpenCode session state.
+- Restore into the same Windows host and project, after an explicit preview and confirmation.
+- Recovery artifacts for current state, created and decrypt-verified before any old target is deleted.
 
-Both commands are registered by the plugin as `sessionport.checkpoint` and `sessionport.restore`, and appear in the slash-command list and the command palette.
+A checkpoint is local backup material, not a portable cross-platform export, a cloud backup, or a replacement for source control. Keep project files in Git or another backup system you already trust.
 
-## Requirements
+## Scope
 
-- OpenCode with the v2 TUI plugin API (exercised with OpenCode v2.0.22).
-- Windows, macOS, or Linux. The build enables the commands on all three through an explicit platform allowlist (`win32`/`darwin`/`linux`); other platforms are not enabled. Windows has the bounded host evidence above; macOS and Linux are enabled but NOT host-tested, and cross-OS artifact interchange is UNVERIFIED.
+- Windows only, with bounded evidence on OpenCode **2.1.1** (native) and **2.1.3** (isolated). There is no Linux/macOS or cross-OS compatibility claim.
+- Artifacts use the existing experimental Windows crypto/artifact profile. Format, parameters, and caps are unchanged.
+- The plugin makes no direct OpenCode-database writes, no LLM calls, and never replays historical tools. It never runs Git commands.
+- No cloud deployment, runtime acceptance, production, or high-assurance claim is made.
 
 ## Install
 
-Add the plugin to the `plugins` array in your global CLI-only config (`cli.json`):
+Installation uses OpenCode's CLI plugin system, not a project-local config.
 
-```json
-{
-  "plugins": ["opencode-session-port@0.1.6"]
-}
-```
+1. OpenCode's TUI plugins live in the **global CLI config**: `~/.config/opencode/cli.json`, or `$XDG_CONFIG_HOME/opencode/cli.json` when that variable is set. There is no project-local `cli.json`.
+2. Merge the plugin entry into an existing `plugins` array; do not replace other preferences:
 
-Or install the package plugin with the OpenCode CLI:
+   ```json
+   {
+     "plugins": ["opencode-session-port"]
+   }
+   ```
 
-```sh
-opencode plugin add opencode-session-port@0.1.6
-```
+3. Restart OpenCode so the CLI loads the plugin.
 
-`cli.json` is the documented OpenCode v2 config for CLI-only plugins: they run locally in the terminal and remain active when the CLI connects to a remote server. The npm registry shows 0.1.2 through 0.1.6 published (0.1.6 latest; read-only registry check on 2026-10-18, which also observed the published 0.1.6 tarball's SHA-1 matching the local 0.1.6 candidate); no published artifact has been loaded by OpenCode here, and no local package-verification record exists for the published tarballs. The 0.1.1 tarball passed npm consumer checks, but a direct Bun package-manager install timed out in the verification environment, so that install path remains unverified. The 0.1.2 tarball passed manifest/allowlist and packed-entry checks only. The 0.1.4 and 0.1.5 candidate tarballs passed the same local manifest/allowlist and packed-entry checks (0.1.5 including the bare-restore latest-checkpoint resolver and the restore reason-copy allowlists). The 0.1.6 tarball passed the same checks, including the checkpoint dependency-closure source modules; it is published, but execution from the packed package has not been host-tested.
+The package's existing `./tui` export is the compiled entry point. Use the package name exactly as shown; do not add a `/tui` suffix, and do not pin a version in this config.
 
-## Usage
-
-### Checkpoint
-
-```text
-/checkpoint [artifact-path]
-```
-
-Without an argument, the artifact is written to `.sessionport/checkpoint-<UTC timestamp>.sessionport` inside the current project. An argument overrides the location (absolute, or relative to the project). An existing file is never overwritten — a collision fails the checkpoint.
-
-Checkpoint prompts for a password twice in a masked input (paste is allowed); both entries must match. Strength guidance is advisory — weak passwords are not rejected.
-
-### Restore
-
-```text
-/restore [artifact-path]
-```
-
-Without an argument, `/restore` picks the newest checkpoint in the current project's `.sessionport/` directory (newest file modification time wins; an exact tie is broken deterministically by filename, descending). If the project has no active directory or no checkpoint is found, nothing is changed. Restore never falls back to an older checkpoint: a corrupt file, wrong password, or read failure stops the command with an error instead of trying another artifact.
-
-Restore first asks which existing project to import into, then prompts for the password (up to three attempts). The artifact is fully checked before the first session import. Project resolution may still update bounded host project metadata through OpenCode's public `location.get` API. Imports run parents-first, one session at a time: independent branches continue after a failure, descendants of a failed parent are blocked, and outcomes are reported per session. There is no atomic rollback. A later manual rerun may skip exact matching records, but exact retry behavior on a real host has not been established. Imported sessions are not opened or navigated to automatically.
-
-### Moving artifacts
-
-Move the artifact with Git (commit it, stash it, or sync it your own way) or any other channel. SessionPort never runs Git commands, and the password is never stored with the artifact or in the repository — if you lose it, the artifact cannot be recovered. A checkpoint cannot be repaired after the fact: if a restore rejects an artifact because it references a session the artifact does not contain (a dangling session reference), make a new checkpoint on the source machine and transfer it — old artifacts are never fixed automatically.
-
-## Security notes
-
-- Encryption is mandatory: no plaintext fallback, no plaintext temporary file.
-- Payloads are compressed, then encrypted with an Argon2id-derived key and XChaCha20-Poly1305 secretstream; truncated or tampered artifacts are rejected.
-- Password input is masked and capped at 4 KiB of UTF-8. SessionPort does not intentionally log it, write it to disk, or copy it to the clipboard. JavaScript strings cannot be reliably zeroed; no secure-erasure claim is made.
-- Protection applies to the artifact at rest only. Git history and metadata, a compromised machine, and secrets copied into session content are outside SessionPort's protection; no secure-deletion promise is made.
-- SessionPort makes no model/LLM calls and never replays historical tool calls.
-
-## Development status
-
-**SessionPort 0.1.6** — local encrypted checkpoint/restore implementation completed for the next planning phase and published to npm; experimental, with the verification limits above.
-
-**SessionPort 0.1.7 (candidate, unpublished)** — repository metadata is prepared locally as version 0.1.7 for a future release; no tag, release, or npm publish has been performed, 0.1.7 is not on npm, and the published install pins above remain 0.1.6 until publication is separately approved. The owner has explicitly approved the M3 pack-boundary update: the candidate intentionally lists **69 files** (replacing the earlier 58), with exact external `@napi-rs/keyring@2.1.2` and lockfile-proven integrity; no native `.node` binary is packed and no plaintext tokens are included. Version and exports are unchanged.
-
-**SessionPort 0.2.0** — active development of optional cloud accounts, encrypted remote storage, and cross-device continuity. Local M1–M3 source slices now exist: a Fastify/Prisma API, SessionPort-owned native device credentials, BetterAuth 1.7.11 browser sign-in, a minimal Feature-Sliced Design Next.js web surface for login, device approval, and connected devices (no dashboard), and the wired native TUI surface. The M3 source ships one literal `/sync` command (login, local status, logout, and a bare action menu), native OpenCode host builtins/theme tokens, an optional bounded `sessionportCloud` configuration, and a cooperative cross-process owner lock; the lazy optional load does not break `/checkpoint` or `/restore`. This is source integration, not runtime acceptance: actual host rendering/focus/Esc, live GitHub OAuth/API login, authoritative session/CSRF behavior, real end-to-end host/OAuth/API/vault flows, the application database, enabled auth, and storage/upload remain unverified, and HOST-01 remains open (all eight runtime rows PARTIAL/UNVERIFIED). The original project/quota PostgreSQL 16 validation passed owner/server-reported (2 migrations, 15/15 checks, 3 users, cleanup true, exit 0), and the separately authorized validation-only `0003` apply/postcheck also passed (2→3 migrations, 8 protocol tables, 3 enums, 20 checks, exit 0); the single protocol run then failed 6/15 on `revision-concurrent-siblings`, with no retry/cleanup and the main database untouched ([protocol result](docs/evidence/protocol-postgres-validation-result-20261020.md)); the driver-only correction is committed at `c44ea02f1086c4e10b5c0ac5b190acee06fbb1b0` after Ora8 source GO, but the live case remains FAIL and is not live validated. The native M3 source received FINAL Ora9 material review2 GO for the source commit boundary and is committed at `cd3ef6902d7bf3e62faf2b75effc36ece75f4ba0`; actual host UI/OAuth/session/CSRF/vault acceptance remains unverified, and milestones are not complete. Architecture, specifications, roadmap, and [M1–M3 status](docs/V2/README.md) are in [`docs/V2/`](docs/V2/README.md); full-package owner review remains unrecorded.
-
-Release CI remains the first release priority for the existing plugin; independent local M1–M3 source work proceeded in parallel. M0 status: **CI-01 completed** — a hosted Windows CI run on commit `5c1d89e` passed the frozen install, typecheck, full test suite (648 passing, 0 failing), package verification, and artifact upload, and the uploaded evidence was downloaded and checked locally. **CI-02 in progress** — local source work is complete (real verifier stage→validate passed locally; final post-remediation review GO) and the GitHub protections are applied and read-back verified (protected `npm-release` environment; active `v*` tag ruleset), while the npm trusted-publisher mapping is owner-reported configured (2026-10-19; independently unverified), the release variables were absent at the last check, and no hosted release run, tag, or OIDC publish has occurred; no version bump or publish authorized. Statuses: [roadmap](docs/V2/ROADMAP.md); owner setup runbook: [deployment plan](docs/V2/DEPLOYMENT.md) §2.
-
-## Development
+**Publication gate.** 0.1.7 is unavailable until release. OpenCode resolves the published package version, so until 0.1.7 is published this entry still resolves 0.1.6. After publication, this read-only check reports the registry version without credentials:
 
 ```sh
-bun install --frozen-lockfile
-bun run typecheck
-bun test
-bun run verify:package   # host-free package verification
+npm view opencode-session-port version
 ```
 
-Design and validation records live under `docs/` in this repository; they are not part of the published package.
+Official references: [CLI plugins](https://opencode.ai/v2/docs/build/plugins/cli) and [CLI configuration](https://opencode.ai/v2/docs/cli/config).
 
-## License
+## Commands
 
-MIT © 2026 Maivand Rahmani
+```text
+/checkpoint [output path]
+/restore [artifact path]
+```
+
+- `/checkpoint` writes one encrypted artifact for the selected project. Without a path, the default is a UTC-timestamped `.sessionport` file under **`PROJECT/.sessionport/`**.
+- `/restore` restores from an explicit artifact path. With no argument, it uses the latest checkpoint in the project's `.sessionport/` directory.
+- Flow: choose the project, enter the artifact password, review the preview, then confirm explicitly. Nothing is replaced or deleted before that confirmation.
+
+Example:
+
+```text
+/checkpoint
+# writes PROJECT/.sessionport/checkpoint-<UTC>.sessionport
+
+/restore
+# previews the newest checkpoint; confirm to continue
+
+/restore PROJECT/.sessionport/checkpoint-2026-10-25T12-00-00Z.sessionport
+# restore a specific artifact
+```
+
+A checkpoint is an older encrypted payload, not a backup of the current target. A fresh encrypted recovery artifact is required before replacing current state.
+
+## Restore safety
+
+1. The imported candidate must be complete and verified.
+2. The preview lists the exact destination targets before any mutation.
+3. Before deleting the current old target, SessionPort creates an encrypted backup of that target and decrypt-verifies it. If backup creation or verification fails, nothing is deleted.
+4. Deletion is limited to targets confirmed standalone, settled, unchanged, and free of fork/revert, parent/child, and incoming-reference risk. Pending, changed, error, unknown-reference, and incomplete-inventory states block delete.
+5. An uncertain delete is read back and reconciled once; there is no blind retry loop.
+6. Exact duplicates may be skipped. A skip never deletes.
+7. If the old target is absent, restore imports only; it never deletes a source on another machine.
+8. For a graph/fork/revert case, SessionPort creates a standalone copy, flattens only known fork/revert metadata, keeps the original, and shows a warning. This is not native graph preservation.
+9. Restore is not atomic and has no CAS/TOCTOU guarantee. Manual quiescence is required: do not edit sessions or run agents while a restore is in progress.
+10. Backups are encrypted copies, not secure erasure of older data.
+
+**Recovery artifacts.** Restore reports the path of the encrypted recovery artifact it creates; keep it until the restored state is confirmed. The intended naming is `recovery-...sessionport`, but the exact integrated filename and path are pending and not promised here. Use the path shown in the report, and pass it explicitly to `/restore` when needed.
+
+## Crypto and host boundary
+
+The artifact format and crypto are the existing experimental Windows profile; this release adds no parameters and has no plaintext fallback. Compatibility evidence is bounded to the recorded OpenCode 2.1.1 native and 2.1.3 isolated Windows results. Treat other hosts, other host versions, and cross-OS artifact interchange as unverified.
+
+## Limits and non-claims
+
+- Limited local mode is accepted for this release; it is **not** M1/HOST-01 full acceptance.
+- No production durability, secure-erasure, atomicity, or CAS guarantee is made.
+- Fork/revert handling is a standalone-copy workaround, not native graph preservation and not tool replay.
+- Windows bounded evidence only; no Linux/macOS host support or cross-OS artifact interchange claim.
+- Cloud sync is not part of this release.
+
+## Cloud status: paused
+
+Cloud/V2 work is paused until host issues are fixed. Cloud code, sync state/outbox source, and evidence are preserved for future work, but sync remains deferred engine wiring rather than a user-facing function. `/sync` is not active or published in this release. See [docs/V2/README.md](docs/V2/README.md).
+
+## Documentation
+
+- [docs/local-release-0.1.7.md](docs/local-release-0.1.7.md) - authoritative current local-release policy, status, and non-claims.
+- [docs/archive/cloud/m3-launcher-preparation-20261024.md](docs/archive/cloud/m3-launcher-preparation-20261024.md) - archived 2026-10-24 M3 launcher preparation, preserved as historical evidence and not current direction.
+- [docs/README.md](docs/README.md) - documentation index, including archived V1 and paused V2 material.
