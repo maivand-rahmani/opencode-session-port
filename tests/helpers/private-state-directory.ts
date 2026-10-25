@@ -103,6 +103,81 @@ export function windowsAclFingerprint(directory: string): string {
 
 /** Removes the helper's now-unused locale-dependent group lookup. */
 
+/** Runs a fixed ACL script for one directory; the path crosses via the env. */
+function runAclPowerShell(script: string, directory: string): { ok: boolean; stdout: string } {
+	const result = Bun.spawnSync({
+		cmd: [
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			script,
+		],
+		env: { ...process.env, PRIVATE_DIRECTORY_PROBE: directory },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`private-directory-helper: Windows PowerShell ACL script failed ` +
+				`(exit ${result.exitCode}) stderr=${bounded(result.stderr)}`,
+		);
+	}
+	return { ok: true, stdout: result.stdout.toString().trim() };
+}
+
+/** Reads the exact owner SID of a directory (SID only, no names/paths). */
+export function windowsAclOwnerSid(directory: string): string {
+	if (!WINDOWS) throw new Error("windowsAclOwnerSid is Windows-only");
+	const script = [
+		"$ErrorActionPreference='Stop'",
+		"$acl=Get-Acl -LiteralPath $env:PRIVATE_DIRECTORY_PROBE",
+		"$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+	].join("\n");
+	const output = runAclPowerShell(script, directory).stdout;
+	if (!/^S-1-[0-9-]+$/.test(output)) {
+		throw new Error("private-directory-helper: ACL owner SID not found");
+	}
+	return output;
+}
+
+/**
+ * Sets the owner of a directory this test just created. Used for private test
+ * fixtures and, in one regression test, to build a deliberately unsafe
+ * Administrators-owned fixture. Never applied to a pre-existing host directory.
+ */
+export function setWindowsOwner(directory: string, sid = currentWindowsSid()): void {
+	if (!WINDOWS) throw new Error("setWindowsOwner is Windows-only");
+	const script = [
+		"$ErrorActionPreference='Stop'",
+		"$acl=Get-Acl -LiteralPath $env:PRIVATE_DIRECTORY_PROBE",
+		"$owner=New-Object System.Security.Principal.SecurityIdentifier($env:PRIVATE_DIRECTORY_OWNER)",
+		"$acl.SetOwner($owner)",
+		"Set-Acl -LiteralPath $env:PRIVATE_DIRECTORY_PROBE -AclObject $acl",
+	].join("\n");
+	const result = Bun.spawnSync({
+		cmd: [
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-Command",
+			script,
+		],
+		env: { ...process.env, PRIVATE_DIRECTORY_PROBE: directory, PRIVATE_DIRECTORY_OWNER: sid },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(
+			`private-directory-helper: set-owner failed (exit ${result.exitCode}): ${bounded(result.stderr)}`,
+		);
+	}
+}
+
 interface PrivateAclOptions {
 	/** Adds BUILTIN\Users read; used only by the unsafe-fixture regression test. */
 	readonly grantUsersRead?: boolean;
@@ -294,6 +369,13 @@ async function assertPhysicalDirectory(directory: string): Promise<void> {
 export async function makePrivate(directory: string, options: PrivateAclOptions = {}): Promise<string> {
 	await assertPhysicalDirectory(directory);
 	if (WINDOWS) {
+		// Claim ownership first: an elevated token can leave a fresh directory
+		// owned by Administrators, which the production gate (correctly)
+		// refuses. Only freshly created fixtures are re-owned.
+		setWindowsOwner(directory);
+		if (windowsAclOwnerSid(directory) !== currentWindowsSid()) {
+			throw new Error("private-directory-helper: could not establish current-user ownership");
+		}
 		applyWindowsPrivateAcl(directory, options);
 	} else if (options.grantUsersRead === true) {
 		await chmod(directory, 0o755);

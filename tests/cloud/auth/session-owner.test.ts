@@ -25,12 +25,15 @@ import {
 	createPrivateRoot,
 	createUnsafeDirectory,
 	currentWindowsAccountName,
+	currentWindowsSid,
 	grantUsersRead,
 	isSyntheticRoot,
 	removeSyntheticRoot,
+	setWindowsOwner,
 	SYNTHETIC_TEMP_ROOT,
 	trackRoot,
 	windowsAclFingerprint,
+	windowsAclOwnerSid,
 } from "../../helpers/private-state-directory.ts";
 
 const CHILD_FIXTURE = join(import.meta.dir, "fixtures", "session-owner-child.ts");
@@ -446,6 +449,10 @@ describe("session owner lock primitive", () => {
 		if (WINDOWS) {
 			const fingerprint = windowsAclFingerprint(stateDirectory);
 			expect(fingerprint.toLowerCase()).toContain(currentWindowsAccountName().toLowerCase());
+			// Owner identity, not just the ACE account: Windows defaults can leave
+			// a fresh directory owned by Administrators on elevated tokens.
+			expect(windowsAclOwnerSid(stateDirectory)).toBe(currentWindowsSid());
+			expect(windowsAclOwnerSid(root)).toBe(currentWindowsSid());
 		} else {
 			expect((await lstat(stateDirectory)).mode & 0o077).toBe(0);
 		}
@@ -474,6 +481,42 @@ describe("session owner lock primitive", () => {
 
 		await expectOwnerError(acquireSessionOwner({ stateDirectory: unsafe }), "invalid-state-directory");
 		expect(await readdir(unsafe)).toEqual([]);
+		if (WINDOWS) expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
+	});
+
+	test("a pre-existing Administrators-owned directory is refused, never re-owned", async () => {
+		const root = await createRoot("owner-regression-admin-owned");
+		const directory = await createPrivateDirectory(root, "admin-owned");
+		const parentFingerprint = WINDOWS ? windowsAclFingerprint(root) : "";
+
+		if (WINDOWS) {
+			let administrativelyOwned = false;
+			try {
+				setWindowsOwner(directory, "S-1-5-32-544");
+				administrativelyOwned = windowsAclOwnerSid(directory) === "S-1-5-32-544";
+			} catch {
+				administrativelyOwned = false;
+			}
+			if (administrativelyOwned) {
+				await expectOwnerError(
+					acquireSessionOwner({ stateDirectory: directory }),
+					"invalid-state-directory",
+				);
+				// The production create-only ownership fix must not rewrite it.
+				expect(windowsAclOwnerSid(directory)).toBe("S-1-5-32-544");
+				expect(await readdir(directory)).toEqual([]);
+				return;
+			}
+			// Non-elevated host: the Administrators-owned fixture cannot be built.
+			// The gate must still refuse an owned-but-broadened directory.
+			expect(windowsAclOwnerSid(directory)).toBe(currentWindowsSid());
+			await grantUsersRead(directory);
+		} else {
+			await grantUsersRead(directory);
+		}
+
+		await expectOwnerError(acquireSessionOwner({ stateDirectory: directory }), "invalid-state-directory");
+		expect(await readdir(directory)).toEqual([]);
 		if (WINDOWS) expect(windowsAclFingerprint(root)).toBe(parentFingerprint);
 	});
 });

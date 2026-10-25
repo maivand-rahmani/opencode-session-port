@@ -365,10 +365,28 @@ async function ensurePrivateStateDirectory(stateDirectory: string): Promise<void
 		}
 	}
 
+	let createdIdentity: FileIdentity | undefined;
 	try {
 		const stats = await lstat(stateDirectory, { bigint: true });
 		if (!stats.isDirectory() || stats.isSymbolicLink() || stats.ino === 0n) {
 			throw new SessionOwnerError("invalid-state-directory");
+		}
+		if (createdByThisCall) {
+			createdIdentity = identityFrom(stats);
+			if (process.platform === "win32") {
+				// A newly created directory can default to a group owner (for
+				// example Administrators) under elevated Windows tokens. Only a
+				// directory created by this call is claimed; an existing foreign
+				// owner is never rewritten and still fails the check below.
+				await claimCurrentUserOwnership(stateDirectory);
+				const ownerStats = await lstat(stateDirectory, { bigint: true });
+				if (
+					!ownerStats.isDirectory() ||
+					!sameIdentity(createdIdentity, ownerStats)
+				) {
+					throw new SessionOwnerError("invalid-state-directory");
+				}
+			}
 		}
 		await rejectSymlinkAncestors(stateDirectory);
 		if (process.platform === "win32") {
@@ -379,9 +397,13 @@ async function ensurePrivateStateDirectory(stateDirectory: string): Promise<void
 	} catch (error) {
 		if (createdByThisCall) {
 			// Only the empty directory this call just created is removed, and
-			// only non-recursively. Anything else is left for manual recovery.
+			// only non-recursively. Anything else, including a path replaced
+			// after creation, is left for manual recovery.
 			try {
-				await rmdir(stateDirectory);
+				const current = await lstat(stateDirectory, { bigint: true });
+				if (createdIdentity === undefined || sameIdentity(createdIdentity, current)) {
+					await rmdir(stateDirectory);
+				}
 			} catch {
 				// Best-effort removal of our own empty directory only.
 			}
@@ -443,6 +465,52 @@ async function assertPrivateWindowsAcl(stateDirectory: string): Promise<void> {
 			throw new SessionOwnerError("invalid-state-directory");
 		}
 	}
+}
+
+/**
+ * Claims a directory created moments earlier by this call for the current
+ * process user. Windows can assign a group owner (for example Administrators)
+ * to objects created under an elevated token, while the state-directory
+ * contract requires the current user as owner. The path is passed through the
+ * child environment; the child only changes ownership of that exact path.
+ * Callers must verify the directory identity before and after.
+ */
+function claimCurrentUserOwnership(stateDirectory: string): Promise<void> {
+	const script = [
+		"$ErrorActionPreference='Stop'",
+		`$p=$env:${ACL_ENVIRONMENT_NAME}`,
+		"$acl=Get-Acl -LiteralPath $p",
+		"$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+		"$acl.SetOwner($me)",
+		"Set-Acl -LiteralPath $p -AclObject $acl",
+	].join("\n");
+
+	return new Promise<void>((resolvePromise, rejectPromise) => {
+		execFile(
+			"powershell.exe",
+			[
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				script,
+			],
+			{
+				env: { ...process.env, [ACL_ENVIRONMENT_NAME]: stateDirectory },
+				timeout: 15_000,
+				maxBuffer: 1024 * 1024,
+				windowsHide: true,
+			},
+			(error) => {
+				if (error !== null && error !== undefined) {
+					rejectPromise(new SessionOwnerError("invalid-state-directory"));
+					return;
+				}
+				resolvePromise();
+			},
+		);
+	});
 }
 
 /**
