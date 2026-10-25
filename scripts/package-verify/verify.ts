@@ -82,8 +82,13 @@ export const EXPECTED_REPOSITORY = {
 	url: "git+https://github.com/maivand-rahmani/opencode-session-port.git",
 } as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
-/** Measured `npm pack --dry-run --ignore-scripts --json` file count after intentional cloud/native shipping. */
-export const EXPECTED_PACKED_FILE_COUNT = 69;
+/**
+ * Measured packed file count after the intentional shipped-source state
+ * implementation (src/cloud/state, state-codec, state-key). Measured with both
+ * `npm pack --dry-run --json` (79) and `bun pm pack --dry-run` (79); both
+ * listings are pinned to this same value by the whitelist tests.
+ */
+export const EXPECTED_PACKED_FILE_COUNT = 79;
 export const EXPECTED_EXPORTS = { "./tui": "./dist/tui.js" } as const;
 /** Compiled bundle produced by `build:tui` (prepack) and shipped via `exports["./tui"]`. */
 export const BUILT_ENTRY_PATH = "dist/tui.js";
@@ -135,6 +140,19 @@ export const REQUIRED_PACKED_PATHS = [
 	"src/cloud/auth/types.ts",
 	"src/cloud/vault/keyring.ts",
 	"src/cloud/vault/types.ts",
+	// Intentional shipped state implementation (owner-requested state
+	// outbox): atomic-write store, codec, and separate vault-key provider.
+	// Exact paths only, no wildcards.
+	"src/cloud/state/index.ts",
+	"src/cloud/state/store.ts",
+	"src/cloud/state/local.ts",
+	"src/cloud/state/atomic.ts",
+	"src/cloud/state/types.ts",
+	"src/cloud/state-codec/index.ts",
+	"src/cloud/state-codec/codec.ts",
+	"src/cloud/state-codec/errors.ts",
+	"src/cloud/state-key/index.ts",
+	"src/cloud/state-key/provider.ts",
 	BUILT_ENTRY_PATH,
 	"tsconfig.json",
 ];

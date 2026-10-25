@@ -81,6 +81,34 @@ describe("packed path classification", () => {
 		expect(missing.some((problem) => problem.includes("missing required path: tui.ts"))).toBe(true);
 	});
 
+	test("intentional state modules are required exact packed paths", () => {
+		// The owner-requested state outbox ships as source under src/**. These
+		// exact paths (no wildcard) must stay required; dropping any state file
+		// from a packed listing must be reported as a missing required path.
+		const statePaths = [
+			"src/cloud/state/index.ts",
+			"src/cloud/state/store.ts",
+			"src/cloud/state/local.ts",
+			"src/cloud/state/atomic.ts",
+			"src/cloud/state/types.ts",
+			"src/cloud/state-codec/index.ts",
+			"src/cloud/state-codec/codec.ts",
+			"src/cloud/state-codec/errors.ts",
+			"src/cloud/state-key/index.ts",
+			"src/cloud/state-key/provider.ts",
+		];
+		for (const statePath of statePaths) {
+			expect(REQUIRED_PACKED_PATHS).toContain(statePath);
+			const withoutState = REQUIRED_PACKED_PATHS.filter((required) => required !== statePath);
+			const problems = checkPackedListing(withoutState);
+			expect(problems).toContain(`packed listing is missing required path: ${statePath}`);
+		}
+		// No wildcard expansion: every non-built-entry required src path is exact.
+		for (const required of REQUIRED_PACKED_PATHS) {
+			if (required.startsWith("src/")) expect(required).not.toContain("*");
+		}
+	});
+
 	test("parseNpmPackJson tolerates prepended lines and parseBunPackListing extracts packed paths", () => {
 		const npmListing = parseNpmPackJson('some lifecycle line\n[{"files":[{"path":"tui.ts"},{"path":"dist/tui.js"}]}]');
 		expect(npmListing[0]?.files?.map((file) => file.path)).toEqual(["tui.ts", "dist/tui.js"]);
@@ -107,7 +135,8 @@ describe("live dry-run pack listings", () => {
 		expect(files).toContain("dist/tui.js");
 		expect(files).toContain("src/tui.ts");
 		// Intentional M3 tarball: prior whitelist plus the shipped cloud-auth
-		// source, native wiring, and designer UI source. Measured before pinning.
+		// source, native wiring, designer UI source, and the owner-requested
+		// state outbox (state, state-codec, state-key). Measured before pinning.
 		expect(files.length).toBe(EXPECTED_PACKED_FILE_COUNT);
 		expect(files).not.toContain("bun.lock");
 		expect(files.some((file) => file.startsWith(".package-verify-work/"))).toBe(false);
