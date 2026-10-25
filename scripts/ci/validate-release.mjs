@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 /**
- * CI-02 publish-side validation (runs in the Ubuntu publish job under Node,
- * with no project installs). Rebinds the downloaded same-run artifact to this
- * exact run before publish:
- * - the artifact directory contains exactly exact.tgz / evidence.json /
- *   release-metadata.json, regular files only (symlinks rejected);
- * - exact.tgz sha256 equals the staged metadata sha256;
- * - metadata binds to manifest version, workflow tag, checked-out commit,
- *   workflow repository, and the fixed package identity;
- * - evidence.json is a successful install run (problems empty, withInstall
- *   true, all consumer results recorded) with a matching tarball digest/name;
- * - the packed package/package.json inside exact.tgz is read without disk
- *   extraction and must match the expected name/version/repository, so the
- *   metadata alone is never trusted.
+ * CI-02 publish-side validation (Ubuntu publish job, no project installs).
+ *
+ * Rebinds the downloaded evidence artifact to the independently resolved
+ * source proof and to this release run:
+ * - artifact directory contains exactly exact.tgz / evidence.json /
+ *   release-metadata.json, regular files only;
+ * - resolution document is immutable, in-repo, and matches metadata
+ *   (source run/attempt/artifact ID/digest, peeled tag commit, tag, version);
+ * - metadata workflowCommit equals this trusted workflow commit and
+ *   releaseRunID equals this run;
+ * - exact.tgz digest matches metadata; evidence is a successful install run
+ *   with all consumer results; the packed identity inside exact.tgz matches.
+ * Metadata alone is never trusted; the artifact cannot assert its own source.
  */
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -29,6 +29,7 @@ import {
 import { readGzippedTarEntry } from "./tarball-members.mjs";
 
 export const ARTIFACT_DIR_NAME = "release-artifact";
+export const RESOLUTION_FILE_NAME = "resolved-source.json";
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 
 export function sha256File(file) {
@@ -50,7 +51,25 @@ function readJsonBounded(file) {
 	}
 }
 
-export function validateReleaseArtifact({ artifactDir = ARTIFACT_DIR_NAME, env = process.env, manifestVersion } = {}) {
+function evaluateResolution(resolution) {
+	const problems = [];
+	if (resolution === null || typeof resolution !== "object" || Array.isArray(resolution)) {
+		return { source: null, problems: ["resolved source proof is missing"] };
+	}
+	const keys = ["commit", "repo", "sourceArtifactDigest", "sourceArtifactID", "sourceRunAttempt", "sourceRunID", "tag", "version"].sort();
+	if (JSON.stringify(Object.keys(resolution).sort()) !== JSON.stringify(keys)) {
+		problems.push("resolved source proof has unexpected or missing fields");
+	}
+	if (resolution.repo !== "maivand-rahmani/opencode-session-port") problems.push("resolved source repository mismatch");
+	return { source: resolution, problems };
+}
+
+export function validateReleaseArtifact({
+	artifactDir = ARTIFACT_DIR_NAME,
+	resolutionFile = path.join(path.dirname(artifactDir), "release-resolution", RESOLUTION_FILE_NAME),
+	env = process.env,
+	manifestVersion,
+} = {}) {
 	const problems = [];
 	const dir = path.resolve(artifactDir);
 	let entries = [];
@@ -77,10 +96,26 @@ export function validateReleaseArtifact({ artifactDir = ARTIFACT_DIR_NAME, env =
 	if (metadataRead.error !== null) problems.push(`release-metadata.json: ${metadataRead.error}`);
 	const evidenceRead = readJsonBounded(path.join(dir, "evidence.json"));
 	if (evidenceRead.error !== null) problems.push(`evidence.json: ${evidenceRead.error}`);
-	const tagRef = env.GITHUB_REF_NAME ?? "";
+	const resolutionRead = readJsonBounded(resolutionFile);
+	if (resolutionRead.error !== null) problems.push(`resolved-source.json: ${resolutionRead.error}`);
+	const resolution = evaluateResolution(resolutionRead.value);
+	problems.push(...resolution.problems);
+	const source = resolution.source;
+	const tagRef = source !== null && typeof source === "object" ? source.tag : "";
 	const version = tagVersion(tagRef);
-	let tarballSha256 = null;
+	if (version === null) problems.push(`resolved tag must match "v<version>" (got ${JSON.stringify(tagRef)})`);
+	if (source !== null && source.version !== version) problems.push("resolved version must equal the resolved tag version");
+	const approvedVersion = env.SESSIONPORT_RELEASE_VERSION ?? "";
+	if (source !== null && source.version !== approvedVersion) {
+		problems.push("resolved version must equal the owner-approved version");
+	}
+	const artifactManifestVersion = source !== null && typeof source === "object" ? source.version : null;
+	if (source !== null && source.tag !== env.GITHUB_REF_NAME && env.GITHUB_EVENT_NAME !== "workflow_dispatch") {
+		problems.push("resolved tag must equal the pushed tag ref");
+	}
+	lstatSync(path.join(dir, "exact.tgz"));
 	const tarballPath = path.join(dir, "exact.tgz");
+	let tarballSha256 = null;
 	try {
 		tarballSha256 = sha256File(tarballPath);
 	} catch (error) {
@@ -103,26 +138,24 @@ export function validateReleaseArtifact({ artifactDir = ARTIFACT_DIR_NAME, env =
 			problems.push(`exact.tgz could not be inspected: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	if (version === null) {
-		problems.push(`workflow tag must match "v<version>" (got ${JSON.stringify(tagRef)})`);
-		problems.push(...evaluateEvidence(evidenceRead.value, { sha256: tarballSha256 ?? undefined }).problems);
-	} else {
-		problems.push(
-			...evaluateEvidence(evidenceRead.value, {
-				sha256: tarballSha256 ?? undefined,
-				expectedTarballBasename: `${EXPECTED_PACKAGE_NAME}-${version}.tgz`,
-			}).problems,
-		);
-	}
+	problems.push(
+		...evaluateEvidence(evidenceRead.value, {
+			sha256: tarballSha256 ?? undefined,
+			expectedTarballBasename: version === null ? undefined : `${EXPECTED_PACKAGE_NAME}-${version}.tgz`,
+		}).problems,
+	);
 	problems.push(
 		...evaluateReleaseBindings({
 			metadata: metadataRead.value,
-			manifestVersion,
+			manifestVersion: artifactManifestVersion,
 			tagRef,
-			commit: env.GITHUB_SHA ?? "",
+			commit: source !== null && typeof source === "object" ? source.commit : "",
 			repoSlug: env.GITHUB_REPOSITORY ?? "",
 			tarballSha256,
 			packedManifest,
+			source,
+			workflowCommit: env.GITHUB_SHA ?? "",
+			releaseRunID: env.GITHUB_RUN_ID ?? "",
 		}).problems,
 	);
 	return { ok: problems.length === 0, version, tarballSha256, problems };
@@ -131,20 +164,17 @@ export function validateReleaseArtifact({ artifactDir = ARTIFACT_DIR_NAME, env =
 async function main() {
 	const args = process.argv.slice(2);
 	let artifactDir = ARTIFACT_DIR_NAME;
+	let resolutionFile = path.join("release-resolution", RESOLUTION_FILE_NAME);
 	for (let index = 0; index < args.length; index += 1) {
 		if (args[index] === "--artifact-dir" && typeof args[index + 1] === "string") {
 			artifactDir = args[index + 1];
 			index += 1;
+		} else if (args[index] === "--resolution" && typeof args[index + 1] === "string") {
+			resolutionFile = args[index + 1];
+			index += 1;
 		}
 	}
-	let manifestVersion = null;
-	try {
-		const parsed = JSON.parse(readFileSync("package.json", "utf8"));
-		manifestVersion = typeof parsed.version === "string" && parsed.version !== "" ? parsed.version : null;
-	} catch {
-		manifestVersion = null;
-	}
-	const summary = validateReleaseArtifact({ artifactDir, manifestVersion });
+	const summary = validateReleaseArtifact({ artifactDir, resolutionFile, manifestVersion: process.env.SESSIONPORT_RELEASE_VERSION ?? null });
 	console.log(
 		JSON.stringify(
 			{

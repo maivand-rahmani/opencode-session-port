@@ -30,16 +30,39 @@ const goodEvidence = {
 	tarball: { path: `C:\\repo\\.package-verify-work\\abc\\tarball\\${TARBALL_NAME}`, sha256: SHA },
 };
 
+const SOURCE = {
+	tag: `v${VERSION}`,
+	sourceRunID: "12345",
+	sourceRunAttempt: "1",
+	sourceArtifactID: "67890",
+	sourceArtifactDigest: `sha256:${SHA}`,
+};
+const WORKFLOW_COMMIT = "b".repeat(40);
+const RELEASE_RUN_ID = "99999";
+
 const goodEnv = {
 	enabled: "true",
 	approvedVersion: VERSION,
-	tagRef: `v${VERSION}`,
-	manifestVersion: VERSION,
+	dispatchTag: `v${VERSION}`,
+	eventName: "workflow_dispatch",
+	ref: "refs/heads/main",
 	repoSlug: EXPECTED_REPO_SLUG,
 };
 
 function goodMetadata() {
-	const result = buildReleaseMetadata({ version: VERSION, commit: COMMIT, tag: `v${VERSION}`, sha256: SHA, repo: EXPECTED_REPO_SLUG });
+	const result = buildReleaseMetadata({
+		version: VERSION,
+		commit: COMMIT,
+		tag: `v${VERSION}`,
+		sha256: SHA,
+		repo: EXPECTED_REPO_SLUG,
+		sourceRunID: "12345",
+		sourceRunAttempt: "1",
+		sourceArtifactID: "67890",
+		sourceArtifactDigest: `sha256:${SHA}`,
+		workflowCommit: WORKFLOW_COMMIT,
+		releaseRunID: RELEASE_RUN_ID,
+	});
 	return result.metadata;
 }
 
@@ -58,6 +81,9 @@ function goodBindings() {
 		repoSlug: EXPECTED_REPO_SLUG,
 		tarballSha256: SHA,
 		packedManifest,
+		source: SOURCE,
+		workflowCommit: WORKFLOW_COMMIT,
+		releaseRunID: RELEASE_RUN_ID,
 	};
 }
 
@@ -75,40 +101,32 @@ describe("tagVersion", () => {
 });
 
 describe("evaluateReleaseGate", () => {
-	test("opens only for enabled + approved + matching tag/manifest/repo", () => {
+	test("opens only for a main dispatch with the approved tag and enabled flag", () => {
 		expect(evaluateReleaseGate(goodEnv)).toEqual({ ok: true, version: VERSION, problems: [] });
 	});
-	test("absent enable flag blocks", () => {
-		const result = evaluateReleaseGate({ ...goodEnv, enabled: "" });
-		expect(result.ok).toBe(false);
-		expect(result.problems.join(" ")).toContain("SESSIONPORT_RELEASE_ENABLED");
+	test("rejects tag pushes even with a v* ref", () => {
+		expect(evaluateReleaseGate({ ...goodEnv, eventName: "push", ref: `refs/tags/v${VERSION}` }).ok).toBe(false);
 	});
-	test("only the exact true string enables release", () => {
+	test("rejects non-main dispatch refs", () => {
+		expect(evaluateReleaseGate({ ...goodEnv, ref: `refs/tags/v${VERSION}` }).ok).toBe(false);
+		expect(evaluateReleaseGate({ ...goodEnv, ref: "refs/heads/feature" }).ok).toBe(false);
+	});
+	test("requires enabled exactly true and a non-empty tag input", () => {
+		expect(evaluateReleaseGate({ ...goodEnv, enabled: "" }).ok).toBe(false);
 		expect(evaluateReleaseGate({ ...goodEnv, enabled: "TRUE" }).ok).toBe(false);
-		expect(evaluateReleaseGate({ ...goodEnv, enabled: "1" }).ok).toBe(false);
+		expect(evaluateReleaseGate({ ...goodEnv, dispatchTag: "" }).ok).toBe(false);
 	});
-	test("absent or mismatched approved version blocks", () => {
+	test("approved version must equal the tag version and immutable versions block", () => {
 		expect(evaluateReleaseGate({ ...goodEnv, approvedVersion: "" }).ok).toBe(false);
-		const mismatch = evaluateReleaseGate({ ...goodEnv, approvedVersion: "0.2.1" });
-		expect(mismatch.ok).toBe(false);
-		expect(mismatch.problems.join(" ")).toContain("SESSIONPORT_RELEASE_VERSION");
+		expect(evaluateReleaseGate({ ...goodEnv, approvedVersion: "0.2.1" }).ok).toBe(false);
+		expect(evaluateReleaseGate({ ...goodEnv, dispatchTag: "0.1.7" }).ok).toBe(false);
+		const immutable = evaluateReleaseGate({ ...goodEnv, dispatchTag: "v0.1.6", approvedVersion: "0.1.6" });
+		expect(immutable.ok).toBe(false);
+		expect(immutable.problems.join(";")).toContain("immutable");
 	});
-	test("tag must be v<version>", () => {
-		expect(evaluateReleaseGate({ ...goodEnv, tagRef: VERSION }).ok).toBe(false);
-	});
-	test("manifest version must equal the tag version", () => {
-		expect(evaluateReleaseGate({ ...goodEnv, manifestVersion: "0.1.6" }).ok).toBe(false);
-	});
-	test("immutable versions never release again", () => {
-		const result = evaluateReleaseGate({
-			enabled: "true",
-			approvedVersion: "0.1.6",
-			tagRef: "v0.1.6",
-			manifestVersion: "0.1.6",
-			repoSlug: EXPECTED_REPO_SLUG,
-		});
-		expect(result.ok).toBe(false);
-		expect(result.problems.join(" ")).toContain("immutable");
+	test("does not require the current checkout package.json version", () => {
+		// main may have advanced to 0.1.8 while resuming the 0.1.7 artifact.
+		expect(evaluateReleaseGate({ ...goodEnv, manifestVersion: "0.1.8" }).ok).toBe(true);
 	});
 	test("repository identity is enforced (case-insensitive slug match)", () => {
 		expect(evaluateReleaseGate({ ...goodEnv, repoSlug: "attacker/repo" }).ok).toBe(false);
@@ -117,17 +135,16 @@ describe("evaluateReleaseGate", () => {
 });
 
 describe("buildReleaseMetadata", () => {
-	test("builds the exact six-key metadata for valid input", () => {
-		const result = buildReleaseMetadata({ version: VERSION, commit: COMMIT, tag: `v${VERSION}`, sha256: SHA, repo: EXPECTED_REPO_SLUG });
-		expect(result.ok).toBe(true);
-		expect(result.metadata).toEqual({
-			name: EXPECTED_PACKAGE_NAME,
-			version: VERSION,
-			commit: COMMIT,
-			tag: `v${VERSION}`,
-			sha256: SHA,
-			repo: EXPECTED_REPO_SLUG,
-		});
+	test("builds the exact twelve-key metadata for valid input", () => {
+		const metadata = goodMetadata();
+		expect(Object.keys(metadata).sort()).toEqual([
+			"commit", "name", "releaseRunID", "repo", "sha256", "sourceArtifactDigest",
+			"sourceArtifactID", "sourceRunAttempt", "sourceRunID", "tag", "version", "workflowCommit",
+		]);
+		expect(metadata.sourceRunID).toBe("12345");
+		expect(metadata.sourceArtifactDigest).toBe(`sha256:${SHA}`);
+		expect(metadata.workflowCommit).toBe(WORKFLOW_COMMIT);
+		expect(metadata.releaseRunID).toBe(RELEASE_RUN_ID);
 	});
 	test("rejects malformed commit, sha, tag, version, and repo", () => {
 		expect(buildReleaseMetadata({ version: VERSION, commit: "zz", tag: `v${VERSION}`, sha256: SHA, repo: EXPECTED_REPO_SLUG }).ok).toBe(false);
@@ -200,6 +217,10 @@ describe("evaluateReleaseBindings", () => {
 		expect(evaluateReleaseBindings({ ...goodBindings(), tagRef: "v0.2.1" }).ok).toBe(false);
 		expect(evaluateReleaseBindings({ ...goodBindings(), manifestVersion: "0.1.6" }).ok).toBe(false);
 		expect(evaluateReleaseBindings({ ...goodBindings(), repoSlug: "attacker/repo" }).ok).toBe(false);
+		expect(evaluateReleaseBindings({ ...goodBindings(), source: { ...SOURCE, sourceRunID: "55555" } }).ok).toBe(false);
+		expect(evaluateReleaseBindings({ ...goodBindings(), source: { ...SOURCE, sourceArtifactDigest: `sha256:${"d".repeat(64)}` } }).ok).toBe(false);
+		expect(evaluateReleaseBindings({ ...goodBindings(), workflowCommit: "c".repeat(40) }).ok).toBe(false);
+		expect(evaluateReleaseBindings({ ...goodBindings(), releaseRunID: "11111" }).ok).toBe(false);
 	});
 	test("rejects metadata with unknown or missing keys", () => {
 		const extra = { ...goodMetadata(), unexpected: true };

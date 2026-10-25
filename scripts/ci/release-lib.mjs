@@ -24,7 +24,22 @@ export const ARTIFACT_FILE_NAMES = Object.freeze(["evidence.json", "exact.tgz", 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-const METADATA_KEYS = Object.freeze(["commit", "name", "repo", "sha256", "tag", "version"]);
+const METADATA_KEYS = Object.freeze([
+	"commit",
+	"name",
+	"releaseRunID",
+	"repo",
+	"sha256",
+	"sourceArtifactDigest",
+	"sourceArtifactID",
+	"sourceRunAttempt",
+	"sourceRunID",
+	"tag",
+	"version",
+	"workflowCommit",
+]);
+const SOURCE_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
+const ARTIFACT_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 export function tagVersion(refName) {
 	if (typeof refName !== "string" || !refName.startsWith(RELEASE_TAG_PREFIX)) return null;
@@ -37,15 +52,20 @@ export function sameRepoSlug(left, right) {
 }
 
 /**
- * Fail-closed release gate, evaluated identically in both jobs before any
- * expensive work and again before publish. Absent owner variables block.
+ * Fail-closed release gate. Dispatch-only from the trusted main branch with
+ * exactly one effective tag input; owner variables and immutable versions are
+ * checked here. The artifact's own version is validated later against the
+ * packed manifest, never against the current checkout's package.json (which
+ * may have advanced past the tag being resumed).
  */
 export function evaluateReleaseGate({
 	enabled,
 	approvedVersion,
 	tagRef,
-	manifestVersion,
 	repoSlug,
+	eventName = "workflow_dispatch",
+	ref = "",
+	dispatchTag = "",
 	expectedRepoSlug = EXPECTED_REPO_SLUG,
 	immutableVersions = IMMUTABLE_VERSIONS,
 } = {}) {
@@ -53,17 +73,23 @@ export function evaluateReleaseGate({
 	if (enabled !== "true") {
 		problems.push('SESSIONPORT_RELEASE_ENABLED must be exactly "true" (absent or any other value blocks the release)');
 	}
-	const version = tagVersion(tagRef);
+	if (eventName !== "workflow_dispatch") {
+		problems.push(`release must be an explicit workflow_dispatch from main (got ${JSON.stringify(eventName)})`);
+	}
+	if (ref !== "refs/heads/main") {
+		problems.push(`workflow_dispatch is only allowed from refs/heads/main (got ${JSON.stringify(ref ?? "")})`);
+	}
+	if (typeof dispatchTag !== "string" || dispatchTag === "") {
+		problems.push("workflow_dispatch requires exactly one non-empty tag input");
+	}
+	const version = tagVersion(dispatchTag);
 	if (version === null) {
-		problems.push(`release tag must match "v<version>" (got ${JSON.stringify(tagRef ?? "")})`);
+		problems.push(`release tag must match "v<version>" (got ${JSON.stringify(dispatchTag ?? "")})`);
 	}
 	if (typeof approvedVersion !== "string" || approvedVersion === "") {
 		problems.push("SESSIONPORT_RELEASE_VERSION must be set to the exact owner-approved version");
 	} else if (version !== null && approvedVersion !== version) {
 		problems.push(`SESSIONPORT_RELEASE_VERSION (${approvedVersion}) must equal the tag version (${version})`);
-	}
-	if (version !== null && manifestVersion !== version) {
-		problems.push(`package.json version (${JSON.stringify(manifestVersion ?? null)}) must equal the tag version (${version})`);
 	}
 	if (version !== null && immutableVersions.includes(version)) {
 		problems.push(`version ${version} is immutable and can never be published again`);
@@ -75,7 +101,20 @@ export function evaluateReleaseGate({
 }
 
 /** Build the exact staged release metadata object; rejects any other identity. */
-export function buildReleaseMetadata({ version, commit, tag, sha256, repo, name = EXPECTED_PACKAGE_NAME }) {
+export function buildReleaseMetadata({
+	version,
+	commit,
+	tag,
+	sha256,
+	repo,
+	name = EXPECTED_PACKAGE_NAME,
+	sourceRunID,
+	sourceRunAttempt,
+	sourceArtifactID,
+	sourceArtifactDigest,
+	workflowCommit,
+	releaseRunID,
+}) {
 	const problems = [];
 	if (typeof version !== "string" || !VERSION_PATTERN.test(version)) {
 		problems.push(`release version is malformed: ${JSON.stringify(version ?? null)}`);
@@ -95,6 +134,22 @@ export function buildReleaseMetadata({ version, commit, tag, sha256, repo, name 
 	if (!sameRepoSlug(repo, EXPECTED_REPO_SLUG)) {
 		problems.push(`repository must be ${EXPECTED_REPO_SLUG} (got ${JSON.stringify(repo ?? "")})`);
 	}
+	for (const [label, value] of [
+		["sourceRunID", sourceRunID],
+		["sourceRunAttempt", sourceRunAttempt],
+		["sourceArtifactID", sourceArtifactID],
+		["releaseRunID", releaseRunID],
+	]) {
+		if (typeof value !== "string" || !SOURCE_ID_PATTERN.test(value)) {
+			problems.push(`${label} must be a positive integer string (got ${JSON.stringify(value ?? null)})`);
+		}
+	}
+	if (typeof sourceArtifactDigest !== "string" || !ARTIFACT_DIGEST_PATTERN.test(sourceArtifactDigest)) {
+		problems.push(`sourceArtifactDigest must be sha256:<64 lowercase hex> (got ${JSON.stringify(sourceArtifactDigest ?? null)})`);
+	}
+	if (typeof workflowCommit !== "string" || !COMMIT_PATTERN.test(workflowCommit)) {
+		problems.push(`workflowCommit must be a 40-hex SHA (got ${JSON.stringify(workflowCommit ?? null)})`);
+	}
 	const metadata = {
 		name: EXPECTED_PACKAGE_NAME,
 		version: String(version),
@@ -102,6 +157,12 @@ export function buildReleaseMetadata({ version, commit, tag, sha256, repo, name 
 		tag: String(tag),
 		sha256: String(sha256),
 		repo: EXPECTED_REPO_SLUG,
+		sourceRunID: String(sourceRunID),
+		sourceRunAttempt: String(sourceRunAttempt),
+		sourceArtifactID: String(sourceArtifactID),
+		sourceArtifactDigest: String(sourceArtifactDigest),
+		workflowCommit: String(workflowCommit),
+		releaseRunID: String(releaseRunID),
 	};
 	return { ok: problems.length === 0, metadata, problems };
 }
@@ -210,7 +271,18 @@ export function evaluateStagedNames(entries) {
  * and the packed package identity inside the tarball (metadata alone is not
  * trusted).
  */
-export function evaluateReleaseBindings({ metadata, manifestVersion, tagRef, commit, repoSlug, tarballSha256, packedManifest }) {
+export function evaluateReleaseBindings({
+	metadata,
+	manifestVersion,
+	tagRef,
+	commit,
+	repoSlug,
+	tarballSha256,
+	packedManifest,
+	source,
+	workflowCommit,
+	releaseRunID,
+}) {
 	if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
 		return { ok: false, problems: ["release-metadata.json must be a JSON object"] };
 	}
@@ -239,7 +311,25 @@ export function evaluateReleaseBindings({ metadata, manifestVersion, tagRef, com
 		}
 	}
 	if (metadata.commit !== commit) {
-		problems.push(`metadata commit (${JSON.stringify(metadata.commit ?? null)}) must equal the checked-out commit (${JSON.stringify(commit ?? null)})`);
+		problems.push(`metadata commit (${JSON.stringify(metadata.commit ?? null)}) must equal the peeled tag commit (${JSON.stringify(commit ?? null)})`);
+	}
+	if (source === null || typeof source !== "object" || Array.isArray(source)) {
+		problems.push("resolved source proof is missing");
+	} else {
+		for (const key of ["sourceRunID", "sourceRunAttempt", "sourceArtifactID", "sourceArtifactDigest"]) {
+			if (metadata[key] !== source[key]) {
+				problems.push(`metadata ${key} (${JSON.stringify(metadata[key] ?? null)}) must equal the resolved source (${JSON.stringify(source[key] ?? null)})`);
+			}
+		}
+		if (metadata.tag !== source.tag) {
+			problems.push("metadata tag must equal the resolved tag");
+		}
+	}
+	if (metadata.workflowCommit !== workflowCommit) {
+		problems.push(`metadata workflowCommit (${JSON.stringify(metadata.workflowCommit ?? null)}) must equal the trusted workflow commit (${JSON.stringify(workflowCommit ?? null)})`);
+	}
+	if (metadata.releaseRunID !== releaseRunID) {
+		problems.push(`metadata releaseRunID (${JSON.stringify(metadata.releaseRunID ?? null)}) must equal this release run (${JSON.stringify(releaseRunID ?? null)})`);
 	}
 	if (typeof metadata.sha256 !== "string" || !SHA256_PATTERN.test(metadata.sha256)) {
 		problems.push("metadata sha256 must be 64 lowercase hex");

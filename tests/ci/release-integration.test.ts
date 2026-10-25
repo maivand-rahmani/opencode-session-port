@@ -151,8 +151,19 @@ function writeCandidate(
 function releaseEnv(version: string): Record<string, string> {
 	return {
 		GITHUB_REF_NAME: `v${version}`,
+		GITHUB_REF: "refs/heads/main",
+		GITHUB_EVENT_NAME: "workflow_dispatch",
 		GITHUB_SHA: fixtureCommit,
+		SESSIONPORT_RELEASE_DISPATCH_TAG: `v${version}`,
+		GITHUB_RUN_ID: "99999",
 		GITHUB_REPOSITORY: expectedRepo,
+		SESSIONPORT_RELEASE_VERSION: version,
+		SOURCE_RUN_ID: "12345",
+		SOURCE_RUN_ATTEMPT: "1",
+		SOURCE_ARTIFACT_ID: "67890",
+		SOURCE_ARTIFACT_DIGEST: `sha256:${"a".repeat(64)}`,
+		WORKFLOW_COMMIT: fixtureCommit,
+		RELEASE_RUN_ID: "99999",
 	};
 }
 
@@ -182,7 +193,26 @@ function runCli(cwd: string, script: string, args: string[] = [], env: Record<st
 }
 
 function stage(root: string, version = "0.2.0"): CliResult {
-	return runCli(root, "stage-release-artifact.mjs", [], releaseEnv(version));
+	const result = runCli(root, "stage-release-artifact.mjs", [], releaseEnv(version));
+	if (result.status === 0) {
+		const metadata = JSON.parse(readFileSync(path.join(root, "release-artifact", "release-metadata.json"), "utf8"));
+		const resolution = path.join(root, "release-resolution");
+		mkdirSync(resolution, { recursive: true });
+		writeFileSync(
+			path.join(resolution, "resolved-source.json"),
+			`${JSON.stringify({
+				repo: expectedRepo,
+				tag: metadata.tag,
+				version: metadata.version,
+				commit: metadata.commit,
+				sourceRunID: metadata.sourceRunID,
+				sourceRunAttempt: metadata.sourceRunAttempt,
+				sourceArtifactID: metadata.sourceArtifactID,
+				sourceArtifactDigest: metadata.sourceArtifactDigest,
+			}, null, 2)}\n`,
+		);
+	}
+	return result;
 }
 
 function validate(root: string, version = "0.2.0", artifactDir = "release-artifact"): CliResult {
@@ -209,6 +239,12 @@ describe("CI-02 CLI integration: staging and publish-side validation", () => {
 			tag: "v0.2.0",
 			sha256: candidate.sha256,
 			repo: expectedRepo,
+			sourceRunID: "12345",
+			sourceRunAttempt: "1",
+			sourceArtifactID: "67890",
+			sourceArtifactDigest: `sha256:${"a".repeat(64)}`,
+			workflowCommit: fixtureCommit,
+			releaseRunID: "99999",
 		});
 		expect(sha256(readFileSync(path.join(artifactDir, "exact.tgz"))) ).toBe(candidate.sha256);
 
@@ -240,6 +276,24 @@ describe("CI-02 CLI integration: staging and publish-side validation", () => {
 		});
 		expect(blocked.status).toBe(1);
 		expect(blocked.stdout).toContain("immutable");
+
+		// Tag pushes are rejected even when the ref is a v* tag.
+		const push = runCli(futureRoot, "release-gate.mjs", [], {
+			...releaseEnv("0.2.0"),
+			GITHUB_EVENT_NAME: "push",
+			GITHUB_REF: "refs/tags/v0.2.0",
+			SESSIONPORT_RELEASE_ENABLED: "true",
+			SESSIONPORT_RELEASE_VERSION: "0.2.0",
+		});
+		expect(push.status).toBe(1);
+		// Non-main dispatch is rejected.
+		const feature = runCli(futureRoot, "release-gate.mjs", [], {
+			...releaseEnv("0.2.0"),
+			GITHUB_REF: "refs/heads/feature",
+			SESSIONPORT_RELEASE_ENABLED: "true",
+			SESSIONPORT_RELEASE_VERSION: "0.2.0",
+		});
+		expect(feature.status).toBe(1);
 	});
 
 	test("tampered tarball bytes are rejected by the publish validator", () => {
@@ -369,4 +423,103 @@ describe("CI-02 CLI integration: staging and publish-side validation", () => {
 		expect(staged.status).toBe(1);
 		expect(staged.stderr).toContain("escapes its scratch directory");
 	});
+
+
+test("artifact version wins over an advanced checkout package.json (0.1.7 artifact, 0.1.8 checkout)", () => {
+	const root = newWorkspace();
+	// Trusted main checkout version differs from the resumed artifact.
+	writeFixtureManifest(root, "0.1.8");
+	writeCandidate(root, { version: "0.1.7" });
+	expect(stage(root, "0.1.7").status).toBe(0);
+	for (const file of ["evidence.json", "release-metadata.json"]) {
+		expect(readFileSync(path.join(root, "release-artifact", file), "utf8")).toContain("0.1.7");
+	}
+	const validated = validate(root, "0.1.7");
+	expect(validated.status).toBe(0);
+	expect(JSON.parse(validated.stdout).version).toBe("0.1.7");
+});
+
+test("downloaded CI layout with a stale Windows absolute evidence path stages and validates", () => {
+	const root = newWorkspace();
+	writeFixtureManifest(root, "0.1.8");
+	const downloaded = path.join(root, "release-downloaded", "runid-artifact");
+	mkdirSync(path.join(downloaded, "tarball"), { recursive: true });
+	const bytes = buildTarball(packedManifest("0.1.7"));
+	const tarballName = "opencode-session-port-0.1.7.tgz";
+	writeFileSync(path.join(downloaded, "tarball", tarballName), bytes);
+	const digest = sha256(bytes);
+	const staleWindowsPath = `D:\\a\\opencode-session-port\\opencode-session-port\\.package-verify-work\\x\\tarball\\${tarballName}`;
+	writeFileSync(
+		path.join(downloaded, "evidence.json"),
+		`${JSON.stringify({
+			withInstall: true,
+			problems: [],
+			consumers: { npmBaseline: { files: [] }, npmHostPeers: { files: [] }, bunBaseline: { files: [] } },
+			tarball: { path: staleWindowsPath, sha256: digest },
+		}, null, 2)}\n`,
+	);
+	const resolutionDir = path.join(root, "release-resolution");
+	mkdirSync(resolutionDir, { recursive: true });
+	writeFileSync(
+		path.join(resolutionDir, "resolved-source.json"),
+		`${JSON.stringify({
+			repo: expectedRepo,
+			tag: "v0.1.7",
+			version: "0.1.7",
+			commit: fixtureCommit,
+			sourceRunID: "40212562472",
+			sourceRunAttempt: "1",
+			sourceArtifactID: "12606815301",
+			sourceArtifactDigest: `sha256:${"a".repeat(64)}`,
+		}, null, 2)}\n`,
+	);
+	const staged = runCli(root, "stage-release-artifact.mjs", [
+		"--downloaded", "release-downloaded",
+		"--out", "release-artifact",
+		"--resolution", "release-resolution/resolved-source.json",
+	], { ...releaseEnv("0.1.7") });
+	expect(staged.status).toBe(0);
+	expect(sha256(readFileSync(path.join(root, "release-artifact", "exact.tgz")))).toBe(digest);
+	expect(JSON.parse(staged.stdout).metadata.commit).toBe(fixtureCommit);
+	const validated = validate(root, "0.1.7");
+	expect(validated.status).toBe(0);
+});
+
+test("downloaded layout rejects unexpected files and digest mismatches", () => {
+	for (const mode of ["unexpected", "digest"]) {
+		const root = newWorkspace();
+		writeFixtureManifest(root, "0.1.7");
+		const downloaded = path.join(root, "release-downloaded");
+		mkdirSync(downloaded, { recursive: true });
+		const bytes = buildTarball(packedManifest("0.1.7"));
+		writeFileSync(path.join(downloaded, "opencode-session-port-0.1.7.tgz"), bytes);
+		writeFileSync(
+			path.join(downloaded, "evidence.json"),
+			JSON.stringify({
+				withInstall: true,
+				problems: [],
+				consumers: { npmBaseline: {}, npmHostPeers: {}, bunBaseline: {} },
+				tarball: {
+					path: "D:\\stale\\opencode-session-port-0.1.7.tgz",
+					sha256: mode === "digest" ? "e".repeat(64) : sha256(bytes),
+				},
+			}),
+		);
+		if (mode === "unexpected") writeFileSync(path.join(downloaded, "payload.exe"), "x");
+		const resolutionDir = path.join(root, "release-resolution");
+		mkdirSync(resolutionDir, { recursive: true });
+		writeFileSync(
+			path.join(resolutionDir, "resolved-source.json"),
+			JSON.stringify({
+				repo: expectedRepo, tag: "v0.1.7", version: "0.1.7", commit: fixtureCommit,
+				sourceRunID: "1", sourceRunAttempt: "1", sourceArtifactID: "2", sourceArtifactDigest: `sha256:${"a".repeat(64)}`,
+			}),
+		);
+		const staged = runCli(root, "stage-release-artifact.mjs", [
+			"--downloaded", "release-downloaded", "--out", "release-artifact",
+			"--resolution", "release-resolution/resolved-source.json",
+		], releaseEnv("0.1.7"));
+		expect(staged.status).toBe(1);
+	}
+});
 });
