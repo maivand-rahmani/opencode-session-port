@@ -124,6 +124,7 @@ jobs:
       - name: Fail if the exact version already exists on npm
         env:
           SESSIONPORT_RELEASE_VERSION: ${{ vars.SESSIONPORT_RELEASE_VERSION }}
+          SESSIONPORT_RELEASE_TAG: ${{ inputs.tag }}
         run: node scripts/ci/registry-check.mjs --artifact-dir release-artifact
 
       - name: Publish exact tarball via OIDC (no token fallback)

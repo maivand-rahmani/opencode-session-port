@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { checkVersionAbsent, classifyRegistryResponse } from "../../scripts/ci/registry-check.mjs";
+import { checkVersionAbsent, classifyRegistryResponse, evaluateRegistryIdentity } from "../../scripts/ci/registry-check.mjs";
 
 /**
  * Synthetic tests for the fail-closed npm version existence check. The fetch
@@ -11,6 +11,102 @@ type FetchLike = (url: string, init: any) => Promise<any>;
 function jsonResponse(status: number, body: unknown): FetchLike {
 	return async () => ({ status, text: async () => JSON.stringify(body) });
 }
+
+const stagedMetadata = (overrides: Record<string, unknown> = {}) => ({
+	name: "opencode-session-port",
+	version: "0.1.7",
+	commit: "0123456789abcdef0123456789abcdef01234567",
+	tag: "v0.1.7",
+	sha256: "a".repeat(64),
+	repo: "maivand-rahmani/opencode-session-port",
+	sourceRunID: "40212562472",
+	sourceRunAttempt: "1",
+	sourceArtifactID: "12606815301",
+	sourceArtifactDigest: `sha256:${"b".repeat(64)}`,
+	workflowCommit: "0123456789abcdef0123456789abcdef01234567",
+	releaseRunID: "40304262173",
+	...overrides,
+});
+
+/** Dispatch env for the 0.1.7 resume: the ref is main, the tag is explicit. */
+const dispatchEnv = {
+	GITHUB_REF_NAME: "main",
+	SESSIONPORT_RELEASE_TAG: "v0.1.7",
+	SESSIONPORT_RELEASE_VERSION: "0.1.7",
+} as Record<string, string>;
+
+describe("evaluateRegistryIdentity", () => {
+	test("accepts staged 0.1.7 metadata with an explicit v0.1.7 dispatch tag from main", () => {
+		const result = evaluateRegistryIdentity({
+			metadata: stagedMetadata(),
+			tag: dispatchEnv.SESSIONPORT_RELEASE_TAG,
+			approvedVersion: dispatchEnv.SESSIONPORT_RELEASE_VERSION,
+		});
+		expect(result).toEqual({ ok: true, version: "0.1.7", problems: [] });
+	});
+
+	test("missing explicit tag aborts even when the dispatcher ref is main", () => {
+		const result = evaluateRegistryIdentity({
+			metadata: stagedMetadata(),
+			tag: "",
+			approvedVersion: dispatchEnv.SESSIONPORT_RELEASE_VERSION,
+		});
+		expect(result.ok).toBe(false);
+		expect(result.problems.join(" ")).toContain("SESSIONPORT_RELEASE_TAG");
+	});
+
+	test("tag/version and metadata-tag mismatches abort", () => {
+		const versionMismatch = evaluateRegistryIdentity({
+			metadata: stagedMetadata(),
+			tag: "v0.1.8",
+			approvedVersion: dispatchEnv.SESSIONPORT_RELEASE_VERSION,
+		});
+		expect(versionMismatch.ok).toBe(false);
+		expect(versionMismatch.problems.join(" ")).toContain("must match the metadata version");
+
+		const metadataTagMismatch = evaluateRegistryIdentity({
+			metadata: stagedMetadata({ tag: "v0.1.8" }),
+			tag: "v0.1.7",
+			approvedVersion: dispatchEnv.SESSIONPORT_RELEASE_VERSION,
+		});
+		expect(metadataTagMismatch.ok).toBe(false);
+		expect(metadataTagMismatch.problems.join(" ")).toContain("metadata tag");
+	});
+
+	test("approved version mismatch aborts before any registry request", () => {
+		const result = evaluateRegistryIdentity({
+			metadata: stagedMetadata(),
+			tag: dispatchEnv.SESSIONPORT_RELEASE_TAG,
+			approvedVersion: "0.1.8",
+		});
+		expect(result.ok).toBe(false);
+		expect(result.problems.join(" ")).toContain("SESSIONPORT_RELEASE_VERSION");
+	});
+
+	test("malformed or non-release metadata fails closed", () => {
+		expect(
+			evaluateRegistryIdentity({
+				metadata: stagedMetadata({ name: "attacker-pkg" }),
+				tag: "v0.1.7",
+				approvedVersion: "0.1.7",
+			}).ok,
+		).toBe(false);
+		expect(
+			evaluateRegistryIdentity({
+				metadata: stagedMetadata({ version: "" }),
+				tag: "v0.1.7",
+				approvedVersion: "0.1.7",
+			}).ok,
+		).toBe(false);
+		expect(
+			evaluateRegistryIdentity({
+				metadata: stagedMetadata(),
+				tag: "main",
+				approvedVersion: "0.1.7",
+			}).ok,
+		).toBe(false);
+	});
+});
 
 describe("classifyRegistryResponse", () => {
 	test("200 with a version document means the version exists", () => {
