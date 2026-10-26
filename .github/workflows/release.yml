@@ -135,4 +135,4 @@ jobs:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/.ci-npmrc-empty
         run: |
           : > "$NPM_CONFIG_USERCONFIG"
-          npm publish ./exact.tgz --provenance --ignore-scripts --registry=https://registry.npmjs.org
+          node ../scripts/ci/publish-with-diagnostics.mjs
