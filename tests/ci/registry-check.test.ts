@@ -130,6 +130,106 @@ describe("classifyRegistryResponse", () => {
 	});
 });
 
+describe("checkVersionAbsent package-metadata fallback", () => {
+	function sequenceFetch(responses: FetchLike[]): { fetchImpl: FetchLike; calls: Array<{ url: string; init: any }> } {
+		const calls: Array<{ url: string; init: any }> = [];
+		const fetchImpl: FetchLike = async (url, init) => {
+			calls.push({ url, init });
+			const next = responses.shift();
+			if (!next) throw new Error("unexpected extra request");
+			return next(url, init);
+		};
+		return { fetchImpl, calls };
+	}
+
+	test("unrecognized JSON 404 falls back to abbreviated metadata and reports absence", async () => {
+		const { fetchImpl, calls } = sequenceFetch([
+			jsonResponse(404, { error: "Not found" }),
+			jsonResponse(200, { name: "opencode-session-port", versions: { "0.1.6": { name: "opencode-session-port", version: "0.1.6" } } }),
+		]);
+		const result = await checkVersionAbsent({ fetchImpl, name: "opencode-session-port", version: "0.1.7" });
+		expect(result).toEqual({ kind: "absent" });
+		expect(calls).toHaveLength(2);
+		expect(calls[0].url).toBe("https://registry.npmjs.org/opencode-session-port/0.1.7");
+		expect(calls[1].url).toBe("https://registry.npmjs.org/opencode-session-port");
+		expect(calls[1].init.headers.accept).toBe("application/vnd.npm.install-v1+json");
+		expect(calls[1].init.redirect).toBe("error");
+	});
+
+	test("bare JSON string 404 from npm also triggers the fallback", async () => {
+		const { fetchImpl, calls } = sequenceFetch([
+			jsonResponse(404, "version not found: 0.1.7"),
+			jsonResponse(200, { name: "opencode-session-port", versions: { "0.1.6": { name: "opencode-session-port", version: "0.1.6" } } }),
+		]);
+		const result = await checkVersionAbsent({ fetchImpl, name: "opencode-session-port", version: "0.1.7" });
+		expect(result).toEqual({ kind: "absent" });
+		expect(calls).toHaveLength(2);
+	});
+
+	test("abbreviated metadata with the requested own version reports exists", async () => {
+		const { fetchImpl } = sequenceFetch([
+			jsonResponse(404, { error: "Not found" }),
+			jsonResponse(200, { name: "opencode-session-port", versions: { "0.1.7": { name: "opencode-session-port", version: "0.1.7" } } }),
+		]);
+		const result = await checkVersionAbsent({ fetchImpl, name: "opencode-session-port", version: "0.1.7" });
+		expect(result).toEqual({ kind: "exists" });
+	});
+
+	test("recognized version-not-found 404 and 200 existence never issue a fallback request", async () => {
+		const absent = sequenceFetch([jsonResponse(404, { error: "version not found: 0.1.7" })]);
+		expect(await checkVersionAbsent({ fetchImpl: absent.fetchImpl, name: "opencode-session-port", version: "0.1.7" })).toEqual({ kind: "absent" });
+		expect(absent.calls).toHaveLength(1);
+
+		const exists = sequenceFetch([jsonResponse(200, { name: "opencode-session-port", version: "0.1.7" })]);
+		expect(await checkVersionAbsent({ fetchImpl: exists.fetchImpl, name: "opencode-session-port", version: "0.1.7" })).toEqual({ kind: "exists" });
+		expect(exists.calls).toHaveLength(1);
+	});
+
+	test("malformed 404 bodies never trigger the fallback", async () => {
+		const { fetchImpl, calls } = sequenceFetch([jsonResponse(404, { error: 404 })]);
+		const result = await checkVersionAbsent({ fetchImpl, name: "opencode-session-port", version: "0.1.7" });
+		expect(result.kind).toBe("error");
+		expect(calls).toHaveLength(1);
+	});
+
+	test("metadata 404, non-200, wrong package, and malformed versions fail closed", async () => {
+		const cases: Array<[FetchLike, number]> = [
+			[jsonResponse(404, { error: "Not found" }), 404],
+			[jsonResponse(500, { error: "boom" }), 500],
+			[jsonResponse(200, { name: "attacker-pkg", versions: { "0.1.6": {} } }), 200],
+			[jsonResponse(200, { name: "opencode-session-port", versions: null }), 200],
+			[jsonResponse(200, { name: "opencode-session-port", versions: [] }), 200],
+			[jsonResponse(200, { name: "opencode-session-port", versions: { "0.1.6": "bad" } }), 200],
+			[jsonResponse(200, { name: "opencode-session-port", versions: { "": {} } }), 200],
+			[jsonResponse(200, "not json"), 200],
+		];
+		for (const [metadataResponse, status] of cases) {
+			const { fetchImpl } = sequenceFetch([jsonResponse(404, { error: "Not found" }), metadataResponse]);
+			const result = await checkVersionAbsent({ fetchImpl, name: "opencode-session-port", version: "0.1.7" });
+			expect(result.kind).toBe("error");
+			expect(status).toBeGreaterThanOrEqual(200);
+		}
+	});
+
+	test("network failure or oversized metadata on the fallback fails closed", async () => {
+		const network = sequenceFetch([
+			jsonResponse(404, { error: "Not found" }),
+			async () => {
+				throw new Error("connection reset");
+			},
+		]);
+		expect((await checkVersionAbsent({ fetchImpl: network.fetchImpl, name: "opencode-session-port", version: "0.1.7" })).kind).toBe("error");
+
+		const oversized = sequenceFetch([
+			jsonResponse(404, { error: "Not found" }),
+			async () => ({ status: 200, text: async () => "x".repeat(200) }),
+		]);
+		expect(
+			(await checkVersionAbsent({ fetchImpl: oversized.fetchImpl, name: "opencode-session-port", version: "0.1.7", maxBodyBytes: 100 })).kind,
+		).toBe("error");
+	});
+});
+
 describe("checkVersionAbsent", () => {
 	test("requests the fixed registry URL for the exact package/version", async () => {
 		let requested = "";

@@ -24,14 +24,8 @@ export function classifyRegistryResponse(status, bodyText) {
 	if (typeof status !== "number" || !Number.isInteger(status)) {
 		return { kind: "error", reason: `registry returned an invalid status: ${String(status)}` };
 	}
-	let parsed = null;
-	let parsedOk = false;
-	try {
-		parsed = JSON.parse(typeof bodyText === "string" ? bodyText : "");
-		parsedOk = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
-	} catch {
-		parsedOk = false;
-	}
+	const parsed = parseBodyObject(bodyText);
+	const parsedOk = parsed !== null;
 	if (status === 200) {
 		if (parsedOk && typeof parsed.version === "string" && parsed.version !== "") {
 			return { kind: "exists" };
@@ -47,6 +41,91 @@ export function classifyRegistryResponse(status, bodyText) {
 	return { kind: "error", reason: `registry responded with status ${status}` };
 }
 
+function isPlainObject(value) {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseBodyObject(bodyText) {
+	try {
+		const parsed = JSON.parse(typeof bodyText === "string" ? bodyText : "");
+		return isPlainObject(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+function parseJsonValue(bodyText) {
+	try {
+		return { ok: true, value: JSON.parse(typeof bodyText === "string" ? bodyText : "") };
+	} catch {
+		return { ok: false, value: null };
+	}
+}
+
+/**
+ * Only a valid-JSON 404 whose wording is not the recognized version-not-found
+ * form warrants the package-metadata fallback. npm may return either an error
+ * object or a bare JSON error string; other JSON shapes and malformed bodies
+ * stay fail-closed without a second request.
+ */
+function isUnrecognizedVersion404(status, bodyText) {
+	if (status !== 404) return false;
+	const parsed = parseJsonValue(bodyText);
+	if (!parsed.ok) return false;
+	const objectError = isPlainObject(parsed.value) && typeof parsed.value.error === "string";
+	const errorLike = typeof parsed.value === "string" || objectError;
+	const recognized = objectError && /version not found/i.test(parsed.value.error);
+	return errorLike && !recognized;
+}
+
+async function fetchBoundedText(fetchImpl, url, { signal, accept, maxBodyBytes }) {
+	const response = await fetchImpl(url, {
+		method: "GET",
+		redirect: "error",
+		signal,
+		headers: { accept },
+	});
+	const bodyText = await response.text();
+	if (typeof bodyText !== "string" || bodyText.length > maxBodyBytes) {
+		return { ok: false, reason: "registry response body was missing or exceeded the bounded size" };
+	}
+	return { ok: true, status: response.status, bodyText };
+}
+
+/**
+ * Authoritative check against the abbreviated packument. Absence is only
+ * reported for a 200 with the exact package name and a plain versions object
+ * whose entries are all objects; the requested version is decided by own
+ * property presence, so prototype keys can never fake an existing release.
+ */
+export function classifyPackageMetadataResponse(status, bodyText, { name, version } = {}) {
+	if (typeof status !== "number" || !Number.isInteger(status)) {
+		return { kind: "error", reason: `registry returned an invalid status: ${String(status)}` };
+	}
+	if (status !== 200) {
+		return { kind: "error", reason: `registry package metadata responded with status ${status}` };
+	}
+	const parsed = parseBodyObject(bodyText);
+	if (parsed === null) {
+		return { kind: "error", reason: "registry package metadata was not a valid JSON object" };
+	}
+	if (parsed.name !== name) {
+		return { kind: "error", reason: "registry package metadata named a different package" };
+	}
+	if (!isPlainObject(parsed.versions)) {
+		return { kind: "error", reason: "registry package metadata did not contain a versions object" };
+	}
+	for (const key of Object.keys(parsed.versions)) {
+		if (key === "" || !isPlainObject(parsed.versions[key])) {
+			return { kind: "error", reason: "registry package metadata contained a malformed version entry" };
+		}
+	}
+	if (typeof version !== "string" || version === "") {
+		return { kind: "error", reason: "package version must be a non-empty string" };
+	}
+	return Object.prototype.hasOwnProperty.call(parsed.versions, version) ? { kind: "exists" } : { kind: "absent" };
+}
+
 export async function checkVersionAbsent({
 	fetchImpl = fetch,
 	registry = NPM_REGISTRY,
@@ -59,20 +138,31 @@ export async function checkVersionAbsent({
 		return { kind: "error", reason: "package name and version must be non-empty strings" };
 	}
 	const url = `${String(registry).replace(/\/+$/, "")}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`;
+	const packageUrl = `${String(registry).replace(/\/+$/, "")}/${encodeURIComponent(name)}`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const response = await fetchImpl(url, {
-			method: "GET",
-			redirect: "error",
+		const first = await fetchBoundedText(fetchImpl, url, {
 			signal: controller.signal,
-			headers: { accept: "application/json" },
+			accept: "application/json",
+			maxBodyBytes,
 		});
-		const bodyText = await response.text();
-		if (typeof bodyText !== "string" || bodyText.length > maxBodyBytes) {
-			return { kind: "error", reason: "registry response body was missing or exceeded the bounded size" };
+		if (!first.ok) {
+			return { kind: "error", reason: first.reason };
 		}
-		return classifyRegistryResponse(response.status, bodyText);
+		const classification = classifyRegistryResponse(first.status, first.bodyText);
+		if (classification.kind !== "error" || !isUnrecognizedVersion404(first.status, first.bodyText)) {
+			return classification;
+		}
+		const packument = await fetchBoundedText(fetchImpl, packageUrl, {
+			signal: controller.signal,
+			accept: "application/vnd.npm.install-v1+json",
+			maxBodyBytes,
+		});
+		if (!packument.ok) {
+			return { kind: "error", reason: packument.reason };
+		}
+		return classifyPackageMetadataResponse(packument.status, packument.bodyText, { name, version });
 	} catch (error) {
 		return { kind: "error", reason: `registry request failed: ${error instanceof Error ? error.message : String(error)}` };
 	} finally {
