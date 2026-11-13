@@ -49,8 +49,11 @@ function fakeCloudAuth(overrides: {
 interface FakeInstallContextHandle {
 	readonly context: Context;
 	readonly slotCalls: number;
+	readonly slotAppends: readonly string[];
 	readonly layerCalls: number;
 	readonly disposals: number;
+	readonly settings: { sidebarActions: boolean };
+	readonly dialogCalls: { set: number; show: number; clear: number };
 	readonly toasts: Array<{ readonly title?: string; readonly message: string; readonly variant?: string }>;
 	renderSlot(): void;
 	/** Commands published by the deferred keymap layer (empty until `renderSlot`). */
@@ -59,6 +62,9 @@ interface FakeInstallContextHandle {
 
 function createFakeInstallContext(): FakeInstallContextHandle {
 	const toasts: FakeInstallContextHandle["toasts"] = [];
+	const slotAppends: string[] = [];
+	const settings = { sidebarActions: false };
+	const dialogCalls = { set: 0, show: 0, clear: 0 };
 	let slotCalls = 0;
 	let layerCalls = 0;
 	let disposals = 0;
@@ -68,8 +74,30 @@ function createFakeInstallContext(): FakeInstallContextHandle {
 	const context = {
 		client: {},
 		location: { directory: "C:/work/active" },
+		storage: {
+			store(_key: string, options: { readonly initial: { sidebarActions: boolean } }) {
+				Object.assign(settings, options.initial);
+				return [
+					settings,
+					async (mutation: (draft: { sidebarActions: boolean }) => void) => {
+						mutation(settings);
+					},
+				];
+			},
+		},
 		ui: {
-			dialog: { select: async () => undefined },
+			dialog: {
+				select: async () => undefined,
+				set() {
+					dialogCalls.set += 1;
+				},
+				show() {
+					dialogCalls.show += 1;
+				},
+				clear() {
+					dialogCalls.clear += 1;
+				},
+			},
 			toast: {
 				show(options: { title?: string; message: string; variant?: string }) {
 					toasts.push(options);
@@ -77,7 +105,8 @@ function createFakeInstallContext(): FakeInstallContextHandle {
 			},
 			slot(claim: { readonly append?: string; readonly render?: (input: unknown) => unknown }) {
 				slotCalls += 1;
-				slotClaim = claim;
+				slotAppends.push(String(claim.append));
+				if (claim.append === "app") slotClaim = claim;
 				return () => {
 					disposals += 1;
 				};
@@ -96,12 +125,17 @@ function createFakeInstallContext(): FakeInstallContextHandle {
 		get slotCalls(): number {
 			return slotCalls;
 		},
+		get slotAppends(): readonly string[] {
+			return slotAppends;
+		},
 		get layerCalls(): number {
 			return layerCalls;
 		},
 		get disposals(): number {
 			return disposals;
 		},
+		settings,
+		dialogCalls,
 		toasts,
 		renderSlot() {
 			slotClaim?.render?.({});
@@ -147,7 +181,7 @@ describe("installSessionPortWiring", () => {
 		expect(deriverCalls).toBe(0);
 	});
 
-	test("Windows: initializes, registers the app-slot/keymap commands, and returns the slot disposer", async () => {
+	test("Windows: initializes, registers the app slot plus the storage-gated sidebar footer, and returns the disposer", async () => {
 		const handle = createFakeInstallContext();
 
 		const cleanup = await installSessionPortWiring(handle.context, {
@@ -157,15 +191,42 @@ describe("installSessionPortWiring", () => {
 			requestPassword: async () => undefined,
 		});
 
-		expect(handle.slotCalls).toBe(1);
+		expect(handle.slotCalls).toBe(2);
+		expect(handle.slotAppends).toEqual(["app", "sidebar.footer"]);
+		expect(handle.settings.sidebarActions).toBe(false);
 		expect(typeof cleanup).toBe("function");
 		expect(handle.layerCalls).toBe(0); // E39: the layer is effect-deferred until render
 
 		handle.renderSlot();
 		expect(handle.layerCalls).toBe(1);
+		expect(handle.commands().map((command) => command.id)).toEqual([
+			"sessionport.checkpoint",
+			"sessionport.restore",
+			"sessionport.settings",
+		]);
 
 		(cleanup as () => void)();
-		expect(handle.disposals).toBe(1);
+		expect(handle.disposals).toBe(2);
+	});
+
+	test("Windows: the SessionPort settings command opens the native modal", async () => {
+		const handle = createFakeInstallContext();
+
+		const cleanup = await installSessionPortWiring(handle.context, {
+			platform: "win32",
+			createCryptoFactory: async () => fakeFactory(),
+			createIdDeriver: async () => fakeDeriver(),
+			requestPassword: async () => undefined,
+		});
+		handle.renderSlot();
+
+		const settingsCommand = handle.commands().find((command) => command.id === "sessionport.settings");
+		expect(settingsCommand).toBeDefined();
+		await settingsCommand!.run();
+
+		expect(handle.dialogCalls.set).toBe(1);
+		expect(handle.dialogCalls.show).toBe(1);
+		(cleanup as () => void)();
 	});
 
 	// Simulated platform only: the `platform` seam overrides the platform string
@@ -192,7 +253,7 @@ describe("installSessionPortWiring", () => {
 
 			expect(factoryCalls).toBe(1);
 			expect(deriverCalls).toBe(1);
-			expect(handle.slotCalls).toBe(1);
+			expect(handle.slotCalls).toBe(2);
 			expect(typeof cleanup).toBe("function");
 			expect(handle.layerCalls).toBe(0); // E39: the layer is effect-deferred until render
 
@@ -201,10 +262,11 @@ describe("installSessionPortWiring", () => {
 			expect(handle.commands().map((command) => command.id)).toEqual([
 				"sessionport.checkpoint",
 				"sessionport.restore",
+				"sessionport.settings",
 			]);
 
 			(cleanup as () => void)();
-			expect(handle.disposals).toBe(1);
+			expect(handle.disposals).toBe(2);
 		});
 	}
 
@@ -221,6 +283,7 @@ describe("installSessionPortWiring", () => {
 		expect(handle.commands().map((command) => command.id)).toEqual([
 			"sessionport.checkpoint",
 			"sessionport.restore",
+			"sessionport.settings",
 			"sessionport.sync",
 		]);
 		(cleanup as () => void)();
@@ -253,7 +316,7 @@ describe("installSessionPortWiring", () => {
 		cleanupFn = cleanup as () => Promise<void>;
 
 		const first = cleanupFn();
-		expect(handle.disposals).toBe(1); // slot disposer ran before awaiting release
+		expect(handle.disposals).toBe(2); // slot disposers ran before awaiting release
 		expect(disposeCalls).toBe(1);
 		expect(reentrantCleanup).toBe(first);
 		let settled = false;
@@ -377,7 +440,7 @@ describe("installSessionPortWiring", () => {
 		const repeated = cleanupFn();
 		expect(repeated).toBe(first);
 		const error = await first.catch((value) => value);
-		expect(handle.disposals).toBe(1);
+		expect(handle.disposals).toBe(2);
 		expect(releaseCalls).toBe(1);
 		expect(error).toBeInstanceOf(Error);
 		expect(error.message).toBe("Cloud sign-in cleanup failed.");
@@ -413,7 +476,7 @@ describe("installSessionPortWiring", () => {
 		expect(repeated).toBe(first);
 		const error = await first.catch((value) => value);
 		expect(disposeCalls).toBe(1);
-		expect(handle.disposals).toBe(1);
+		expect(handle.disposals).toBe(2);
 		expect(error).toBeInstanceOf(Error);
 		expect(error.message).toBe("Cloud sign-in cleanup failed.");
 		expect(error.message).not.toContain("SECRET");
@@ -442,11 +505,12 @@ describe("installSessionPortWiring", () => {
 		expect(handle.commands().map((command) => command.id)).toEqual([
 			"sessionport.checkpoint",
 			"sessionport.restore",
+			"sessionport.settings",
 		]);
 
 		(cleanup as () => void)();
 		(cleanup as () => void)();
-		expect(handle.disposals).toBe(1);
+		expect(handle.disposals).toBe(2);
 		expect(optionReads).toBe(0);
 	});
 

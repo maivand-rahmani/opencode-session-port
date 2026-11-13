@@ -6,8 +6,9 @@ import { Plugin } from "@opencode/plugin/tui"
  * Setup checks `process.platform` first and only on an explicitly allowed
  * platform (`win32`, `darwin`, or `linux`) dynamically imports
  * `installSessionPortWiring`, which:
- * - registers `/checkpoint` and `/restore` only on those platforms; every other
- *   platform gets no registration and no platform-support claim;
+ * - registers `/checkpoint`, `/restore`, and `/sessionport` only on those
+ *   platforms; every other platform gets no registration and no platform-support
+ *   claim;
  * - initializes the pinned `libsodium-wrappers-sumo@0.8.4` runtime first and
  *   fails closed if it is unavailable (setup rejects; nothing is registered);
  * - registers commands inside the existing app-slot/keymap component scope

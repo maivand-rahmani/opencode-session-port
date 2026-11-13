@@ -7,22 +7,13 @@ import {
 	type PasswordPromptState,
 } from "./password-flow.ts";
 
-type Context = Plugin.Context;
-
-const palette = {
-	background: "#111922",
-	field: "#202d3b",
-	edge: "#344557",
-	accent: "#53d6c3",
-	text: "#edf3f7",
-	muted: "#94a4b2",
-	gold: "#e5be76",
-} as const;
+type Context = Pick<Plugin.Context, "ui" | "theme">;
 
 interface PasswordDialogProps {
 	readonly mode: PasswordMode;
 	readonly maxPasswordBytes: number;
 	readonly prompt: PasswordPromptState;
+	readonly theme: Plugin.Context["theme"];
 	readonly accept: (password: Uint8Array) => void;
 	readonly cancel: () => void;
 }
@@ -33,6 +24,7 @@ interface PasswordFieldProps {
 	/** A mask from PasswordPromptState; never pass the entered password here. */
 	readonly displayMask: string;
 	readonly emptyHint: string;
+	readonly theme: Plugin.Context["theme"];
 }
 
 interface ConsumableKeyEvent {
@@ -57,21 +49,31 @@ function PasswordField(props: PasswordFieldProps) {
 			flexDirection="column"
 			border
 			borderStyle="rounded"
-			borderColor={props.active ? palette.accent : palette.edge}
-			backgroundColor={palette.field}
+			borderColor={
+				props.active ? props.theme.text.formfield.focused : props.theme.border.base
+			}
+			backgroundColor={
+				props.active
+					? props.theme.background.formfield.focused
+					: props.theme.background.formfield.base
+			}
 			paddingX={1}
 			paddingY={0}
 		>
 			<box flexDirection="row" gap={1}>
-				<text fg={props.active ? palette.accent : palette.muted}>
+				<text fg={props.active ? props.theme.text.formfield.selected : props.theme.text.muted}>
 					{props.active ? ">" : " "}
 				</text>
-				<text fg={props.active ? palette.text : palette.muted}>{props.label}</text>
+				<text fg={props.active ? props.theme.text.formfield.focused : props.theme.text.muted}>
+					{props.label}
+				</text>
 			</box>
-			<text fg={props.displayMask ? palette.text : palette.muted}>
-				{props.displayMask || props.emptyHint}
-				{props.active ? "▏" : ""}
-			</text>
+			<box flexDirection="row">
+				<text fg={props.displayMask ? props.theme.text.formfield.base : props.theme.text.muted}>
+					{props.displayMask || props.emptyHint}
+				</text>
+				{props.active && <text fg={props.theme.text.formfield.focused}>▏</text>}
+			</box>
 		</box>
 	);
 }
@@ -149,38 +151,38 @@ function PasswordDialog(props: PasswordDialogProps) {
 			gap={1}
 			border
 			borderStyle="rounded"
-			borderColor={palette.edge}
-			backgroundColor={palette.background}
+			borderColor={props.theme.border.base}
+			backgroundColor={props.theme.background.base}
 			paddingX={2}
 			paddingY={1}
 		>
 			<box flexDirection="row" justifyContent="space-between">
-				<text fg={palette.accent}>SESSIONPORT</text>
-				<text fg={palette.muted}>
+				<text fg={props.theme.text.feedback.info.base}>SESSIONPORT</text>
+				<text fg={props.theme.text.muted}>
 					{props.mode === "checkpoint" ? "CHECKPOINT" : "RESTORE"}
 				</text>
 			</box>
 
 			<box flexDirection="column" gap={0}>
-				<text fg={palette.text}>Password</text>
-				<text fg={palette.muted}>
+				<text fg={props.theme.text.base}>Password</text>
+				<text fg={props.theme.text.muted}>
 					{props.mode === "checkpoint"
 						? "Choose a password to protect this checkpoint."
 						: "Enter the password used to create this checkpoint."}
 				</text>
 				{props.mode === "checkpoint" && (
 					<>
-						<text fg={palette.muted}>
+						<text fg={props.theme.text.muted}>
 							Use a longer password you do not reuse elsewhere.
 						</text>
-						<text fg={palette.muted}>
+						<text fg={props.theme.text.muted}>
 							Password strength is not checked.
 						</text>
 					</>
 				)}
-				<text fg={palette.muted}>SessionPort cannot recover a lost password.</text>
-				<text fg={palette.muted}>You can type or paste; your entry stays masked.</text>
-				<text fg={palette.muted}>
+				<text fg={props.theme.text.muted}>SessionPort cannot recover a lost password.</text>
+				<text fg={props.theme.text.muted}>You can type or paste; your entry stays masked.</text>
+				<text fg={props.theme.text.muted}>
 					Password entries are limited to {formatByteLimit(props.maxPasswordBytes)} of UTF-8.
 				</text>
 			</box>
@@ -190,6 +192,7 @@ function PasswordDialog(props: PasswordDialogProps) {
 				active={view().activeField === "password"}
 				displayMask={view().passwordMask}
 				emptyHint="Type a password"
+				theme={props.theme}
 			/>
 
 			{props.mode === "checkpoint" && (
@@ -198,20 +201,21 @@ function PasswordDialog(props: PasswordDialogProps) {
 					active={view().activeField === "confirmation"}
 					displayMask={view().confirmationMask ?? ""}
 					emptyHint="Type it again"
+					theme={props.theme}
 				/>
 			)}
 
 			<box flexDirection="row" minHeight={1}>
-				<text fg={view().message ? palette.gold : palette.muted}>
+				<text fg={view().message ? props.theme.text.feedback.warning.base : props.theme.text.muted}>
 					{view().message ?? " "}
 				</text>
 			</box>
 
 			<box flexDirection="row" justifyContent="space-between">
-				<text fg={palette.muted}>
+				<text fg={props.theme.text.muted}>
 					{props.mode === "checkpoint" ? "Tab: switch fields · Esc: cancel" : "Esc: cancel"}
 				</text>
-				<text fg={palette.accent}>
+				<text fg={props.theme.text.action.primary.base}>
 					{props.mode === "restore"
 						? "ENTER  CONTINUE"
 						: view().activeField === "password"
@@ -219,7 +223,7 @@ function PasswordDialog(props: PasswordDialogProps) {
 							: "ENTER  CREATE"}
 				</text>
 			</box>
-			<text fg={palette.muted}>
+			<text fg={props.theme.text.muted}>
 				Backspace: delete · Ctrl+U: clear · Paste: allowed
 			</text>
 		</box>
@@ -242,6 +246,7 @@ export function requestPassword(
 				mode={mode}
 				maxPasswordBytes={maxPasswordBytes}
 				prompt={prompt}
+				theme={context.theme}
 				accept={accept}
 				cancel={cancel}
 			/>

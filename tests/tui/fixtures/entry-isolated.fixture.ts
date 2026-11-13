@@ -24,8 +24,10 @@ import { describe, expect, mock, test } from "bun:test";
  * named child (`bun test tests/tui/fixtures/entry-isolated.fixture.ts`) so the
  * process-wide `mock.module` registrations above can never leak into the rest
  * of the suite. Do not rename this file to a `*.test.ts` / `*.spec.ts` pattern.
- * Initial assertions and seams are unchanged from the original entry tests;
- * only the relative source paths gained one `../` level for this folder.
+ * Initial assertions and seams are preserved from the original entry tests;
+ * only the relative source paths gained one `../` level for this folder, and the
+ * Windows cases now provide the durable settings store used by the sidebar
+ * footer and settings command.
  */
 
 const uiModuleEvaluations: string[] = [];
@@ -75,13 +77,43 @@ mock.module("../../../src/core/restore/index.ts", () => ({
 	fingerprintSessionRecord: () => {
 		throw new Error("fingerprintSessionRecord is not used by entry tests");
 	},
+	sessionLineageID: (record: { info?: { id?: string } }) => String(record.info?.id ?? ""),
+	stampSessionLineage: (record: unknown) => record,
 	classifyReplacement: () => ({ mode: "copy" }),
+	classifyLineageUpdate: () => ({ mode: "copy" }),
+	fingerprintSessionContent: () => "content",
+	fingerprintSessionLineageInfo: () => "info",
+	fingerprintSessionMessages: () => [],
 	verifyImportedRecord: () => ({ verified: false }),
 }));
 
 const sessionPort = (await import("../../../src/tui.ts")).default;
 /** UI module evaluations caused by loading the entry itself (must be none). */
 const evaluationsAtEntryImport = [...uiModuleEvaluations];
+
+/** Minimal durable-storage fake: one plugin-scoped settings object. */
+function storageFake(): {
+	store(
+		key: string,
+		options: { readonly initial: { sidebarActions: boolean } },
+	): readonly [
+		{ sidebarActions: boolean },
+		(mutation: (draft: { sidebarActions: boolean }) => void) => Promise<void>,
+	];
+} {
+	const settings = { sidebarActions: false };
+	return {
+		store(_key, options) {
+			Object.assign(settings, options.initial);
+			return [
+				settings,
+				async (mutation) => {
+					mutation(settings);
+				},
+			];
+		},
+	};
+}
 
 describe("SessionPort plugin entrypoint", () => {
 	test("loading the entry does not evaluate the optional-peer UI modules", () => {
@@ -126,11 +158,12 @@ describe("SessionPort plugin entrypoint", () => {
 			const context = {
 				client: {},
 				location: { directory: "/work/active" },
+				storage: storageFake(),
 				ui: {
 					dialog: { select: async () => undefined },
 					toast: { show() {} },
 					slot(claim: { readonly append?: string; readonly render?: (input: unknown) => unknown }) {
-						slotClaim = claim;
+						if (claim.append === "app") slotClaim = claim;
 						return () => {
 							disposed += 1;
 						};
@@ -168,10 +201,14 @@ describe("SessionPort plugin entrypoint", () => {
 				slotClaim?.render?.({});
 				expect(layerCalls).toBe(1);
 				expect(layerMode).toBe("global");
-				expect(commandIDs).toEqual(["sessionport.checkpoint", "sessionport.restore"]);
+				expect(commandIDs).toEqual([
+					"sessionport.checkpoint",
+					"sessionport.restore",
+					"sessionport.settings",
+				]);
 
 				(cleanup as () => void)();
-				expect(disposed).toBe(1);
+				expect(disposed).toBe(2);
 			} finally {
 				Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 			}
@@ -199,18 +236,19 @@ describe("SessionPort plugin entrypoint", () => {
 	);
 
 	test.skipIf(process.platform !== "win32")(
-		"Windows: dynamically loads the wiring, registers inside the app slot, and returns the slot disposer",
+		"Windows: dynamically loads the wiring, registers the app slot plus the storage-gated footer, and returns the disposer",
 		async () => {
 			let disposed = 0;
-			let slotClaim: { readonly append?: string } | undefined;
+			const slotAppends: string[] = [];
 			const context = {
 				client: {},
 				location: { directory: "C:/work/active" },
+				storage: storageFake(),
 				ui: {
 					dialog: { select: async () => undefined },
 					toast: { show() {} },
 					slot(claim: { readonly append?: string }) {
-						slotClaim = claim;
+						slotAppends.push(String(claim.append));
 						return () => {
 							disposed += 1;
 						};
@@ -226,10 +264,12 @@ describe("SessionPort plugin entrypoint", () => {
 			expect(uiModuleEvaluations).toContain("restore-report-dialog");
 			expect(uiModuleEvaluations).toContain("restore-replacement-dialog");
 
-			expect(slotClaim?.append).toBe("app");
+			// The footer claim is always present but renders nothing until the
+			// durable settings store enables it.
+			expect(slotAppends).toEqual(["app", "sidebar.footer"]);
 			expect(typeof cleanup).toBe("function");
 			(cleanup as () => void)();
-			expect(disposed).toBe(1);
+			expect(disposed).toBe(2);
 		},
 	);
 });

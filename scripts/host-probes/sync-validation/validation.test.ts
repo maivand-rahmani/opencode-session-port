@@ -470,8 +470,11 @@ describe("bounded owner status evidence", () => {
 					show: () => {},
 				},
 				toast: { show: () => {} },
-				slot: (options: { render: () => unknown }) => {
-					options.render();
+				slot: (options: { append?: string; render: () => unknown }) => {
+					// The app slot registers commands through keymap.layer; the
+					// sidebar footer is JSX-only and needs a real OpenTUI renderer,
+					// which this headless probe does not have.
+					if (options.append === "app") options.render();
 					return () => {};
 				},
 			},
@@ -479,6 +482,15 @@ describe("bounded owner status evidence", () => {
 				layer: (factory: () => { commands: typeof commands }) => {
 					commands = factory().commands;
 					return () => {};
+				},
+			},
+			storage: {
+				store: (_name: string, options: { initial: Record<string, unknown> }) => {
+					const value = { ...options.initial };
+					const update = async (mutate: (draft: Record<string, unknown>) => void) => {
+						mutate(value);
+					};
+					return [value, update] as const;
 				},
 			},
 		};

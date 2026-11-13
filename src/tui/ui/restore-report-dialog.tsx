@@ -17,22 +17,14 @@ export type {
 	RestoreReportSummary,
 } from "./restore-report-flow.ts";
 
-const palette = {
-	background: "#111922",
-	field: "#202d3b",
-	edge: "#344557",
-	accent: "#53d6c3",
-	text: "#edf3f7",
-	muted: "#94a4b2",
-	gold: "#e5be76",
-	coral: "#ee907f",
-} as const;
-
-type RestoreReportDialogContext = Pick<Plugin.Context, "ui">;
+type Theme = Plugin.Context["theme"];
+type ThemeColor = Theme["text"]["base"];
+type RestoreReportDialogContext = Pick<Plugin.Context, "ui" | "theme">;
 
 interface RestoreReportDialogProps {
 	readonly model: RestoreReportPresentationModel;
 	readonly navigator: RestoreReportNavigator;
+	readonly theme: Theme;
 	readonly close: () => void;
 }
 
@@ -46,17 +38,17 @@ function consumeKey(event: ConsumableKeyEvent): void {
 	event.stopPropagation();
 }
 
-function statusColor(status: RestoreReportStatus): string {
+function statusColor(status: RestoreReportStatus, theme: Theme): ThemeColor {
 	switch (status) {
 		case "imported":
-			return palette.accent;
+			return theme.text.feedback.success.base;
 		case "failed":
-			return palette.coral;
+			return theme.text.feedback.error.base;
 		case "blocked":
-			return palette.gold;
+			return theme.text.feedback.warning.base;
 		case "skipped":
 		case "not-attempted":
-			return palette.muted;
+			return theme.text.muted;
 	}
 }
 
@@ -71,48 +63,49 @@ function SummaryLine(props: {
 	readonly failed: number;
 	readonly blocked: number;
 	readonly notAttempted: number;
+	readonly theme: Theme;
 }) {
 	return (
 		<box flexDirection="column" gap={0}>
-			<text wrapMode="char" fg={palette.text}>
+			<text wrapMode="char" fg={props.theme.text.base}>
 				{props.total.toLocaleString()} total · {props.imported.toLocaleString()} imported · {props.skipped.toLocaleString()} skipped
 			</text>
-			<text wrapMode="char" fg={palette.text}>
+			<text wrapMode="char" fg={props.theme.text.base}>
 				{props.failed.toLocaleString()} failed · {props.blocked.toLocaleString()} blocked · {props.notAttempted.toLocaleString()} not attempted
 			</text>
 		</box>
 	);
 }
 
-function SessionOutcome(props: { readonly session: RestoreReportSession }) {
+function SessionOutcome(props: { readonly session: RestoreReportSession; readonly theme: Theme }) {
 	return (
 		<box
 			flexDirection="column"
 			gap={0}
 			border
 			borderStyle="rounded"
-			borderColor={palette.edge}
-			backgroundColor={palette.field}
+			borderColor={props.theme.border.base}
+			backgroundColor={props.theme.background.raised.base}
 			paddingX={1}
 			paddingY={0}
 		>
-			<text fg={palette.muted}>Session ID</text>
-			<text wrapMode="char" fg={palette.text}>{props.session.sessionID}</text>
+			<text fg={props.theme.text.muted}>Session ID</text>
+			<text wrapMode="char" fg={props.theme.text.base}>{props.session.sessionID}</text>
 
 			<box flexDirection="row" gap={1}>
-				<text fg={palette.muted}>Classification</text>
-				<text wrapMode="char" fg={palette.text}>{props.session.classification}</text>
+				<text fg={props.theme.text.muted}>Classification</text>
+				<text wrapMode="char" fg={props.theme.text.base}>{props.session.classification}</text>
 			</box>
 			<box flexDirection="row" gap={1}>
-				<text fg={palette.muted}>Outcome</text>
-				<text wrapMode="char" fg={statusColor(props.session.status)}>{props.session.status}</text>
+				<text fg={props.theme.text.muted}>Outcome</text>
+				<text wrapMode="char" fg={statusColor(props.session.status, props.theme)}>{props.session.status}</text>
 			</box>
 
 			{props.session.skipReason !== undefined && (
 				<box flexDirection="column" gap={0}>
-					<text fg={palette.muted}>Skip reason</text>
+					<text fg={props.theme.text.muted}>Skip reason</text>
 					{/* Keep the supplied sanitized reason verbatim; do not ellipsize it. */}
-					<text wrapMode="char" fg={palette.text}>{props.session.skipReason}</text>
+					<text wrapMode="char" fg={props.theme.text.base}>{props.session.skipReason}</text>
 				</box>
 			)}
 		</box>
@@ -164,19 +157,19 @@ function RestoreReportDialog(props: RestoreReportDialogProps) {
 			gap={1}
 			border
 			borderStyle="rounded"
-			borderColor={palette.edge}
-			backgroundColor={palette.background}
+			borderColor={props.theme.border.base}
+			backgroundColor={props.theme.background.base}
 			paddingX={2}
 			paddingY={1}
 		>
 			<box flexDirection="row" justifyContent="space-between">
-				<text fg={palette.accent}>SESSIONPORT</text>
-				<text fg={palette.muted}>RESTORE REPORT</text>
+				<text fg={props.theme.text.feedback.info.base}>SESSIONPORT</text>
+				<text fg={props.theme.text.muted}>RESTORE REPORT</text>
 			</box>
 
 			<box flexDirection="column" gap={0}>
-				<text fg={palette.text}>Restore finished</text>
-				<SummaryLine {...summary} />
+				<text fg={props.theme.text.feedback.success.base}>Restore finished</text>
+				<SummaryLine {...summary} theme={props.theme} />
 			</box>
 
 			{partial && (
@@ -184,10 +177,10 @@ function RestoreReportDialog(props: RestoreReportDialogProps) {
 					flexDirection="row"
 					border
 					borderStyle="rounded"
-					borderColor={palette.gold}
+					borderColor={props.theme.border.base}
 					paddingX={1}
 				>
-					<text wrapMode="char" fg={palette.gold}>
+					<text wrapMode="char" fg={props.theme.text.feedback.warning.base}>
 						Partial progress: there is no atomic rollback; imported sessions remain.
 					</text>
 				</box>
@@ -195,34 +188,34 @@ function RestoreReportDialog(props: RestoreReportDialogProps) {
 
 			<box flexDirection="column" gap={0}>
 				<box flexDirection="row" justifyContent="space-between">
-					<text fg={palette.accent}>SESSION OUTCOME</text>
-					<text fg={palette.muted}>
+					<text fg={props.theme.text.feedback.info.base}>SESSION OUTCOME</text>
+					<text fg={props.theme.text.muted}>
 						{navigation().count === 0
 							? "NO RESULTS"
 							: `${(navigation().index + 1).toLocaleString()} OF ${navigation().count.toLocaleString()}`}
 					</text>
 				</box>
 				{navigation().session ? (
-					<SessionOutcome session={navigation().session!} />
+					<SessionOutcome session={navigation().session!} theme={props.theme} />
 				) : (
 					<box
 						flexDirection="column"
 						border
 						borderStyle="rounded"
-						borderColor={palette.edge}
-						backgroundColor={palette.field}
+						borderColor={props.theme.border.base}
+						backgroundColor={props.theme.background.raised.high}
 						paddingX={1}
 					>
-						<text wrapMode="char" fg={palette.muted}>No per-session outcomes were returned.</text>
+						<text wrapMode="char" fg={props.theme.text.muted}>No per-session outcomes were returned.</text>
 					</box>
 				)}
 			</box>
 
 			<box flexDirection="row" justifyContent="space-between">
-				<text wrapMode="char" fg={palette.muted}>
+				<text wrapMode="char" fg={props.theme.text.muted}>
 					←/↑ previous · →/↓ next · Home/End jump
 				</text>
-				<text fg={palette.accent}>Esc  CLOSE</text>
+				<text fg={props.theme.text.action.primary.base}>Esc  CLOSE</text>
 			</box>
 		</box>
 	);
@@ -244,6 +237,7 @@ export function showRestoreReportDialog(
 			<RestoreReportDialog
 				model={model}
 				navigator={navigator}
+				theme={context.theme}
 				close={() => context.ui.dialog.clear()}
 			/>
 		),

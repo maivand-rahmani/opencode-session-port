@@ -3,6 +3,7 @@ import type { Plugin } from "@opencode/plugin/tui";
 export const SESSIONPORT_COMMAND_IDS = {
 	checkpoint: "sessionport.checkpoint",
 	restore: "sessionport.restore",
+	settings: "sessionport.settings",
 	sync: "sessionport.sync",
 } as const;
 
@@ -11,6 +12,8 @@ export interface SessionPortCommandHandlers {
 	readonly restore: (rawInput: string | undefined) => Promise<void>;
 	/** Optional in the base seam so existing checkpoint/restore composition stays compatible. */
 	readonly sync?: (rawInput: string | undefined) => Promise<void>;
+	/** Opens the native SessionPort settings modal. */
+	readonly settings?: () => void;
 }
 
 /** The host APIs this registration seam uses. */
@@ -64,8 +67,26 @@ export function installSessionPortCommands(
 							await handlers.restore(rawInput);
 						},
 					},
-					// `/sync` exists only when an explicit cloud-auth handler was
-					// injected; the local-first default publishes two commands.
+					// The local-first default publishes checkpoint, restore, and
+					// settings. `/sync` exists only when an explicit cloud-auth
+					// handler was injected.
+					...(handlers.settings !== undefined
+						? [
+								{
+									id: SESSIONPORT_COMMAND_IDS.settings,
+									title: "SessionPort settings",
+									description:
+										"Turn optional SessionPort sidebar actions on or off.",
+									group: "SessionPort",
+									bind: false as const,
+									palette: true as const,
+									slash: { name: "sessionport" },
+									run: () => {
+										handlers.settings!();
+									},
+								},
+							]
+						: []),
 					...(handlers.sync !== undefined
 						? [
 								{

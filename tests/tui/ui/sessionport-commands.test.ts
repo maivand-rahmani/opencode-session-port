@@ -89,6 +89,42 @@ describe("SessionPort command registration", () => {
 		]);
 	});
 
+	test("publishes the settings command only when a settings handler is provided", () => {
+		let slotClaim: Parameters<SessionPortCommandHost["ui"]["slot"]>[0] | undefined;
+		let layerFactory: Parameters<SessionPortCommandHost["keymap"]["layer"]>[0] | undefined;
+		let opened = 0;
+		installSessionPortCommands(
+			{
+				ui: {
+					slot: (claim) => {
+						slotClaim = claim;
+						return () => {};
+					},
+				},
+				keymap: {
+					layer: (factory) => {
+						layerFactory = factory;
+					},
+				},
+			},
+			{
+				checkpoint: async () => {},
+				restore: async () => {},
+				settings: () => {
+					opened += 1;
+				},
+			},
+		);
+		slotClaim?.render({});
+		const commands = layerFactory?.().commands ?? [];
+		const settings = commands.find((command) => command.id === SESSIONPORT_COMMAND_IDS.settings);
+		expect(settings).toBeDefined();
+		expect(settings?.slash?.name).toBe("sessionport");
+		expect(settings?.palette).toBe(true);
+		settings?.run();
+		expect(opened).toBe(1);
+	});
+
 	test("forwards raw slash input to each async handler without parsing or trimming", async () => {
 		let slotClaim: Parameters<SessionPortCommandHost["ui"]["slot"]>[0] | undefined;
 		let layerFactory: Parameters<SessionPortCommandHost["keymap"]["layer"]>[0] | undefined;

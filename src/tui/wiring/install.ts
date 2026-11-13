@@ -27,15 +27,15 @@
  *   `showRestoreReport` dependency is retained only for old injected tests and
  *   is never used by the production local-first path, so two report UIs can
  *   never both appear.
- * - The local-first default publishes exactly `/checkpoint` and `/restore` and
- *   never constructs a cloud controller, reads cloud options, opens a keyring,
- *   or creates a vault. `/sync` appears only when an explicit
- *   `options.createCloudAuth` handler is injected (historical validation
- *   seam); cleanup for that explicit handler stays at-most-once and
- *   fail-closed.
+ * - The local-first default publishes `/checkpoint`, `/restore`, and
+ *   `/sessionport` (native settings modal) and never constructs a cloud
+ *   controller, reads cloud options, opens a keyring, or creates a vault.
+ *   `/sync` appears only when an explicit `options.createCloudAuth` handler is
+ *   injected (historical validation seam); cleanup for that explicit handler
+ *   stays at-most-once and fail-closed.
  *
- * This module statically imports the designer-owned UI modules (password modal
- * and restore report dialog), which import the optional UI peers
+ * This module statically imports the designer-owned UI modules (password,
+ * restore, and settings modals), which import the optional UI peers
  * (`@opentui/solid`, `solid-js`). The entry (`src/tui.ts`) imports this module
  * dynamically only after its own allowlist check, so unsupported-platform
  * plugin setup never evaluates those modules.
@@ -51,16 +51,22 @@ import type { CheckpointCryptoFactory } from "../../core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../core/crypto/index.ts";
 import { createRemappedIdDeriver, type RemappedIdDeriver } from "../../core/restore/index.ts";
 import {
+	deleteCheckpointArtifacts,
+	planCheckpointCleanup,
 	readEncryptedArtifact,
 	resolveCheckpointOutputPath,
 	resolveLatestCheckpointArtifact,
 	resolveRecoveryArtifactPath,
 	writeEncryptedArtifact,
 } from "../artifacts/files.ts";
+import { createCheckpointRetentionUi } from "../ui/checkpoint-retention-flow.ts";
 import { requestPassword as showPasswordDialog } from "../ui/password-dialog.tsx";
+import { createRestoreImportModeUi } from "../ui/restore-import-mode-flow.ts";
 import { showRestoreReportDialog } from "../ui/restore-report-dialog.tsx";
 import { createRestoreReplacementUi } from "../ui/restore-replacement-dialog.tsx";
 import { installSessionPortCommands } from "../ui/sessionport-commands.tsx";
+import { createSessionPortSettingsUi } from "../ui/settings-dialog.tsx";
+import { installSessionPortSidebarActions } from "../ui/sidebar-actions.tsx";
 import { createSessionPortHandlers, type SessionPortPasswordProvider } from "./composition.ts";
 import type { SessionPortCloudAuthHandlers } from "./cloud-auth.ts";
 import { EXPERIMENTAL_CRYPTO_POLICY_DEFINITION } from "./experimental-profile.ts";
@@ -78,8 +84,8 @@ export interface SessionPortInstallOptions {
 	/**
 	 * Explicit cloud-auth injection seam only. The local-first 0.1.7 default
 	 * never creates a cloud controller, resolves cloud options, reads a keyring,
-	 * or opens a vault; without this injected handler only the two local
-	 * commands are registered.
+	 * or opens a vault; without this injected handler only the local commands
+	 * are registered.
 	 */
 	readonly createCloudAuth?: (
 		context: Plugin.Context,
@@ -108,17 +114,86 @@ export async function installSessionPortWiring(
 	const cryptoFactory = await (options.createCryptoFactory ?? createExperimentalCryptoFactory)();
 	const idDeriver = await (options.createIdDeriver ?? createRemappedIdDeriver)();
 
+	const checkpointRetentionUi = createCheckpointRetentionUi(context);
+	const restoreImportModeUi = createRestoreImportModeUi(context);
+	// Durable, plugin-scoped storage: the settings modal owns the toggle and the
+	// sidebar reads the same reactive store, so no config-file edit is needed.
+	const [settings, updateSettings] = context.storage.store("settings", {
+		initial: { sidebarActions: false },
+	});
+	const sidebarActionsEnabled = () => settings.sidebarActions === true;
+	const setSidebarActions = async (value: boolean): Promise<void> => {
+		await updateSettings((draft) => {
+			draft.sidebarActions = value;
+		});
+	};
+	const notify = (notification: {
+		readonly title?: string;
+		readonly message: string;
+		readonly variant?: "info" | "success" | "warning" | "error";
+	}) => {
+		context.ui.toast.show({
+			title: notification.title,
+			message: notification.message,
+			variant: notification.variant,
+		});
+	};
+	const settingsUi = createSessionPortSettingsUi(context, {
+		sidebarActions: sidebarActionsEnabled,
+		setSidebarActions,
+		cleanupCheckpoints: async () => {
+			const projectDirectory = context.location?.directory;
+			if (typeof projectDirectory !== "string" || projectDirectory.trim().length === 0) {
+				notify({
+					title: "Checkpoint cleanup",
+					message: "Open a project session first.",
+					variant: "warning",
+				});
+				return;
+			}
+			try {
+				const plan = await planCheckpointCleanup({ projectDirectory });
+				if (plan.older.length === 0) {
+					notify({
+						title: "Checkpoint cleanup",
+						message: "No older checkpoints to delete.",
+						variant: "info",
+					});
+					return;
+				}
+				const count = plan.older.length;
+				const confirmed = await context.ui.dialog.confirm({
+					title: "Delete older checkpoints?",
+					message:
+						`Delete ${count} older checkpoint${count === 1 ? "" : "s"} from .sessionport? ` +
+						"The newest checkpoint will be kept. This cannot be undone.",
+					label: { confirm: "Delete", cancel: "Cancel" },
+				});
+				if (confirmed !== true) return;
+				const deleted = await deleteCheckpointArtifacts(plan.older);
+				notify({
+					title: "Checkpoint cleanup",
+					message:
+						`Deleted ${deleted} older checkpoint${deleted === 1 ? "" : "s"}. ` +
+						"The newest checkpoint was kept.",
+					variant: "success",
+				});
+			} catch {
+				notify({
+					title: "Checkpoint cleanup failed",
+					message: "Checkpoint cleanup stopped unexpectedly; review the .sessionport directory.",
+					variant: "error",
+				});
+			}
+		},
+	});
 	const handlers = createSessionPortHandlers({
 		client: context.client,
 		getActiveDirectory: () => context.location?.directory,
 		dialog: context.ui.dialog,
-		notify: (notification) => {
-			context.ui.toast.show({
-				title: notification.title,
-				message: notification.message,
-				variant: notification.variant,
-			});
-		},
+		chooseCheckpointRetention: (insights) => checkpointRetentionUi.choose(insights),
+		chooseRestoreImportMode: () => restoreImportModeUi.choose(),
+		notify,
 		showRestoreReport: (model) => showRestoreReportDialog(context, model),
 		restoreReplacementUi: createRestoreReplacementUi(context),
 		resolveRecoveryArtifactPath,
@@ -150,7 +225,13 @@ export async function installSessionPortWiring(
 	const slotDispose = installSessionPortCommands(context, {
 		checkpoint: handlers.checkpoint,
 		restore: handlers.restore,
+		settings: () => {
+			settingsUi.open();
+		},
 		...(cloudAuth !== undefined ? { sync: cloudAuth.sync } : {}),
+	});
+	const sidebarDispose = installSessionPortSidebarActions(context, {
+		enabled: sidebarActionsEnabled,
 	});
 
 	let cleanupPromise: Promise<void> | undefined;
@@ -187,6 +268,13 @@ export async function installSessionPortWiring(
 			slotDispose();
 		} catch {
 			slotFailure = true;
+		}
+		if (sidebarDispose !== undefined) {
+			try {
+				sidebarDispose();
+			} catch {
+				slotFailure = true;
+			}
 		}
 
 		let releaseFailure = false;
