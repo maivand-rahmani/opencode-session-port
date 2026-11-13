@@ -30,7 +30,7 @@ interface EntrySpec {
 	readonly source: string;
 	/** Planned target session ID; defaults to the source ID. */
 	readonly target?: string;
-	readonly classification?: "imported" | "renamed" | "skipped";
+	readonly classification?: "imported" | "renamed" | "updated" | "skipped";
 	readonly skipReason?: "exact-local-duplicate" | "exact-planned-retry";
 	/** Planned target session ID of the parent entry, when this session has one. */
 	readonly parent?: string;
@@ -208,6 +208,16 @@ describe("runRestoreExecution", () => {
 
 		expect(recording.calls.length).toBe(3);
 		expect(recording.calls.every((call) => call.target.directory === "D:/explicit/restore/target")).toBe(true);
+	});
+
+	test("rejects an in-place update entry because only the replacement executor may run it", async () => {
+		const entry = makeEntry({ source: "ses_a", classification: "updated" });
+		const recording = createRecordingImporter();
+
+		await expect(
+			runRestoreExecution({ plan: makePlan([entry]), importer: recording.importer, targetDirectory: TARGET_DIRECTORY }),
+		).rejects.toThrow(/in-place update/);
+		expect(recording.calls).toHaveLength(0);
 	});
 
 	test("a failed parent blocks its descendants while independent branches continue", async () => {

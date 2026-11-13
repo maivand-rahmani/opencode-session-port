@@ -4,7 +4,7 @@
  * shortened to fit a notification or a crowded list.
  */
 
-export type RestoreReportClassification = "skipped" | "imported" | "renamed";
+export type RestoreReportClassification = "skipped" | "imported" | "renamed" | "updated";
 
 export type RestoreReportStatus =
 	| "imported"

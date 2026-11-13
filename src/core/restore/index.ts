@@ -18,12 +18,24 @@ export type {
 	RestorePlan,
 	RestorePlanEntry,
 	RestorePlanErrorCode,
+	RestorePlanNote,
 	RestoreSkipReason,
 } from "./planner.ts";
 export { createRemappedIdDeriver, RemappedIdError } from "./identity.ts";
 export type { RemappedIdDeriver, RemappedIdErrorCode, RemappedIdNamespace } from "./identity.ts";
 export {
+	readLineageID,
+	SESSIONPORT_LINEAGE_VERSION,
+	SESSIONPORT_METADATA_KEY,
+	sessionLineageID,
+	stampSessionLineage,
+} from "./lineage.ts";
+export {
+	classifyLineageUpdate,
 	classifyReplacement,
+	fingerprintSessionContent,
+	fingerprintSessionLineageInfo,
+	fingerprintSessionMessages,
 	fingerprintSessionRecord,
 	prepareStandaloneRecord,
 	ReplacementPolicyError,

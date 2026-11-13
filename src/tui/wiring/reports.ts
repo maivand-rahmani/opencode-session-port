@@ -5,16 +5,21 @@
  * or exception text is NEVER interpolated. Classification uses stable error
  * classes/codes only, never message text, so a failure report cannot leak
  * session IDs, paths, host internals, or password material. Checkpoint
- * collection failures, restore collection failures, and restore plan failures
- * additionally append a fixed human reason and the exact machine code, but
- * only for `SessionCollectionError`/`RestorePlanError` codes on explicit
- * allowlists; unknown or forged codes keep the generic text. Exact user-facing
- * copy remains OPEN (OQ-15); these strings are the wiring lane's generic
- * sanitized categories.
+ * collection failures, restore collection failures, restore plan failures, and
+ * crypto container failures additionally append a fixed human reason and the
+ * exact machine code, but only for `SessionCollectionError`/`RestorePlanError`/
+ * `CryptoContainerError` codes on explicit allowlists; unknown or forged codes
+ * keep the generic text. Raw filesystem error codes are mapped to fixed copy
+ * and are never echoed, and memory-exhaustion `RangeError`s get a fixed
+ * resource category. Exact user-facing copy remains OPEN (OQ-15); these
+ * strings are the wiring lane's generic sanitized categories.
  *
  * Truthful-outcome rules:
  * - Checkpoint success is reported only for a `written` outcome with the
- *   artifact path, encrypted byte count, and session count.
+ *   artifact path, encrypted byte count, and session count. When the
+ *   checkpoint-only retention policy supplied a summary, one fixed sentence
+ *   additionally reports the kept/excluded project-session counts so the user
+ *   knows older subagent sessions are deliberately absent from the artifact.
  * - Restore success is reported only for a non-empty execution result with at
  *   least one imported session and no failed/blocked/not-attempted entries; an
  *   empty artifact, cancel, capability absence, authentication failure, and
@@ -33,7 +38,7 @@
 import { ArtifactFileError } from "../artifacts/files.ts";
 import { HostAdapterError, ProjectDestinationError } from "../adapters/index.ts";
 import { LocationResolutionError } from "../adapters/location-resolver.ts";
-import { CryptoContainerError } from "../../core/crypto/errors.ts";
+import { CryptoContainerError, type CryptoErrorCode } from "../../core/crypto/errors.ts";
 import { RestorePlanError, type RestorePlanErrorCode } from "../../core/restore/planner.ts";
 import { SessionCollectionError, type SessionCollectionErrorCode } from "../../core/sessions/index.ts";
 import { RESTORE_PASSWORD_ATTEMPT_LIMIT } from "../orchestration/index.ts";
@@ -62,8 +67,33 @@ export interface SessionPortNotification {
 /* Checkpoint reports                                                        */
 /* ------------------------------------------------------------------------- */
 
-/** Reports one completed checkpoint outcome with its raw path/size/count facts. */
-export function reportCheckpointOutcome(outcome: CheckpointOutcome): SessionPortNotification {
+/**
+ * Adapter-supplied retention facts for a written checkpoint: the configured
+ * retention mode, total project sessions, how many were kept, how many older
+ * subagent sessions were excluded by the checkpoint-only retention policy, and
+ * the configured subagent limit. All counts are numbers produced by our own
+ * adapter, never raw error text; `mode` is a fixed union, never host text.
+ */
+export interface CheckpointRetentionSummary {
+	readonly mode: "latest" | "since-compaction" | "all" | "roots";
+	readonly projectSessionCount: number;
+	readonly keptSessionCount: number;
+	readonly excludedSessionCount: number;
+	readonly keptRootCount: number;
+	readonly maxSubagentSessions: number | null;
+	readonly maxRootSessions: number | null;
+}
+
+/**
+ * Reports one completed checkpoint outcome with its raw path/size/count facts.
+ * When a retention summary is supplied for a `written` outcome, one fixed,
+ * mode-named sentence truthfully states whether older subagent sessions were
+ * excluded; the other outcomes ignore it because retention does not apply.
+ */
+export function reportCheckpointOutcome(
+	outcome: CheckpointOutcome,
+	retention?: CheckpointRetentionSummary,
+): SessionPortNotification {
 	switch (outcome.status) {
 		case "no-sessions":
 			return {
@@ -77,13 +107,79 @@ export function reportCheckpointOutcome(outcome: CheckpointOutcome): SessionPort
 				message: "The password prompt was canceled; no artifact was written.",
 				variant: "info",
 			};
-		case "written":
+		case "written": {
+			const message = `Wrote ${outcome.artifactPath} (${outcome.encryptedBytes} bytes, ${outcome.sessionCount} sessions).`;
 			return {
 				title: "Checkpoint created",
-				message: `Wrote ${outcome.artifactPath} (${outcome.encryptedBytes} bytes, ${outcome.sessionCount} sessions).`,
+				message: retention === undefined ? message : message + retentionSentence(retention),
 				variant: "success",
 			};
+		}
 	}
+}
+
+/**
+ * Fixed mode-specific prefix for the retention sentence appended to a written
+ * checkpoint report. The prefix names the configured retention mode; only the
+ * interpolated adapter counts differ afterward, and no host text is included.
+ */
+function retentionPrefix(mode: CheckpointRetentionSummary["mode"]): string {
+	switch (mode) {
+		case "latest":
+			return " Experimental retention (latest subagent sessions):";
+		case "since-compaction":
+			return " Experimental retention (subagents after compaction):";
+		case "all":
+			return " Experimental retention (all sessions):";
+		case "roots":
+			return " Experimental retention (last root sessions):";
+	}
+}
+
+/**
+ * Fixed retention sentence appended to a written checkpoint report. The prefix
+ * names the configured mode; the remainder states the kept/excluded counts
+ * with mode-specific explanations. No raw error text is ever included.
+ */
+function retentionSentence(retention: CheckpointRetentionSummary): string {
+	const prefix = retentionPrefix(retention.mode);
+	if (retention.excludedSessionCount > 0) {
+		switch (retention.mode) {
+			case "latest":
+				return (
+					`${prefix} kept ${retention.keptSessionCount} of ${retention.projectSessionCount} project sessions ` +
+					`(all root sessions plus the latest ${retention.maxSubagentSessions} subagent sessions); ` +
+					`${retention.excludedSessionCount} older subagent sessions were excluded.`
+				);
+			case "since-compaction":
+				return (
+					`${prefix} kept ${retention.keptSessionCount} of ${retention.projectSessionCount} project sessions ` +
+					"(all root sessions plus subagent sessions created after the most recent compaction); " +
+					`${retention.excludedSessionCount} older subagent sessions were excluded.`
+				);
+			case "all":
+				return (
+					`${prefix} kept ${retention.keptSessionCount} of ${retention.projectSessionCount} project sessions; ` +
+					`${retention.excludedSessionCount} subagent sessions were excluded.`
+				);
+			case "roots":
+				return (
+					`${prefix} kept ${retention.keptSessionCount} of ${retention.projectSessionCount} project sessions ` +
+					`(the ${retention.keptRootCount} most recently active root sessions plus all of their subagent sessions); ` +
+					`${retention.excludedSessionCount} older sessions were excluded.`
+				);
+		}
+	}
+	return `${prefix} all ${retention.projectSessionCount} project sessions were kept.`;
+}
+
+/** The user closed the retention-choice dialog before collection; nothing was written. */
+export function reportCheckpointRetentionCanceled(): SessionPortNotification {
+	return {
+		title: "Checkpoint canceled",
+		message: "No checkpoint size option was chosen; no artifact was written.",
+		variant: "info",
+	};
 }
 
 /** Reports one checkpoint failure as a fixed, sanitized category. */
@@ -105,7 +201,19 @@ export function reportCheckpointFailure(error: unknown): SessionPortNotification
 		case "artifact-path":
 			return checkpointFailure("The artifact output path is not usable; no artifact was written.");
 		case "crypto":
-			return checkpointFailure("The checkpoint could not be encrypted; no artifact was written.");
+			return checkpointFailure(
+				cryptoFailureMessage(error, "The checkpoint could not be encrypted; no artifact was written."),
+			);
+		case "resource":
+			return checkpointFailure(
+				"The checkpoint could not be built because the session data is too large for the available memory; no artifact was written.",
+			);
+		case "filesystem": {
+			const code = filesystemCode(error);
+			const message = code === undefined ? undefined : checkpointFilesystemFailureMessage(code);
+			if (message !== undefined) return checkpointFailure(message);
+			break;
+		}
 		case "destinations":
 		case "plan":
 		case "authentication":
@@ -176,6 +284,99 @@ function withKnownCollectionReason(error: unknown, base: string): string {
 	if (!Object.hasOwn(COLLECTION_FAILURE_REASONS, code)) return base;
 	const reason = COLLECTION_FAILURE_REASONS[code as SessionCollectionErrorCode];
 	return `${base} Reason: ${reason} (${code}).`;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Crypto and filesystem failure reasons (fixed allowlists only)             */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Fixed human reason per known `CryptoContainerError` code — the explicit
+ * allowlist shared by the checkpoint and restore crypto categories. The raw
+ * code is echoed only on an exact key match and the raw `error.message` is
+ * never used; crypto messages may carry container internals. Adding a code to
+ * `CryptoErrorCode` fails compilation until a fixed reason is added here.
+ */
+const CRYPTO_FAILURE_REASONS: Readonly<Record<CryptoErrorCode, string>> = {
+	"invalid-policy-definition": "the crypto policy configuration was invalid",
+	"unknown-policy": "the selected crypto policy is unknown",
+	"unknown-kdf-profile": "the crypto key-derivation profile is unknown",
+	"invalid-password": "the password material was invalid",
+	"unsupported-runtime": "the required crypto runtime is unavailable",
+	"invalid-header": "the encrypted artifact header was invalid",
+	"unsupported-format-version": "the artifact format version is unsupported",
+	"unsupported-algorithm": "the artifact algorithm is unsupported",
+	"artifact-too-large": "the encrypted artifact would exceed the configured size limit",
+	"invalid-artifact-source": "the checkpoint data stream was invalid",
+	"truncated-artifact": "the encrypted artifact ended unexpectedly",
+	"invalid-frame": "the encrypted artifact contains an invalid frame",
+	"cipher-failure": "encryption or decryption failed",
+	"authentication-failed": "the password or artifact authentication failed",
+	"unexpected-tag": "the encrypted artifact contains an unexpected frame tag",
+	"missing-final-tag": "the encrypted artifact is missing its final frame",
+	"trailing-data": "the encrypted artifact contains trailing data",
+	"compressed-limit-exceeded": "the compressed checkpoint data exceeds the configured size limit",
+	"decompressed-limit-exceeded": "the session data exceeds the configured size limit",
+	"expansion-limit-exceeded": "the checkpoint data exceeds the configured compression ratio limit",
+	"gzip-error": "the checkpoint data could not be compressed or decompressed",
+};
+
+/**
+ * Crypto failure copy: appends `Reason: <fixed human reason> (<known code>).`
+ * to `base` only for a `CryptoContainerError` whose code is an own key on the
+ * fixed map. Any other error or unknown/forged code keeps `base` unchanged;
+ * only allowlisted literal code strings are ever echoed, never `error.message`.
+ */
+function cryptoFailureMessage(error: unknown, base: string): string {
+	if (!(error instanceof CryptoContainerError)) return base;
+	const code: string = error.code;
+	if (!Object.hasOwn(CRYPTO_FAILURE_REASONS, code)) return base;
+	const reason = CRYPTO_FAILURE_REASONS[code as CryptoErrorCode];
+	return `${base} Reason: ${reason} (${code}).`;
+}
+
+/**
+ * Fixed checkpoint-write copy per raw filesystem code. Only these codes map to
+ * a specific message; every other code falls through to the generic unknown
+ * copy. The raw code and `error.message` (which can contain paths) are never
+ * echoed.
+ */
+function checkpointFilesystemFailureMessage(code: string): string | undefined {
+	switch (code) {
+		case "ENOSPC":
+			return "There is not enough free disk space to write the checkpoint; no artifact was written.";
+		case "EACCES":
+		case "EPERM":
+		case "EROFS":
+			return "The checkpoint could not be written because the output location is not writable; no artifact was written.";
+		case "EBUSY":
+		case "ETXTBSY":
+		case "EMFILE":
+		case "ENFILE":
+			return "The checkpoint file could not be written because the output location is busy; no artifact was written.";
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Fixed restore-read copy per raw filesystem code (pre-execution only). Only
+ * these codes map to a specific message; every other code falls through to the
+ * generic unknown copy. The raw code and `error.message` are never echoed.
+ */
+function restoreFilesystemFailureMessage(code: string): string | undefined {
+	switch (code) {
+		case "ENOENT":
+			return "The checkpoint file no longer exists; no sessions were changed.";
+		case "EACCES":
+		case "EPERM":
+			return "The checkpoint file could not be read because it is not accessible; no sessions were changed.";
+		case "EISDIR":
+		case "ENOTDIR":
+			return "The checkpoint path is not a regular file; no sessions were changed.";
+		default:
+			return undefined;
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -340,7 +541,18 @@ export function reportRestoreFailure(error: unknown, executionStarted: boolean):
 		case "authentication":
 			return restoreFailure("The checkpoint could not be authenticated; no sessions were changed.");
 		case "crypto":
-			return restoreFailure("The file could not be opened as a SessionPort checkpoint; no sessions were changed.");
+			return restoreFailure(
+				cryptoFailureMessage(error, "The file could not be opened as a SessionPort checkpoint; no sessions were changed."),
+			);
+		case "resource":
+			return restoreFailure(
+				"The checkpoint could not be processed because its data is too large for the available memory; no sessions were changed.",
+			);
+		case "filesystem": {
+			const code = filesystemCode(error);
+			const message = code === undefined ? undefined : restoreFilesystemFailureMessage(code);
+			return restoreFailure(message ?? "Restore failed; no sessions were changed.");
+		}
 		case "unknown":
 			return restoreFailure("Restore failed; no sessions were changed.");
 	}
@@ -369,7 +581,7 @@ export function reportRestoreReplacementFallback(report: RestoreReplacementRepor
 	const count = (outcome: string): number =>
 		report.entries.filter((entry) => entry.outcome === outcome).length;
 	const lines = [
-		`Restore finished: ${count("replaced")} replaced, ${count("copied")} copied, ${count("imported")} imported, ` +
+		`Restore finished: ${count("replaced")} replaced, ${count("updated")} updated, ${count("copied")} copied, ${count("imported")} imported, ` +
 			`${count("skipped")} skipped, ${count("kept")} kept, ${count("failed")} failed, ${count("uncertain")} uncertain ` +
 			`(${report.entries.length} total). The per-session report could not be displayed.`,
 	];
@@ -503,7 +715,20 @@ type FailureCategory =
 	| "path-exists"
 	| "authentication"
 	| "crypto"
+	| "resource"
+	| "filesystem"
 	| "unknown";
+
+/**
+ * Reads only a string `code` from a non-null, non-array object. Raw fs errors
+ * propagate unwrapped from the artifact writer/reader; their messages (which
+ * contain paths) are never inspected.
+ */
+function filesystemCode(error: unknown): string | undefined {
+	if (error === null || typeof error !== "object" || Array.isArray(error)) return undefined;
+	const code = (error as { readonly code?: unknown }).code;
+	return typeof code === "string" ? code : undefined;
+}
 
 function classifyFailure(error: unknown): FailureCategory {
 	if (error instanceof HostAdapterError) {
@@ -519,5 +744,9 @@ function classifyFailure(error: unknown): FailureCategory {
 	if (error instanceof CryptoContainerError) {
 		return error.code === "authentication-failed" ? "authentication" : "crypto";
 	}
+	// Checked before the filesystem probe: a RangeError carrying a `code` is a
+	// resource failure, not a raw filesystem failure.
+	if (error instanceof RangeError) return "resource";
+	if (filesystemCode(error) !== undefined) return "filesystem";
 	return "unknown";
 }

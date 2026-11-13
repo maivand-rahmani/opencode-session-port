@@ -17,7 +17,8 @@
  *       → cancel ⇒ `canceled` outcome, before path resolution and write
  *     → resolveCheckpointOutputPath({ projectDirectory, explicitPath? }) (P-15)
  *     → cryptoFactory.create(cryptoPolicy) (explicit injected policy only)
- *     → crypto.seal(asOneShotByteSource(serializeCheckpointPayload(payload)), password)
+ *     → crypto.seal(serializeCheckpointPayloadChunks(payload), password)
+ *       (bounded-memory streaming serializer; seal pulls it lazily)
  *     → writeEncryptedArtifact(path, sealedSource)
  *
  * Password handling: the resolved `Uint8Array` is treated as flow-owned and is
@@ -59,14 +60,13 @@
 
 import {
 	collectCheckpointPayloadWithDependencies,
-	serializeCheckpointPayload,
+	serializeCheckpointPayloadChunks,
 	type SessionCollectionPolicy,
 	type SessionDependencyReadPort,
 } from "../../core/sessions/index.ts";
 import type { ByteSource, CheckpointCryptoFactory, CryptoPolicy } from "../../core/contracts/index.ts";
 import type { ResolveCheckpointOutputPathOptions } from "../artifacts/files.ts";
 import {
-	asOneShotByteSource,
 	isRecordValue,
 	requireCallable,
 	requireNonEmptyString,
@@ -156,9 +156,11 @@ export async function runCheckpointFlow(
 			...(input.explicitOutputPath !== undefined ? { explicitPath: input.explicitOutputPath } : {}),
 		});
 		const crypto = await input.cryptoFactory.create(input.cryptoPolicy);
-		// `serializeCheckpointPayload` returns bytes; `seal` consumes a ByteSource,
-		// so the serialized payload is handed over as a one-shot borrowed chunk.
-		const sealed = await crypto.seal(asOneShotByteSource(serializeCheckpointPayload(payload)), password);
+		// `serializeCheckpointPayloadChunks` streams the exact JSON bytes in
+		// bounded chunks; `seal` consumes that ByteSource lazily, after its KDF.
+		// A long session therefore never materializes one whole-payload string or
+		// byte array, which was the memory spike that failed after the password.
+		const sealed = await crypto.seal(serializeCheckpointPayloadChunks(payload), password);
 		const encryptedBytes = await input.writeEncryptedArtifact(artifactPath, sealed);
 		if (typeof encryptedBytes !== "number" || !Number.isSafeInteger(encryptedBytes) || encryptedBytes < 0) {
 			throw new TypeError("writeEncryptedArtifact must resolve with the exact non-negative integer byte count written");

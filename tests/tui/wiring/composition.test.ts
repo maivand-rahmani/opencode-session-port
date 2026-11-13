@@ -27,6 +27,7 @@ import {
 	TEST_ACTIVE_DIRECTORY,
 	TEST_DEST_DIRECTORY,
 	TEST_DEST_PROJECT_ID,
+	type WiringHarnessOptions,
 	userMessage,
 } from "./test-support.ts";
 
@@ -118,6 +119,114 @@ describe("checkpoint command callback", () => {
 		expect(harness.crypto.sealPasswords).toHaveLength(0);
 	});
 
+	test("checkpoint applies the user's retention choice and reports it", async () => {
+		const sessions = [
+			sessionRecord("ses_root", [userMessage("msg_root")], "proj_active"),
+			sessionRecord("ses_child_a", [userMessage("msg_a")], "proj_active", {
+				parentID: "ses_root",
+				time: { created: 1, updated: 10 },
+			}),
+			sessionRecord("ses_child_b", [userMessage("msg_b")], "proj_active", {
+				parentID: "ses_root",
+				time: { created: 1, updated: 20 },
+			}),
+		];
+		let choices = 0;
+		const harness = createWiringHarness({
+			client: { sessions },
+			chooseCheckpointRetention: async () => {
+				choices += 1;
+				return { mode: "latest", maxSubagentSessions: 1, maxRootSessions: null };
+			},
+		});
+
+		await harness.handlers.checkpoint(undefined);
+
+		expect(choices).toBe(1);
+		expect(harness.notifications[0]?.variant).toBe("success");
+		expect(harness.notifications[0]?.message).toContain("2 sessions");
+		expect(harness.notifications[0]?.message).toContain("latest 1 subagent sessions");
+		// Only the root and the newest child are collected; the older child is
+		// excluded from both the collection and the artifact.
+		const collected = harness.client.messageListInputs.map((input) => input.sessionID);
+		expect(collected).toContain("ses_root");
+		expect(collected).toContain("ses_child_b");
+		expect(collected).not.toContain("ses_child_a");
+	});
+
+	test("roots mode receives root-age insights, keeps the newest root plus all of its descendants, and reports it", async () => {
+		const sessions = [
+			sessionRecord("ses_root_old", [userMessage("msg_root_old")], "proj_active", {
+				time: { created: 1, updated: 1 },
+			}),
+			sessionRecord("ses_root_new", [userMessage("msg_root_new")], "proj_active", {
+				time: { created: 1, updated: 100 },
+			}),
+			sessionRecord("ses_child_old", [userMessage("msg_child_old")], "proj_active", {
+				parentID: "ses_root_old",
+				time: { created: 1, updated: 3 },
+			}),
+			sessionRecord("ses_child_new", [userMessage("msg_child_new")], "proj_active", {
+				parentID: "ses_root_new",
+				time: { created: 1, updated: 4 },
+			}),
+			sessionRecord("ses_grandchild_new", [userMessage("msg_grandchild_new")], "proj_active", {
+				parentID: "ses_child_new",
+				time: { created: 1, updated: 5 },
+			}),
+			sessionRecord("ses_orphan", [userMessage("msg_orphan")], "proj_active", {
+				parentID: "ses_missing",
+				time: { created: 1, updated: 6 },
+			}),
+		];
+		let insights: Parameters<NonNullable<WiringHarnessOptions["chooseCheckpointRetention"]>>[0] | undefined;
+		const harness = createWiringHarness({
+			client: { sessions },
+			chooseCheckpointRetention: async (received) => {
+				insights = received;
+				return { mode: "roots", maxSubagentSessions: null, maxRootSessions: 1 };
+			},
+		});
+
+		await harness.handlers.checkpoint(undefined);
+
+		expect(insights?.totalRootSessions).toBe(2);
+		expect(insights?.totalChildSessions).toBe(4);
+		expect(insights?.newestRootAt).toBe(100);
+		expect(insights?.recommendation.mode).toBe("roots");
+		expect(insights?.recommendation.maxRootSessions).toBe(1);
+		expect(harness.notifications[0]?.variant).toBe("success");
+		expect(harness.notifications[0]?.message).toContain("3 sessions");
+		expect(harness.notifications[0]?.message).toContain("last root sessions");
+		expect(harness.notifications[0]?.message).toContain("1 most recently active root sessions");
+		const collected = harness.client.messageListInputs.map((input) => input.sessionID);
+		expect(collected).toContain("ses_root_new");
+		expect(collected).toContain("ses_child_new");
+		expect(collected).toContain("ses_grandchild_new");
+		expect(collected).not.toContain("ses_root_old");
+		expect(collected).not.toContain("ses_child_old");
+		expect(collected).not.toContain("ses_orphan");
+	});
+
+	test("a canceled retention choice reads no messages and writes nothing", async () => {
+		const harness = createWiringHarness({
+			client: { sessions: [sessionRecord("ses_a", [userMessage("msg_a1")], "proj_active")] },
+			chooseCheckpointRetention: async () => undefined,
+		});
+
+		await harness.handlers.checkpoint(undefined);
+
+		expect(harness.notifications[0]?.variant).toBe("info");
+		expect(harness.notifications[0]?.message).toContain("No checkpoint size option was chosen");
+		// The chooser now receives metadata-only root-age insights before it
+		// renders, so one project list read happens even when the user cancels.
+		// No message is read, no password is requested, and nothing is written.
+		expect(harness.client.sessionListInputs).toHaveLength(1);
+		expect(harness.client.messageListInputs).toHaveLength(0);
+		expect(harness.password.calls).toHaveLength(0);
+		expect(harness.artifacts.writeCalls).toHaveLength(0);
+	});
+
 	test("canceled password: reports canceled without path, crypto, or write", async () => {
 		const harness = createWiringHarness({
 			client: { sessions: [sessionRecord("ses_a", [userMessage("msg_a1")], "proj_active")] },
@@ -197,6 +306,9 @@ describe("checkpoint command callback", () => {
 		// dependency-project session.list scan happened.
 		expect(harness.client.sessionGetInputs).toEqual([{ sessionID: "ses_ext_parent" }]);
 		expect(harness.client.projectListCalls).toBe(0);
+		// The retention pre-pass is the only project-scoped list call: it
+		// materializes the kept set, and the collector consumes that set without
+		// another host listing.
 		expect(harness.client.sessionListInputs).toEqual([{ project: "proj_active", limit: 50 }]);
 		const collectedMessageSessionIDs = harness.client.messageListInputs.map((input) => input.sessionID);
 		expect(collectedMessageSessionIDs).toHaveLength(2);

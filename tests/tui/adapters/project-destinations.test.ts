@@ -234,15 +234,23 @@ describe("conservative duplicate and ambiguity handling", () => {
 		]);
 	});
 
-	test("rejects conflicting projectID/canonical values", () => {
+	test("keeps multiple project IDs for one canonical directory for later resolution", () => {
+		const candidates = mapProjectListResponse([
+			{ id: "proj-1", canonical: "C:/work/one" },
+			{ id: "proj-2", canonical: "C:/work/one" },
+		]);
+
+		expect(candidates).toEqual([
+			{ projectID: "proj-1", targetDirectory: "C:/work/one", label: "C:/work/one" },
+			{ projectID: "proj-2", targetDirectory: "C:/work/one", label: "C:/work/one" },
+		]);
+	});
+
+	test("rejects conflicting projectID values and label conflicts", () => {
 		const conflicting: unknown[][] = [
 			[
 				{ id: "proj-1", canonical: "C:/work/one" },
 				{ id: "proj-1", canonical: "C:/work/other" },
-			],
-			[
-				{ id: "proj-1", canonical: "C:/work/one" },
-				{ id: "proj-2", canonical: "C:/work/one" },
 			],
 			[
 				{ id: "proj-1", canonical: "C:/work/one", name: "One" },
@@ -253,6 +261,104 @@ describe("conservative duplicate and ambiguity handling", () => {
 			const error = captureProjectDestinationError(() => mapProjectListResponse(records));
 			expect(error.code).toBe("invalid-response");
 		}
+	});
+});
+
+describe("duplicate canonical directory resolution", () => {
+	const duplicateRecords = [
+		{ id: "proj-1", canonical: "C:/work/one" },
+		{ id: "proj-2", canonical: "C:/work/one" },
+	];
+
+	test("keeps the project ID the host resolves for the duplicate directory", async () => {
+		const locationCalls: unknown[] = [];
+		const client = {
+			project: {
+				async list(): Promise<unknown> {
+					return duplicateRecords;
+				},
+			},
+			location: {
+				async get(input: unknown): Promise<unknown> {
+					locationCalls.push(input);
+					return {
+						directory: "C:/work/one",
+						project: { id: "proj-2", directory: "C:/work/one", canonical: "C:/work/one" },
+					};
+				},
+			},
+		};
+		const adapter = createProjectDestinationsAdapter(client);
+
+		const candidates = await adapter.listDestinations();
+
+		expect(candidates).toEqual([
+			{ projectID: "proj-2", targetDirectory: "C:/work/one", label: "C:/work/one" },
+		]);
+		expect(locationCalls).toEqual([{ location: { directory: "C:/work/one" } }]);
+	});
+
+	test("fails closed with capability-unavailable when duplicate directories need location.get", async () => {
+		const client = {
+			project: {
+				async list(): Promise<unknown> {
+					return duplicateRecords;
+				},
+			},
+		};
+		const adapter = createProjectDestinationsAdapter(client);
+
+		await expect(adapter.listDestinations()).rejects.toMatchObject({
+			name: "HostAdapterError",
+			code: "capability-unavailable",
+		});
+	});
+
+	test("fails closed when location.get does not match a grouped project ID", async () => {
+		const client = {
+			project: {
+				async list(): Promise<unknown> {
+					return duplicateRecords;
+				},
+			},
+			location: {
+				async get(): Promise<unknown> {
+					return {
+						directory: "C:/work/one",
+						project: { id: "proj-other", directory: "C:/work/one", canonical: "C:/work/one" },
+					};
+				},
+			},
+		};
+		const adapter = createProjectDestinationsAdapter(client);
+
+		await expect(adapter.listDestinations()).rejects.toMatchObject({
+			name: "ProjectDestinationError",
+			code: "invalid-response",
+		});
+	});
+
+	test("does not call location.get when every canonical directory is unique", async () => {
+		let locationCalls = 0;
+		const client = {
+			project: {
+				async list(): Promise<unknown> {
+					return [{ id: "proj-1", canonical: "C:/work/one" }];
+				},
+			},
+			location: {
+				async get(): Promise<unknown> {
+					locationCalls += 1;
+					throw new Error("must not be called");
+				},
+			},
+		};
+		const adapter = createProjectDestinationsAdapter(client);
+
+		const candidates = await adapter.listDestinations();
+
+		expect(candidates).toHaveLength(1);
+		expect(locationCalls).toBe(0);
 	});
 });
 

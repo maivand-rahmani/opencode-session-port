@@ -546,6 +546,8 @@ export interface WiringHarnessOptions {
 	readonly report?: FakeRestoreReportOptions;
 	/** Bare `/restore` resolver result; a configured Error is thrown. Default: no checkpoint found. */
 	readonly latestArtifact?: string | Error;
+	readonly chooseCheckpointRetention?: SessionPortHandlerDependencies["chooseCheckpointRetention"];
+	readonly chooseRestoreImportMode?: SessionPortHandlerDependencies["chooseRestoreImportMode"];
 }
 
 export interface WiringHarness {
@@ -591,6 +593,12 @@ export function createWiringHarness(options: WiringHarnessOptions = {}): WiringH
 		notify: (notification) => {
 			notifications.push(notification);
 		},
+		...(options.chooseCheckpointRetention !== undefined
+			? { chooseCheckpointRetention: options.chooseCheckpointRetention }
+			: {}),
+		...(options.chooseRestoreImportMode !== undefined
+			? { chooseRestoreImportMode: options.chooseRestoreImportMode }
+			: {}),
 		showRestoreReport: report.showRestoreReport,
 		requestPassword: password.provider,
 		cryptoFactory: crypto.factory,

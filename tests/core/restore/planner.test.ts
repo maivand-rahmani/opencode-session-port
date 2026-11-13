@@ -23,6 +23,7 @@ import {
 	createRemappedIdDeriver,
 	planRestore,
 	RestorePlanError,
+	stampSessionLineage,
 	type RemappedIdDeriver,
 	type RestorePlan,
 	type RestorePlanEntry,
@@ -61,9 +62,43 @@ function sessionRecord(
 ): SessionRecord {
 	const messages: Array<Record<string, unknown>> = [];
 	for (let index = 0; index < messageIDs.length; index++) {
-		messages.push({ id: messageIDs[index]!, role: "user", ...(messageExtras[index] ?? {}) });
+		// Content-bearing text keeps fixtures realistic: session identity must not
+		// be inferred from IDs alone, and distinct messages must stay distinct
+		// after the content fingerprint strips their IDs.
+		messages.push({
+			id: messageIDs[index]!,
+			role: "user",
+			text: `${id}:${messageIDs[index]!}`,
+			...(messageExtras[index] ?? {}),
+		});
 	}
 	return { info: { id, projectID: "proj_test", ...infoExtra }, messages } as unknown as SessionRecord;
+}
+
+function lineageRecord(
+	id: string,
+	messages: ReadonlyArray<{ readonly id: string; readonly text: string }>,
+	infoExtra: Record<string, unknown> = {},
+	lineage?: string,
+): SessionRecord {
+	const record = {
+		info: {
+			id,
+			projectID: "proj_test",
+			title: "Lineage title",
+			cost: 0,
+			tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+			time: { created: 1, updated: 2 },
+			...infoExtra,
+		},
+		messages: messages.map((message) => ({
+			id: message.id,
+			role: "user",
+			text: message.text,
+			time: { created: 1 },
+		})),
+	} as unknown as SessionRecord;
+	return lineage === undefined ? record : stampSessionLineage(record, lineage);
 }
 
 function payloadOf(sessions: readonly SessionRecord[]): CheckpointPayload {
@@ -200,6 +235,339 @@ describe("canonical full-record comparison (O-04)", () => {
 		const destination = sessionRecord("ses_a", ["msg_1"], { note: null });
 		const plan = runPlan([source], [destination]);
 		expect(plan.entries[0]!.classification).toBe("renamed");
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* Normalized content duplicates (idempotent repeated restores)        */
+/* ------------------------------------------------------------------ */
+
+describe("normalized content duplicate detection", () => {
+	test("skips the same content copied under derived session/message IDs", () => {
+		const source = sessionRecord(
+			"ses_a",
+			["msg_1"],
+			{
+				title: "Same title",
+				metadata: { topic: "same" },
+				time: { created: 5, updated: 9 },
+			},
+			[{ text: "message body" }],
+		);
+		const destination = sessionRecord(
+			derivedSessionID("ses_a"),
+			[derivedMessageID("msg_1")],
+			{
+				projectID: "proj_dest",
+				title: "Same title",
+				metadata: { topic: "same" },
+				time: { created: 5, updated: 999 },
+				version: "2.1.1",
+				slug: "different-slug",
+				location: { directory: "C:/other" },
+			},
+			[{ text: "message body" }],
+		);
+
+		const plan = runPlan([source], [destination]);
+
+		expect(plan.entries).toHaveLength(1);
+		expect(plan.entries[0]!.classification).toBe("skipped");
+		expect(plan.entries[0]!.skipReason).toBe("exact-content-duplicate");
+		expect(plan.importOrder).toHaveLength(0);
+	});
+
+	test("does not skip when message content changed", () => {
+		const source = sessionRecord("ses_a", ["msg_1"], { title: "Same" }, [{ text: "old body" }]);
+		const destination = sessionRecord(
+			"ses_local_copy",
+			["msg_local"],
+			{ title: "Same" },
+			[{ text: "new local message" }],
+		);
+
+		const plan = runPlan([source], [destination]);
+
+		expect(plan.entries[0]!.classification).not.toBe("skipped");
+		expect(plan.entries[0]!.skipReason).toBeUndefined();
+	});
+
+	test("does not skip when meaningful info metadata differs", () => {
+		const source = sessionRecord("ses_a", ["msg_1"], { title: "A", metadata: { k: 1 } });
+		const destination = sessionRecord("ses_local_copy", ["msg_local"], { title: "A", metadata: { k: 2 } });
+
+		const plan = runPlan([source], [destination]);
+
+		expect(plan.entries[0]!.classification).not.toBe("skipped");
+	});
+
+	test("does not skip when message order differs", () => {
+		const source = sessionRecord("ses_a", ["msg_1", "msg_2"]);
+		const destination = sessionRecord("ses_local_copy", ["msg_local_2", "msg_local_1"], {}, [
+			{ text: "text msg_2" },
+			{ text: "text msg_1" },
+		]);
+
+		const plan = runPlan([source], [destination]);
+
+		expect(plan.entries[0]!.classification).not.toBe("skipped");
+	});
+
+	test("a stale same-ID record whose messages are a prefix is skipped as lineage-current", () => {
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = sessionRecord("ses_a", ["msg_1", "msg_2"]);
+
+		const plan = runPlan([source], [destination]);
+
+		expect(plan.entries[0]!.classification).toBe("skipped");
+		expect(plan.entries[0]!.skipReason).toBe("lineage-current");
+	});
+
+	test("duplicate destination content is deterministic and still skipped", () => {
+		const source = sessionRecord("ses_a", ["msg_1"], { title: "T" }, [{ text: "same body" }]);
+		const first = sessionRecord("ses_copy_1", ["msg_c1"], { title: "T" }, [{ text: "same body" }]);
+		const second = sessionRecord("ses_copy_2", ["msg_c2"], { title: "T" }, [{ text: "same body" }]);
+
+		const plan = runPlan([source], [first, second]);
+
+		expect(plan.entries[0]!.classification).toBe("skipped");
+		expect(plan.entries[0]!.skipReason).toBe("exact-content-duplicate");
+		expect(plan.importOrder).toHaveLength(0);
+	});
+});
+
+/* ------------------------------------------------------------------ */
+/* Portable lineage reconciliation                                     */
+/* ------------------------------------------------------------------ */
+
+describe("portable lineage reconciliation", () => {
+	test("updates a continued lineage target under the existing destination ID", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+				{ id: "msg_a3", text: "three" },
+			],
+			{},
+			"ses_a",
+		);
+		const destination = lineageRecord(
+			"ses_copy",
+			[
+				{ id: "msg_c1", text: "one" },
+				{ id: "msg_c2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+
+		const plan = runPlan([source], [destination]);
+		const entry = entryFor(plan, "ses_a");
+
+		expect(entry.classification).toBe("updated");
+		expect(entry.targetSessionID).toBe("ses_copy");
+		expect(entry.copyOnly).toBeUndefined();
+		expect(entry.note).toBe("lineage-continuation");
+		expect(entry.record.info["id"]).toBe("ses_copy");
+		expect(messageIDsOf(entry.record)).toEqual([
+			derivedMessageID("msg_a1"),
+			derivedMessageID("msg_a2"),
+			derivedMessageID("msg_a3"),
+		]);
+		expect(plan.importOrder.map((ordered) => ordered.targetSessionID)).toEqual(["ses_copy"]);
+	});
+
+	test("an unstamped source matches a stamped local copy by ID fallback", () => {
+		const source = lineageRecord("ses_origin", [
+			{ id: "msg_a1", text: "one" },
+			{ id: "msg_a2", text: "two" },
+		]);
+		const destination = lineageRecord(
+			"ses_copy",
+			[{ id: "msg_c1", text: "one" }],
+			{},
+			"ses_origin",
+		);
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_origin");
+
+		expect(entry.classification).toBe("updated");
+		expect(entry.targetSessionID).toBe("ses_copy");
+	});
+
+	test("keeps the local copy when the incoming history is a prefix", () => {
+		const source = lineageRecord("ses_a", [{ id: "msg_a1", text: "one" }], {}, "ses_a");
+		const destination = lineageRecord(
+			"ses_copy",
+			[
+				{ id: "msg_c1", text: "one" },
+				{ id: "msg_c2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_a");
+
+		expect(entry.classification).toBe("skipped");
+		expect(entry.skipReason).toBe("lineage-current");
+	});
+
+	test("diverged different-ID lineages become a forced copy, never a delete", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a3", text: "three" },
+			],
+			{},
+			"ses_a",
+		);
+		const destination = lineageRecord(
+			"ses_copy",
+			[
+				{ id: "msg_c1", text: "one" },
+				{ id: "msg_c2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_a");
+
+		expect(entry.classification).toBe("imported");
+		expect(entry.targetSessionID).toBe("ses_a");
+		expect(entry.copyOnly).toBe(true);
+		expect(entry.note).toBe("lineage-conflict");
+	});
+
+	test("a meaningful info change turns a prefix into a conflict", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+			],
+			{ title: "New title" },
+			"ses_a",
+		);
+		const destination = lineageRecord("ses_copy", [{ id: "msg_c1", text: "one" }], { title: "Old title" }, "ses_a");
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_a");
+
+		expect(entry.classification).not.toBe("updated");
+		expect(entry.copyOnly).toBe(true);
+		expect(entry.note).toBe("lineage-conflict");
+	});
+
+	test("multiple destination copies with one lineage are ambiguous", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+		const first = lineageRecord("ses_copy_1", [{ id: "msg_c1", text: "one" }], {}, "ses_a");
+		const second = lineageRecord("ses_copy_2", [{ id: "msg_c2", text: "one" }], {}, "ses_a");
+
+		const entry = entryFor(runPlan([source], [first, second]), "ses_a");
+
+		expect(entry.classification).not.toBe("updated");
+		expect(entry.copyOnly).toBe(true);
+		expect(entry.note).toBe("lineage-ambiguous");
+	});
+
+	test("a destination child reference blocks an in-place update", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+		const destination = lineageRecord("ses_copy", [{ id: "msg_c1", text: "one" }], {}, "ses_a");
+		const child = lineageRecord("ses_child", [{ id: "msg_ch1", text: "child" }], { parentID: "ses_copy" }, "ses_child");
+
+		const entry = entryFor(runPlan([source], [destination, child]), "ses_a");
+
+		expect(entry.classification).not.toBe("updated");
+		expect(entry.copyOnly).toBe(true);
+		expect(entry.note).toBe("lineage-linked");
+	});
+
+	test("two artifact sessions sharing a lineage are never reconciled in place", () => {
+		const first = lineageRecord("ses_a", [{ id: "msg_a1", text: "one" }], {}, "ses_shared");
+		const second = lineageRecord(
+			"ses_b",
+			[
+				{ id: "msg_b1", text: "one" },
+				{ id: "msg_b2", text: "two" },
+			],
+			{},
+			"ses_shared",
+		);
+		const destination = lineageRecord("ses_copy", [{ id: "msg_c1", text: "one" }], {}, "ses_shared");
+
+		const plan = runPlan([first, second], [destination]);
+
+		expect(entryFor(plan, "ses_b").classification).not.toBe("updated");
+		expect(entryFor(plan, "ses_b").copyOnly).toBe(true);
+		expect(entryFor(plan, "ses_b").note).toBe("lineage-ambiguous");
+	});
+
+	test("same-ID divergence keeps the owner-selected replace policy", () => {
+		const source = sessionRecord("ses_a", ["msg_1"], { title: "checkpoint title" });
+		const destination = sessionRecord("ses_a", ["msg_1"], { title: "local title" });
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_a");
+
+		expect(entry.classification).toBe("renamed");
+		expect(entry.copyOnly).toBeUndefined();
+	});
+
+	test("a derived update message ID owned by the target is allowed", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+		const destination = lineageRecord(
+			"ses_copy",
+			[{ id: derivedMessageID("msg_a1"), text: "one" }],
+			{},
+			"ses_a",
+		);
+
+		const entry = entryFor(runPlan([source], [destination]), "ses_a");
+
+		expect(entry.classification).toBe("updated");
+		expect(entry.targetSessionID).toBe("ses_copy");
+	});
+
+	test("a derived update message ID owned by another session fails closed", () => {
+		const source = lineageRecord(
+			"ses_a",
+			[
+				{ id: "msg_a1", text: "one" },
+				{ id: "msg_a2", text: "two" },
+			],
+			{},
+			"ses_a",
+		);
+		const destination = lineageRecord("ses_copy", [{ id: "msg_c1", text: "one" }], {}, "ses_a");
+		const other = lineageRecord("ses_other", [{ id: derivedMessageID("msg_a2"), text: "unrelated" }]);
+
+		expectCode(() => runPlan([source], [destination, other]), "message-id-collision");
 	});
 });
 

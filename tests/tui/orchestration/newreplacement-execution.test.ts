@@ -11,7 +11,7 @@
  * host result or production policy.
  */
 
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { JsonObject, SessionRecord } from "../../../src/core/contracts/index.ts";
 import type { SessionImportAdapter } from "../../../src/tui/adapters/index.ts";
 import {
@@ -57,6 +57,7 @@ function record(
 
 interface HarnessOptions {
 	readonly entries: readonly StandaloneRestorePlanEntry[];
+	readonly importMode: "replace" | "keep";
 	readonly destination?: readonly SessionRecord[];
 	readonly sourceRecords?: readonly SessionRecord[];
 	readonly globalInventory?: ReplacementReferenceInventory;
@@ -120,6 +121,7 @@ function makeHarness(options: HarnessOptions): Harness {
 
 	const input: RestoreReplacementExecutionInput = {
 		plan: { entries: options.entries },
+		importMode: options.importMode,
 		sourceRecords,
 		destination,
 		globalInventory,
@@ -187,12 +189,165 @@ function replaceEntry(source: string, candidate = `ses_new_${source}`): Standalo
 	return { sourceSessionID: source, record: record(candidate) };
 }
 
+function updateEntry(
+	target: string,
+	messages: readonly JsonObject[],
+	options: { readonly title?: string; readonly info?: Readonly<Record<string, unknown>> } = {},
+): StandaloneRestorePlanEntry {
+	return {
+		sourceSessionID: target,
+		record: record(target, { title: options.title ?? `title ${target}`, messages, info: options.info }),
+		classification: "updated",
+		note: "lineage-continuation",
+	};
+}
+
+describe("same-ID lineage update", () => {
+	test("deletes once, imports the continuation under the same ID, and reports updated", async () => {
+		const first = { id: "msg_a1", type: "user", text: "one" } as JsonObject;
+		const second = { id: "msg_a2", type: "user", text: "two" } as JsonObject;
+		const target = record("ses_a", { messages: [first] });
+		const candidate = record("ses_a", { messages: [first, second] });
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [first, second])],
+			destination: [target],
+		});
+
+		expect(harness.result.preview.entries[0]?.action).toBe("update");
+		expect(harness.result.preview.entries[0]?.reason).toBe("lineage-continuation");
+		expect(harness.result.preview.recoveryRequired).toBe(true);
+		expect(harness.result.report.entries[0]?.outcome).toBe("updated");
+		expect(harness.result.report.entries[0]?.reason).toBe("lineage-continuation");
+		expect(harness.deleteIDs).toEqual(["ses_a"]);
+		expect(harness.imported).toHaveLength(1);
+		expect(String(harness.imported[0]!.info["id"])).toBe("ses_a");
+		expect(harness.events.indexOf("recovery")).toBeGreaterThan(-1);
+		expect(harness.events.indexOf("recovery")).toBeLessThan(harness.events.indexOf("delete:ses_a"));
+		expect(harness.events.filter((event) => event === "delete:ses_a")).toHaveLength(1);
+	});
+
+	test("a changed target after preview keeps the old session and never deletes", async () => {
+		const target = record("ses_a");
+		const changed = record("ses_a", { title: "changed after preview" });
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [target],
+			readSession: () => changed,
+		});
+
+		expect(harness.result.preview.entries[0]?.action).toBe("update");
+		expect(harness.result.report.entries[0]?.outcome).toBe("kept");
+		expect(harness.result.report.entries[0]?.reason).toBe("target-changed");
+		expect(harness.deleteIDs).toEqual([]);
+		expect(harness.imported).toHaveLength(0);
+		expect(harness.events).not.toContain("recovery");
+	});
+
+	test("unverified recovery blocks the delete and the import", async () => {
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [record("ses_a")],
+			recovery: { verified: false },
+		});
+
+		expect(harness.result.report.entries[0]?.outcome).toBe("kept");
+		expect(harness.result.report.entries[0]?.reason).toBe("recovery-unverified");
+		expect(harness.deleteIDs).toEqual([]);
+		expect(harness.imported).toHaveLength(0);
+	});
+
+	test("a refused delete keeps the old session and never imports", async () => {
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [record("ses_a")],
+			deleteOutcome: { status: "refused" },
+		});
+
+		expect(harness.result.report.entries[0]?.outcome).toBe("kept");
+		expect(harness.result.report.entries[0]?.reason).toBe("delete-not-performed");
+		expect(harness.imported).toHaveLength(0);
+	});
+
+	test("a delete whose absence cannot be verified does not import", async () => {
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [record("ses_a")],
+			removeLiveOnDeleted: false,
+		});
+
+		expect(harness.result.report.entries[0]?.outcome).toBe("failed");
+		expect(harness.result.report.entries[0]?.reason).toBe("delete-unverified-present");
+		expect(harness.imported).toHaveLength(0);
+	});
+
+	test("an import failure after deletion is reported truthfully with recovery retained", async () => {
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [record("ses_a")],
+			importResponse: () => {
+				throw new Error("synthetic host import failure");
+			},
+		});
+
+		expect(harness.result.report.entries[0]?.outcome).toBe("failed");
+		expect(harness.result.report.entries[0]?.reason).toBe("import-failed");
+		expect(harness.result.report.recoveryPath).toBe("C:/state/recovery.sessionport");
+		expect(harness.deleteIDs).toEqual(["ses_a"]);
+		expect(harness.events.indexOf("recovery")).toBeLessThan(harness.events.indexOf("delete:ses_a"));
+	});
+
+	test("a fresh incoming reference blocks the update before recovery or delete", async () => {
+		const target = record("ses_a");
+		const childInfo = { id: "ses_child", parentID: "ses_a", projectID: TARGET.projectID } as JsonObject;
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", [{ id: "msg_a2", type: "user", text: "new" }])],
+			destination: [target],
+			inventory: { infos: [target.info, childInfo], complete: true },
+		});
+
+		expect(harness.result.preview.entries[0]?.action).toBe("update");
+		expect(harness.result.report.entries[0]?.outcome).toBe("kept");
+		expect(harness.result.report.entries[0]?.reason).toBe("classifier-copy");
+		expect(harness.deleteIDs).toEqual([]);
+		expect(harness.imported).toHaveLength(0);
+		expect(harness.events).not.toContain("recovery");
+	});
+
+	test("an absent old target imports without recovery or delete", async () => {
+		const candidate = record("ses_a", {
+			messages: [
+				{ id: "msg_a1", type: "user", text: "one" },
+				{ id: "msg_a2", type: "user", text: "two" },
+			],
+		});
+		const harness = await run({
+			importMode: "replace",
+			entries: [updateEntry("ses_a", candidate.messages, { title: String(candidate.info["title"]) })],
+			destination: [record("ses_a")],
+			readSession: (_sessionID, call) => (call === 1 ? undefined : candidate),
+		});
+
+		expect(harness.result.report.entries[0]?.outcome).toBe("imported");
+		expect(harness.result.report.entries[0]?.reason).toBe("old-already-absent");
+		expect(harness.deleteIDs).toEqual([]);
+		expect(harness.events).not.toContain("recovery");
+	});
+});
+
 /* ------------------------------------------------------------------------- */
 /* Preview / confirmation                                                    */
 /* ------------------------------------------------------------------------- */
 
 test("confirmation cancellation performs no import, recovery, or delete", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -211,6 +366,7 @@ test("confirmation cancellation performs no import, recovery, or delete", async 
 
 test("confirmation exception and non-boolean answer cancel all writes", async () => {
 	const thrown = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -222,6 +378,7 @@ test("confirmation exception and non-boolean answer cancel all writes", async ()
 	expect(thrown.deleteIDs).toEqual([]);
 
 	const nonBoolean = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -233,6 +390,7 @@ test("confirmation exception and non-boolean answer cancel all writes", async ()
 
 test("standard replace follows the complete safety order and deletes only the old target", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -265,6 +423,7 @@ test("standard replace follows the complete safety order and deletes only the ol
 
 test("target-absent entry imports only; no delete factory or delete call", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [],
 		sourceRecords: [record("ses_old")],
@@ -279,6 +438,7 @@ test("target-absent entry imports only; no delete factory or delete call", async
 
 test("exact skipped and same-ID collision entries never import or delete", async () => {
 	const skipped = await run({
+		importMode: "replace",
 		entries: [{ sourceSessionID: "ses_old", record: record("ses_candidate"), classification: "skipped" }],
 		destination: [record("ses_old")],
 	});
@@ -288,6 +448,7 @@ test("exact skipped and same-ID collision entries never import or delete", async
 	expect(skipped.deleteIDs).toEqual([]);
 
 	const collision = await run({
+		importMode: "replace",
 		entries: [{ sourceSessionID: "ses_same", record: record("ses_same") }],
 		destination: [record("ses_same")],
 	});
@@ -298,12 +459,79 @@ test("exact skipped and same-ID collision entries never import or delete", async
 });
 
 /* ------------------------------------------------------------------------- */
+/* User-selected import mode                                                 */
+/* ------------------------------------------------------------------------- */
+
+test("keep mode copies an otherwise replaceable target and never requests a delete port", async () => {
+	const harness = await run({
+		importMode: "keep",
+		entries: [replaceEntry("ses_old", "ses_candidate")],
+		destination: [record("ses_old")],
+		sourceRecords: [record("ses_old")],
+	});
+
+	expect(harness.result.preview.entries[0]?.action).toBe("copy");
+	expect(harness.result.preview.entries[0]?.reason).toBe("keep-existing");
+	expect(harness.result.preview.recoveryRequired).toBe(false);
+	expect(harness.factoryScopes).toEqual([]);
+	expect(harness.deleteIDs).toEqual([]);
+	expect(harness.events).not.toContain("recovery");
+	expect(harness.imported).toHaveLength(1);
+	expect(String((harness.imported[0]!.info as JsonObject)["id"])).toBe("ses_candidate");
+	expect(harness.result.report.entries[0]?.outcome).toBe("copied");
+	expect(harness.result.report.entries[0]?.reason).toBe("keep-existing");
+});
+
+test("keep mode still imports absent targets and skips exact duplicates and candidate collisions", async () => {
+	const harness = await run({
+		importMode: "keep",
+		entries: [
+			{ sourceSessionID: "ses_absent", record: record("ses_candidate_absent") },
+			{ sourceSessionID: "ses_same", record: record("ses_same") },
+			{ sourceSessionID: "ses_dup", record: record("ses_candidate_dup"), classification: "skipped" },
+		],
+		destination: [record("ses_same")],
+		sourceRecords: [record("ses_absent")],
+		globalInventory: { infos: [record("ses_same").info], complete: true },
+	});
+
+	expect(harness.result.preview.entries.map((entry) => entry.action)).toEqual(["import", "skip", "skip"]);
+	expect(harness.result.preview.entries.map((entry) => entry.reason)).toEqual([
+		"target-absent",
+		"candidate-collision",
+		"exact-duplicate",
+	]);
+	expect(harness.result.preview.recoveryRequired).toBe(false);
+	expect(harness.imported).toHaveLength(1);
+	expect(harness.factoryScopes).toEqual([]);
+	expect(harness.deleteIDs).toEqual([]);
+	expect(harness.result.report.entries.map((entry) => entry.outcome)).toEqual(["imported", "skipped", "skipped"]);
+});
+
+test("replace mode over the same target still follows the verified delete flow", async () => {
+	const harness = await run({
+		importMode: "replace",
+		entries: [replaceEntry("ses_old", "ses_candidate")],
+		destination: [record("ses_old")],
+		sourceRecords: [record("ses_old")],
+	});
+
+	expect(harness.result.preview.entries[0]?.action).toBe("replace");
+	expect(harness.result.preview.entries[0]?.reason).toBe("safe-replace");
+	expect(harness.result.preview.recoveryRequired).toBe(true);
+	expect(harness.factoryScopes).toEqual([["ses_old"]]);
+	expect(harness.deleteIDs).toEqual(["ses_old"]);
+	expect(harness.result.report.entries[0]?.outcome).toBe("replaced");
+});
+
+/* ------------------------------------------------------------------------- */
 /* Copy downgrades                                                           */
 /* ------------------------------------------------------------------------- */
 
 test("fork and revert sources become parentless copies and retain the old target", async () => {
 	for (const graph of [{ fork: { sessionID: "ses_elsewhere" } }, { revert: { messageID: "msg_1" } }, { parentID: "ses_parent" }]) {
 		const harness = await run({
+			importMode: "replace",
 			entries: [replaceEntry("ses_old", "ses_candidate")],
 			destination: [record("ses_old")],
 			sourceRecords: [record("ses_old", { info: graph })],
@@ -320,6 +548,7 @@ test("fork and revert sources become parentless copies and retain the old target
 
 test("destination children and incoming references downgrade to copy", async () => {
 	const child = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old"), record("ses_child", { info: { parentID: "ses_old" } })],
 		sourceRecords: [record("ses_old")],
@@ -329,6 +558,7 @@ test("destination children and incoming references downgrade to copy", async () 
 	expect(child.deleteIDs).toEqual([]);
 
 	const incoming = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -348,6 +578,7 @@ test("incomplete inventory and missing delete capability downgrade to copy", asy
 		{ deleteCapability: false },
 	] as const) {
 		const harness = await run({
+			importMode: "replace",
 			entries: [replaceEntry("ses_old", "ses_candidate")],
 			destination: [record("ses_old")],
 			sourceRecords: [record("ses_old")],
@@ -364,6 +595,7 @@ test("real classifier copy and rejection downgrade to copy without aborting", as
 		messages: [{ id: "msg_unsettled", type: "assistant", time: { created: 1 } }],
 	});
 	const classifierCopy = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [unsettledTarget],
 		sourceRecords: [record("ses_old")],
@@ -375,6 +607,7 @@ test("real classifier copy and rejection downgrade to copy without aborting", as
 	expect(classifierCopy.deleteIDs).toEqual([]);
 
 	const classifierRejected = await run({
+		importMode: "replace",
 		entries: [{ sourceSessionID: "not-ses-old", record: record("ses_candidate") }],
 		destination: [record("not-ses-old")],
 		sourceRecords: [record("not-ses-old")],
@@ -392,6 +625,7 @@ test("real classifier copy and rejection downgrade to copy without aborting", as
 test("old target changed after candidate import is kept and never deleted", async () => {
 	const changed = record("ses_old", { title: "edited while restoring" });
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -409,6 +643,7 @@ test("new incoming reference discovered before delete keeps the old target", asy
 		complete: true,
 	};
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -427,6 +662,7 @@ test("same-ID source child hidden by destination cannot authorize parent replace
 		{ fork: { sessionID: "ses_a", boundary: { type: "before", messageID: "msg_boundary" } } },
 	]) {
 		const harness = await run({
+			importMode: "replace",
 			entries: [replaceEntry("ses_a", "ses_candidate")],
 			destination: [record("ses_a"), record("ses_b")],
 			sourceRecords: [sourceA, record("ses_b", { info: sourceChild })],
@@ -442,6 +678,7 @@ test("same-ID source child hidden by destination cannot authorize parent replace
 test("late fresh reference-metadata conflict keeps the old target", async () => {
 	const lateB = record("ses_b", { info: { parentID: "ses_a" } });
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_a", "ses_candidate")],
 		destination: [record("ses_a"), record("ses_b")],
 		sourceRecords: [record("ses_a"), record("ses_b")],
@@ -461,6 +698,7 @@ test("ordinary title/time differences remain replace-eligible", async () => {
 	const sourceA = record("ses_a", { title: "source title", info: { time: { created: 1, updated: 5 } } });
 	const destinationA = record("ses_a", { title: "destination title", info: { time: { created: 2, updated: 90 } } });
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_a", "ses_candidate")],
 		destination: [destinationA],
 		sourceRecords: [sourceA],
@@ -473,6 +711,7 @@ test("ordinary title/time differences remain replace-eligible", async () => {
 
 test("fresh incomplete inventory keeps the old target", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -485,6 +724,7 @@ test("fresh incomplete inventory keeps the old target", async () => {
 
 test("unsettled old target is copied, not deleted", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old", { info: { parentID: "ses_parent" } })],
 		sourceRecords: [record("ses_old")],
@@ -497,6 +737,7 @@ test("unsettled old target is copied, not deleted", async () => {
 test("candidate readback failures never delete", async () => {
 	for (const failure of ["throw", "undefined"] as const) {
 		const harness = await run({
+			importMode: "replace",
 			entries: [replaceEntry("ses_old", "ses_candidate")],
 			destination: [record("ses_old")],
 			sourceRecords: [record("ses_old")],
@@ -531,6 +772,7 @@ test("real core verifier rejects wrong candidate project, title, message, tool, 
 	];
 	for (const wrong of wrongCandidates) {
 		const harness = await run({
+			importMode: "replace",
 			entries: [replaceEntry("ses_old", "ses_candidate")],
 			destination: [record("ses_old")],
 			sourceRecords: [record("ses_old")],
@@ -546,6 +788,7 @@ test("real core verifier rejects wrong candidate project, title, message, tool, 
 
 test("recovery failure blocks deletion but not the verified import", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -560,6 +803,7 @@ test("recovery failure blocks deletion but not the verified import", async () =>
 
 test("old target already absent before delete is reported as import-only, not our delete", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -580,6 +824,7 @@ test("old target already absent before delete is reported as import-only, not ou
 
 test("ambiguous delete exception reconciles once with readback and does not retry", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -595,6 +840,7 @@ test("ambiguous delete exception reconciles once with readback and does not retr
 
 test("reported-deleted but still-present old target is a failure without retry", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -608,6 +854,7 @@ test("reported-deleted but still-present old target is a failure without retry",
 
 test("delete uncertain and readback absent is verified success", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -624,6 +871,7 @@ test("delete uncertain and readback absent is verified success", async () => {
 
 test("delete unreadable readback is uncertain and never retried", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old")],
 		sourceRecords: [record("ses_old")],
@@ -644,6 +892,7 @@ test("delete unreadable readback is uncertain and never retried", async () => {
 
 test("copy entries are excluded from the delete scope", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_oldCopy", "ses_candidateCopy"), replaceEntry("ses_oldReplace", "ses_candidateReplace")],
 		destination: [record("ses_oldCopy"), record("ses_oldReplace")],
 		sourceRecords: [
@@ -661,6 +910,7 @@ test("copy entries are excluded from the delete scope", async () => {
 
 test("batch scope is unique and frozen once for all replace targets", async () => {
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old1", "ses_candidate1"), replaceEntry("ses_old2", "ses_candidate2")],
 		destination: [record("ses_old1"), record("ses_old2")],
 		sourceRecords: [record("ses_old1"), record("ses_old2")],
@@ -673,6 +923,7 @@ test("batch scope is unique and frozen once for all replace targets", async () =
 
 test("duplicate source/candidate IDs and malformed records fail before any write", async () => {
 	const duplicateHarness = makeHarness({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate"), replaceEntry("ses_old", "ses_candidate2")],
 		destination: [record("ses_old")],
 	});
@@ -682,6 +933,7 @@ test("duplicate source/candidate IDs and malformed records fail before any write
 	const events: string[] = [];
 	const malformed = {
 		plan: { entries: [{ sourceSessionID: "ses_old", record: { info: {}, messages: [] } }] },
+		importMode: "replace",
 		sourceRecords: [],
 		destination: [],
 		globalInventory: { infos: [], complete: true },
@@ -715,6 +967,7 @@ test("real core exports drive a complete verified replace", async () => {
 	const old = realRecord("ses_old");
 	const candidate = realRecord("ses_candidate");
 	const harness = await run({
+		importMode: "replace",
 		entries: [{ sourceSessionID: "ses_old", record: candidate }],
 		destination: [old],
 		sourceRecords: [old],
@@ -778,6 +1031,7 @@ test("real delete and reference-inventory adapters map into engine ports", async
 test("report is display-safe and compatible with the standalone UI shape", async () => {
 	const secret = "TOPSECRET-MESSAGE-PAYLOAD";
 	const harness = await run({
+		importMode: "replace",
 		entries: [replaceEntry("ses_old", "ses_candidate")],
 		destination: [record("ses_old", { messages: [{ id: "msg_secret", type: "user", text: secret }] })],
 		sourceRecords: [record("ses_old", { messages: [{ id: "msg_secret", type: "user", text: secret }] })],
@@ -787,7 +1041,7 @@ test("report is display-safe and compatible with the standalone UI shape", async
 		readonly entries: readonly {
 			readonly sessionID: string;
 			readonly title: string;
-			readonly action: "replace" | "copy" | "import" | "skip";
+			readonly action: "replace" | "update" | "copy" | "import" | "skip";
 			readonly reason?: string;
 		}[];
 		readonly recoveryRequired: boolean;
@@ -796,7 +1050,7 @@ test("report is display-safe and compatible with the standalone UI shape", async
 		readonly entries: readonly {
 			readonly sessionID: string;
 			readonly title: string;
-			readonly outcome: "replaced" | "copied" | "imported" | "skipped" | "kept" | "failed" | "uncertain";
+			readonly outcome: "replaced" | "updated" | "copied" | "imported" | "skipped" | "kept" | "failed" | "uncertain";
 			readonly reason?: string;
 		}[];
 		readonly recoveryPath?: string;

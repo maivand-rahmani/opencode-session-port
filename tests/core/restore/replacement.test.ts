@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	classifyLineageUpdate,
 	classifyReplacement,
 	fingerprintSessionRecord,
 	prepareStandaloneRecord,
@@ -512,5 +513,116 @@ describe("verifyImportedRecord", () => {
 		expect(
 			verify(expected, { info: expected.info, messages: undefined } as unknown as SessionRecord),
 		).toEqual({ verified: false, reason: "actual-malformed" });
+	});
+});
+
+describe("same-ID lineage update eligibility", () => {
+	/**
+	 * Same session ID on both sides: the target is the settled local copy and
+	 * the source is a longer standalone continuation with the shared message
+	 * prefix that lineage reconciliation requires.
+	 */
+	function lineagePair(): { readonly source: SessionRecord; readonly target: SessionRecord } {
+		return {
+			source: record(TARGET_ID, [userMessage("msg_1"), userMessage("msg_2")]),
+			target: record(TARGET_ID, [userMessage("msg_1")]),
+		};
+	}
+
+	function classifyLineage(
+		source: SessionRecord,
+		target: SessionRecord,
+		inventory: readonly JsonObject[],
+		options: { readonly authorizedTargetID?: string; readonly inventoryComplete?: boolean } = {},
+	) {
+		return classifyLineageUpdate({
+			source,
+			target,
+			authorizedTargetID: options.authorizedTargetID ?? TARGET_ID,
+			referenceInventory: inventory,
+			inventoryComplete: options.inventoryComplete ?? true,
+		});
+	}
+
+	test("accepts a standalone same-ID source/target pair with a complete inventory containing both", () => {
+		const { source, target } = lineagePair();
+		// Both versions share one session ID, so one inventory entry necessarily
+		// covers source and target and the combined inventory stays well-formed.
+		expect(classifyLineage(source, target, inventoryOf(target))).toEqual({ mode: "replace" });
+	});
+
+	test("rejects a non-authorized target ID", () => {
+		const { source, target } = lineagePair();
+		expect(classifyLineage(source, target, inventoryOf(target), { authorizedTargetID: "ses_other" })).toEqual({
+			mode: "copy",
+			reason: "target-not-authorized",
+		});
+	});
+
+	test("rejects a source whose info.id differs from the target", () => {
+		const source = record(SOURCE_ID, [userMessage("msg_1"), userMessage("msg_2")]);
+		const { target } = lineagePair();
+		expect(classifyLineage(source, target, inventoryOf(source, target))).toEqual({
+			mode: "copy",
+			reason: "target-not-authorized",
+		});
+	});
+
+	test("rejects a target with a child session", () => {
+		const { source, target } = lineagePair();
+		const child = record("ses_child", [], { parentID: TARGET_ID });
+		expect(classifyLineage(source, target, inventoryOf(target, child))).toEqual({
+			mode: "copy",
+			reason: "target-has-incoming-references",
+		});
+	});
+
+	test("rejects an incoming fork boundary that points at a target message", () => {
+		const { source, target } = lineagePair();
+		const ancestor = record("ses_ancestor", []);
+		const forked = record("ses_child", [], {
+			fork: { sessionID: "ses_ancestor", boundary: { type: "through", messageID: "msg_1" } },
+		});
+		expect(classifyLineage(source, target, inventoryOf(target, ancestor, forked))).toEqual({
+			mode: "copy",
+			reason: "target-has-incoming-references",
+		});
+	});
+
+	test("rejects an incoming revert that points at a target message", () => {
+		const { source, target } = lineagePair();
+		const reverted = record("ses_child", [], { revert: { messageID: "msg_1" } });
+		expect(classifyLineage(source, target, inventoryOf(target, reverted))).toEqual({
+			mode: "copy",
+			reason: "target-has-incoming-references",
+		});
+	});
+
+	test("rejects incomplete inventory", () => {
+		const { source, target } = lineagePair();
+		expect(classifyLineage(source, target, inventoryOf(target), { inventoryComplete: false })).toEqual({
+			mode: "copy",
+			reason: "inventory-incomplete",
+		});
+		expect(classifyLineage(source, target, [])).toEqual({ mode: "copy", reason: "inventory-incomplete" });
+	});
+
+	test("rejects a running tool part in either source or target", () => {
+		const runningTool = assistantMessage("msg_tool", [
+			{ type: "tool", id: "tool_1", name: "read", state: { status: "running" }, time: { created: 1 } },
+		]);
+		const { source, target } = lineagePair();
+
+		const sourceWithTool = record(TARGET_ID, [runningTool]);
+		expect(classifyLineage(sourceWithTool, target, inventoryOf(target))).toEqual({
+			mode: "copy",
+			reason: "source-unsupported-tool",
+		});
+
+		const targetWithTool = record(TARGET_ID, [userMessage("msg_1"), runningTool]);
+		expect(classifyLineage(source, targetWithTool, inventoryOf(targetWithTool))).toEqual({
+			mode: "copy",
+			reason: "target-unsupported-tool",
+		});
 	});
 });

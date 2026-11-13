@@ -76,6 +76,8 @@ import type {
 import { createLocationResolver, LocationResolutionError } from "../adapters/location-resolver.ts";
 import { createProjectDestinationsAdapter, type ProjectDestinationCandidate } from "../adapters/project-destinations.ts";
 import { createSessionIdInventory } from "../adapters/session-id-inventory.ts";
+import { createSubagentRetentionPort, readCheckpointRetentionInsights } from "../adapters/session-retention.ts";
+import type { CheckpointRetentionInsights } from "../adapters/session-retention.ts";
 import { createSessionDependencyReadAdapter, createSessionReadAdapter } from "../adapters/session-read.ts";
 import { createSessionImportAdapter, probeSessionImportCapability } from "../adapters/session-import.ts";
 import { createSessionReferenceInventoryPort } from "../adapters/session-reference-inventory.ts";
@@ -100,11 +102,14 @@ import {
 	EXPERIMENTAL_COLLECTION_POLICY,
 	EXPERIMENTAL_CRYPTO_POLICY,
 	EXPERIMENTAL_MAX_PASSWORD_BYTES,
+	EXPERIMENTAL_RETENTION_RECOMMENDATION_WINDOW_DAYS,
+	EXPERIMENTAL_SUBAGENT_RETENTION,
 } from "./experimental-profile.ts";
 import {
 	mapRestoreExecutionToReportPresentation,
 	reportCheckpointFailure,
 	reportCheckpointOutcome,
+	reportCheckpointRetentionCanceled,
 	reportRestoreAuthenticationFailed,
 	reportRestoreCanceled,
 	reportRestoreCapabilityUnavailable,
@@ -134,6 +139,17 @@ export type SessionPortPasswordProvider = (
 	maxPasswordBytes: number,
 ) => Promise<Uint8Array | undefined>;
 
+/**
+ * One user-chosen checkpoint retention policy. `maxSubagentSessions: null`
+ * means no cap (valid with `since-compaction`); `0` keeps roots only.
+ */
+export interface CheckpointRetentionChoice {
+	readonly mode: "since-compaction" | "latest" | "all" | "roots";
+	readonly maxSubagentSessions: number | null;
+	/** Required for `"roots"`; ignored by the adapter for every other mode. */
+	readonly maxRootSessions: number | null;
+}
+
 /** Explicit, fully injected command dependencies. Every effect is supplied by the caller. */
 export interface SessionPortHandlerDependencies {
 	/** Host-provided public client (untrusted); all host methods go through the existing adapters. */
@@ -142,6 +158,23 @@ export interface SessionPortHandlerDependencies {
 	readonly getActiveDirectory: () => string | undefined;
 	/** Host dialog selection surface for the restore destination. */
 	readonly dialog: RestoreProjectDialog;
+	/**
+	 * Optional native checkpoint-retention chooser. When present, it runs after
+	 * project resolution and before any session read; `undefined` means the user
+	 * canceled and nothing is collected or written. The chooser receives
+	 * metadata-only root-age insights (the project session list; no messages)
+	 * so it can explain the options and recommend one. When absent, the
+	 * configured experimental default applies.
+	 */
+	readonly chooseCheckpointRetention?: (
+		insights: CheckpointRetentionInsights,
+	) => Promise<CheckpointRetentionChoice | undefined>;
+	/**
+	 * Optional native restore import-mode chooser. When present, it runs after
+	 * destination selection and before decrypt/import; `undefined` means the
+	 * user canceled. When absent, `"replace"` preserves the existing behavior.
+	 */
+	readonly chooseRestoreImportMode?: () => Promise<"replace" | "keep" | undefined>;
 	/** Sanitized notification sink. */
 	readonly notify: SessionPortNotifier;
 	/** Legacy report presenter retained for compatibility; unused when `restoreReplacementUi` is supplied. */
@@ -254,8 +287,40 @@ async function runCheckpointCommand(
 		// needs the dependency-capable read port (session.list/message.list plus
 		// session.get). This is the only place that adapter is created; the
 		// restore path below keeps the list-only adapter.
+		// The retention choice is a user-facing control; when the host UI
+		// supplies it, the chooser first receives metadata-only root-age
+		// insights (project session list; no messages) so it can explain the
+		// options and recommend one. Canceling means no collection, no password
+		// prompt, and no write.
+		let retentionChoice: CheckpointRetentionChoice | undefined;
+		if (dependencies.chooseCheckpointRetention === undefined) {
+			retentionChoice = EXPERIMENTAL_SUBAGENT_RETENTION;
+		} else {
+			const insights = await readCheckpointRetentionInsights({
+				readPort: createSessionReadAdapter(dependencies.client),
+				projectID: resolved.projectID,
+				policy: EXPERIMENTAL_COLLECTION_POLICY,
+				now: dependencies.clock?.() ?? Date.now(),
+				recentDays: EXPERIMENTAL_RETENTION_RECOMMENDATION_WINDOW_DAYS,
+			});
+			retentionChoice = await dependencies.chooseCheckpointRetention(insights);
+		}
+		if (retentionChoice === undefined) {
+			dependencies.notify(reportCheckpointRetentionCanceled());
+			return;
+		}
 		const readPort = createSessionDependencyReadAdapter(dependencies.client);
-		const outcome = await runCheckpointFlow(readPort, {
+		// Checkpoint-only retention: every root session plus the chosen subagent
+		// selection. Restore destination snapshots keep using the full collection.
+		const retention = await createSubagentRetentionPort({
+			readPort,
+			projectID: resolved.projectID,
+			policy: EXPERIMENTAL_COLLECTION_POLICY,
+			mode: retentionChoice.mode,
+			maxSubagentSessions: retentionChoice.maxSubagentSessions,
+			maxRootSessions: retentionChoice.maxRootSessions,
+		});
+		const outcome = await runCheckpointFlow(retention.port, {
 			projectID: resolved.projectID,
 			projectDirectory: resolved.directory,
 			policy: EXPERIMENTAL_COLLECTION_POLICY,
@@ -266,7 +331,7 @@ async function runCheckpointCommand(
 			requestPassword: (purpose) => dependencies.requestPassword(purpose, EXPERIMENTAL_MAX_PASSWORD_BYTES),
 			...(explicitOutputPath !== undefined ? { explicitOutputPath } : {}),
 		});
-		dependencies.notify(reportCheckpointOutcome(outcome));
+		dependencies.notify(reportCheckpointOutcome(outcome, retention.summary));
 	} catch (error) {
 		dependencies.notify(reportCheckpointFailure(error));
 	}
@@ -443,6 +508,17 @@ async function runLocalRestoreCommand(
 	},
 ): Promise<void> {
 	try {
+		// Import mode is a user-facing control: keep-existing never deletes;
+		// replace preserves the verified delete+import behavior. Canceling here
+		// means no artifact read, password prompt, or import.
+		const importMode =
+			dependencies.chooseRestoreImportMode === undefined
+				? "replace"
+				: await dependencies.chooseRestoreImportMode();
+		if (importMode === undefined) {
+			dependencies.notify(reportRestoreCanceled());
+			return;
+		}
 		const readPort = createSessionReadAdapter(dependencies.client);
 		const sessionIdInventory = createSessionIdInventory({
 			readPort,
@@ -499,6 +575,7 @@ async function runLocalRestoreCommand(
 			writeEncryptedArtifact: dependencies.writeEncryptedArtifact,
 			idDeriver: dependencies.idDeriver,
 			ui: dependencies.restoreReplacementUi!,
+			importMode,
 			clock: dependencies.clock ?? (() => Date.now()),
 		});
 

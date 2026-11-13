@@ -15,10 +15,10 @@ import { HostAdapterError } from "../../../src/tui/adapters/index.ts";
 import { LocationResolutionError } from "../../../src/tui/adapters/location-resolver.ts";
 import { ProjectDestinationError } from "../../../src/tui/adapters/project-destinations.ts";
 import { ArtifactFileError } from "../../../src/tui/artifacts/files.ts";
-import { CryptoContainerError } from "../../../src/core/crypto/errors.ts";
+import { CryptoContainerError, type CryptoErrorCode } from "../../../src/core/crypto/errors.ts";
 import { RestorePlanError, type RestorePlanErrorCode } from "../../../src/core/restore/planner.ts";
 import { SessionCollectionError, type SessionCollectionErrorCode } from "../../../src/core/sessions/index.ts";
-import type { RestoreExecutionResult } from "../../../src/tui/orchestration/index.ts";
+import type { RestoreExecutionResult, RestoreReplacementReport } from "../../../src/tui/orchestration/index.ts";
 import {
 	reportCheckpointFailure,
 	reportCheckpointOutcome,
@@ -34,6 +34,8 @@ import {
 import {
 	mapRestoreExecutionToReportPresentation,
 	reportRestoreExecutionFallback,
+	reportRestoreReplacementFallback,
+	type CheckpointRetentionSummary,
 } from "../../../src/tui/wiring/reports.ts";
 
 const RAW = "RAW-HOST-DETAIL";
@@ -53,6 +55,167 @@ describe("checkpoint reports", () => {
 
 		expect(reportCheckpointOutcome({ status: "no-sessions" }).variant).toBe("warning");
 		expect(reportCheckpointOutcome({ status: "canceled" }).variant).toBe("info");
+	});
+
+	test("pins the written message byte-for-byte when no retention summary is supplied", () => {
+		const written = reportCheckpointOutcome({
+			status: "written",
+			artifactPath: "C:/work/.sessionport/checkpoint-a.sessionport",
+			sessionCount: 4,
+			encryptedBytes: 1234,
+		});
+		expect(written).toEqual({
+			title: "Checkpoint created",
+			message: "Wrote C:/work/.sessionport/checkpoint-a.sessionport (1234 bytes, 4 sessions).",
+			variant: "success",
+		});
+	});
+
+	test("appends the exact retention sentence when older subagent sessions were excluded", () => {
+		const retention: CheckpointRetentionSummary = {
+			mode: "latest",
+			projectSessionCount: 9,
+			keptSessionCount: 4,
+			excludedSessionCount: 5,
+			keptRootCount: 2,
+			maxSubagentSessions: 2,
+			maxRootSessions: null,
+		};
+		const written = reportCheckpointOutcome(
+			{
+				status: "written",
+				artifactPath: "C:/work/.sessionport/checkpoint-b.sessionport",
+				sessionCount: 4,
+				encryptedBytes: 2048,
+			},
+			retention,
+		);
+		expect(written).toEqual({
+			title: "Checkpoint created",
+			message:
+				"Wrote C:/work/.sessionport/checkpoint-b.sessionport (2048 bytes, 4 sessions). " +
+				"Experimental retention (latest subagent sessions): kept 4 of 9 project sessions " +
+				"(all root sessions plus the latest 2 subagent sessions); 5 older subagent sessions were excluded.",
+			variant: "success",
+		});
+	});
+
+	test("names since-compaction mode and appends its exact retention sentence", () => {
+		const retention: CheckpointRetentionSummary = {
+			mode: "since-compaction",
+			projectSessionCount: 7,
+			keptSessionCount: 3,
+			excludedSessionCount: 4,
+			keptRootCount: 1,
+			maxSubagentSessions: 3,
+			maxRootSessions: null,
+		};
+		const written = reportCheckpointOutcome(
+			{
+				status: "written",
+				artifactPath: "C:/work/.sessionport/checkpoint-d.sessionport",
+				sessionCount: 3,
+				encryptedBytes: 1024,
+			},
+			retention,
+		);
+		expect(written).toEqual({
+			title: "Checkpoint created",
+			message:
+				"Wrote C:/work/.sessionport/checkpoint-d.sessionport (1024 bytes, 3 sessions). " +
+				"Experimental retention (subagents after compaction): kept 3 of 7 project sessions " +
+				"(all root sessions plus subagent sessions created after the most recent compaction); " +
+				"4 older subagent sessions were excluded.",
+			variant: "success",
+		});
+	});
+
+	test("names roots mode and appends its exact retention sentence", () => {
+		const retention: CheckpointRetentionSummary = {
+			mode: "roots",
+			projectSessionCount: 12,
+			keptSessionCount: 6,
+			excludedSessionCount: 6,
+			keptRootCount: 2,
+			maxSubagentSessions: null,
+			maxRootSessions: 2,
+		};
+		const written = reportCheckpointOutcome(
+			{
+				status: "written",
+				artifactPath: "C:/work/.sessionport/checkpoint-roots.sessionport",
+				sessionCount: 6,
+				encryptedBytes: 4096,
+			},
+			retention,
+		);
+		expect(written).toEqual({
+			title: "Checkpoint created",
+			message:
+				"Wrote C:/work/.sessionport/checkpoint-roots.sessionport (4096 bytes, 6 sessions). " +
+				"Experimental retention (last root sessions): kept 6 of 12 project sessions " +
+				"(the 2 most recently active root sessions plus all of their subagent sessions); " +
+				"6 older sessions were excluded.",
+			variant: "success",
+		});
+	});
+
+	test("appends the exact no-exclusions retention sentence when the limit was not exceeded", () => {
+		const retention: CheckpointRetentionSummary = {
+			mode: "latest",
+			projectSessionCount: 3,
+			keptSessionCount: 3,
+			excludedSessionCount: 0,
+			keptRootCount: 1,
+			maxSubagentSessions: 10,
+			maxRootSessions: null,
+		};
+		const written = reportCheckpointOutcome(
+			{
+				status: "written",
+				artifactPath: "C:/work/.sessionport/checkpoint-c.sessionport",
+				sessionCount: 3,
+				encryptedBytes: 512,
+			},
+			retention,
+		);
+		expect(written).toEqual({
+			title: "Checkpoint created",
+			message:
+				"Wrote C:/work/.sessionport/checkpoint-c.sessionport (512 bytes, 3 sessions). " +
+				"Experimental retention (latest subagent sessions): all 3 project sessions were kept.",
+			variant: "success",
+		});
+	});
+
+	test("ignores a retention summary for no-sessions and canceled outcomes", () => {
+		const retention: CheckpointRetentionSummary = {
+			mode: "latest",
+			projectSessionCount: 9,
+			keptSessionCount: 4,
+			excludedSessionCount: 5,
+			keptRootCount: 2,
+			maxSubagentSessions: 2,
+			maxRootSessions: null,
+		};
+		const noSessions = reportCheckpointOutcome({ status: "no-sessions" }, retention);
+		expect(noSessions).toEqual({
+			title: "Checkpoint not created",
+			message: "No sessions were found for this project, so no checkpoint was created.",
+			variant: "warning",
+		});
+		const canceled = reportCheckpointOutcome({ status: "canceled" }, retention);
+		expect(canceled).toEqual({
+			title: "Checkpoint canceled",
+			message: "The password prompt was canceled; no artifact was written.",
+			variant: "info",
+		});
+		// Retention facts never leak into non-written copy.
+		for (const notification of [noSessions, canceled]) {
+			expect(notification.message).not.toContain("Experimental retention");
+			expect(notification.message).not.toContain("9");
+			expect(notification.message).not.toContain("5");
+		}
 	});
 
 	test("sanitizes every classified failure and never echoes raw text", () => {
@@ -132,6 +295,146 @@ describe("checkpoint reports", () => {
 				"Reason: the project history contains an unfinished message (unsettled-message).",
 		);
 		expect(restore.message).not.toContain(RAW);
+	});
+
+	test("adds a fixed reason and the exact known code for every known crypto failure code", () => {
+		const expected: ReadonlyArray<readonly [CryptoErrorCode, string]> = [
+			["invalid-policy-definition", "the crypto policy configuration was invalid"],
+			["unknown-policy", "the selected crypto policy is unknown"],
+			["unknown-kdf-profile", "the crypto key-derivation profile is unknown"],
+			["invalid-password", "the password material was invalid"],
+			["unsupported-runtime", "the required crypto runtime is unavailable"],
+			["invalid-header", "the encrypted artifact header was invalid"],
+			["unsupported-format-version", "the artifact format version is unsupported"],
+			["unsupported-algorithm", "the artifact algorithm is unsupported"],
+			["artifact-too-large", "the encrypted artifact would exceed the configured size limit"],
+			["invalid-artifact-source", "the checkpoint data stream was invalid"],
+			["truncated-artifact", "the encrypted artifact ended unexpectedly"],
+			["invalid-frame", "the encrypted artifact contains an invalid frame"],
+			["cipher-failure", "encryption or decryption failed"],
+			["authentication-failed", "the password or artifact authentication failed"],
+			["unexpected-tag", "the encrypted artifact contains an unexpected frame tag"],
+			["missing-final-tag", "the encrypted artifact is missing its final frame"],
+			["trailing-data", "the encrypted artifact contains trailing data"],
+			["compressed-limit-exceeded", "the compressed checkpoint data exceeds the configured size limit"],
+			["decompressed-limit-exceeded", "the session data exceeds the configured size limit"],
+			["expansion-limit-exceeded", "the checkpoint data exceeds the configured compression ratio limit"],
+			["gzip-error", "the checkpoint data could not be compressed or decompressed"],
+		];
+
+		for (const [code, reason] of expected) {
+			if (code === "authentication-failed") continue; // Own checkpoint category: generic copy.
+			const notification = reportCheckpointFailure(new CryptoContainerError(code, RAW));
+			expect(notification).toEqual({
+				title: "Checkpoint failed",
+				message: `The checkpoint could not be encrypted; no artifact was written. Reason: ${reason} (${code}).`,
+				variant: "error",
+			});
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// authentication-failed stays in its own (unreachable on checkpoint)
+		// category and never appends a crypto reason or raw text.
+		const auth = reportCheckpointFailure(new CryptoContainerError("authentication-failed", RAW));
+		expect(auth.message).toBe("Checkpoint failed; no artifact was written.");
+		expect(auth.message).not.toContain("Reason:");
+		expect(auth.message).not.toContain(RAW);
+	});
+
+	test("unknown or forged crypto codes and code-shaped plain objects keep the generic checkpoint copy", () => {
+		const cryptoBase = "The checkpoint could not be encrypted; no artifact was written.";
+
+		for (const code of ["future-code", "constructor", "__proto__", "toString"]) {
+			const forged = reportCheckpointFailure(new CryptoContainerError(code as CryptoErrorCode, RAW));
+			expect(forged.message).toBe(cryptoBase);
+			expect(forged.message).not.toContain(code);
+			expect(forged.message).not.toContain(RAW);
+		}
+
+		// A forged object with the class prototype but no own code classifies as
+		// crypto yet keeps the base copy.
+		const prototypeForged = reportCheckpointFailure(Object.create(CryptoContainerError.prototype));
+		expect(prototypeForged.message).toBe(cryptoBase);
+		expect(prototypeForged.message).not.toContain(RAW);
+
+		// A code-shaped plain object has no crypto class; the filesystem probe
+		// rejects the non-allowlisted code and the generic copy is used.
+		for (const code of ["cipher-failure", "future-code"]) {
+			const fake = reportCheckpointFailure({ code, message: RAW });
+			expect(fake.message).toBe("Checkpoint failed; no artifact was written.");
+			expect(fake.message).not.toContain(code);
+			expect(fake.message).not.toContain(RAW);
+		}
+	});
+
+	test("classifies memory exhaustion as a resource failure", () => {
+		const notification = reportCheckpointFailure(new RangeError(RAW));
+		expect(notification.message).toBe(
+			"The checkpoint could not be built because the session data is too large for the available memory; no artifact was written.",
+		);
+		expect(notification.message).not.toContain(RAW);
+		expect(notification.message).not.toBe("Checkpoint failed; no artifact was written.");
+		expect(notification.variant).toBe("error");
+	});
+
+	test("maps known raw filesystem codes to fixed checkpoint copy and never echoes unknown codes", () => {
+		const expected: ReadonlyArray<readonly [string, string]> = [
+			["ENOSPC", "There is not enough free disk space to write the checkpoint; no artifact was written."],
+			[
+				"EACCES",
+				"The checkpoint could not be written because the output location is not writable; no artifact was written.",
+			],
+			["EPERM", "The checkpoint could not be written because the output location is not writable; no artifact was written."],
+			["EROFS", "The checkpoint could not be written because the output location is not writable; no artifact was written."],
+			["EBUSY", "The checkpoint file could not be written because the output location is busy; no artifact was written."],
+			["ETXTBSY", "The checkpoint file could not be written because the output location is busy; no artifact was written."],
+			["EMFILE", "The checkpoint file could not be written because the output location is busy; no artifact was written."],
+			["ENFILE", "The checkpoint file could not be written because the output location is busy; no artifact was written."],
+		];
+
+		for (const [code, message] of expected) {
+			const rawError = Object.assign(new Error(RAW), { code });
+			const notification = reportCheckpointFailure(rawError);
+			expect(notification.message).toBe(message);
+			expect(notification.message).not.toContain(code);
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// Raw fs errors are plain objects too; that must still classify.
+		const plain = reportCheckpointFailure({ code: "ENOSPC", message: RAW });
+		expect(plain.message).toBe(
+			"There is not enough free disk space to write the checkpoint; no artifact was written.",
+		);
+		expect(plain.message).not.toContain(RAW);
+
+		// Unknown filesystem codes fall through to the generic unknown copy.
+		const unknown = reportCheckpointFailure(Object.assign(new Error(RAW), { code: "EWEIRD" }));
+		expect(unknown.message).toBe("Checkpoint failed; no artifact was written.");
+		expect(unknown.message).not.toContain("EWEIRD");
+		expect(unknown.message).not.toContain(RAW);
+
+		// A RangeError carrying a filesystem code stays a resource failure.
+		const rangeWithCode = Object.assign(new RangeError(RAW), { code: "ENOSPC" });
+		const resource = reportCheckpointFailure(rangeWithCode);
+		expect(resource.message).toBe(
+			"The checkpoint could not be built because the session data is too large for the available memory; no artifact was written.",
+		);
+		expect(resource.message).not.toContain("ENOSPC");
+		expect(resource.message).not.toContain(RAW);
+	});
+});
+
+describe("non-object thrown values", () => {
+	test("thrown strings, null, numbers, and arrays keep the generic copies on both paths", () => {
+		for (const thrown of [RAW, null, 42, [RAW]] as const) {
+			const checkpoint = reportCheckpointFailure(thrown);
+			expect(checkpoint.message).toBe("Checkpoint failed; no artifact was written.");
+			expect(checkpoint.message).not.toContain(RAW);
+
+			const restore = reportRestoreFailure(thrown, false);
+			expect(restore.message).toBe("Restore failed; no sessions were changed.");
+			expect(restore.message).not.toContain(RAW);
+		}
 	});
 });
 
@@ -286,6 +589,126 @@ describe("restore reports", () => {
 			expect(forged.message).not.toContain(code);
 			expect(forged.message).not.toContain(RAW);
 		}
+	});
+
+	test("adds a fixed reason and the exact known code for every known crypto failure code except authentication", () => {
+		const expected: ReadonlyArray<readonly [CryptoErrorCode, string]> = [
+			["invalid-policy-definition", "the crypto policy configuration was invalid"],
+			["unknown-policy", "the selected crypto policy is unknown"],
+			["unknown-kdf-profile", "the crypto key-derivation profile is unknown"],
+			["invalid-password", "the password material was invalid"],
+			["unsupported-runtime", "the required crypto runtime is unavailable"],
+			["invalid-header", "the encrypted artifact header was invalid"],
+			["unsupported-format-version", "the artifact format version is unsupported"],
+			["unsupported-algorithm", "the artifact algorithm is unsupported"],
+			["artifact-too-large", "the encrypted artifact would exceed the configured size limit"],
+			["invalid-artifact-source", "the checkpoint data stream was invalid"],
+			["truncated-artifact", "the encrypted artifact ended unexpectedly"],
+			["invalid-frame", "the encrypted artifact contains an invalid frame"],
+			["cipher-failure", "encryption or decryption failed"],
+			["authentication-failed", "the password or artifact authentication failed"],
+			["unexpected-tag", "the encrypted artifact contains an unexpected frame tag"],
+			["missing-final-tag", "the encrypted artifact is missing its final frame"],
+			["trailing-data", "the encrypted artifact contains trailing data"],
+			["compressed-limit-exceeded", "the compressed checkpoint data exceeds the configured size limit"],
+			["decompressed-limit-exceeded", "the session data exceeds the configured size limit"],
+			["expansion-limit-exceeded", "the checkpoint data exceeds the configured compression ratio limit"],
+			["gzip-error", "the checkpoint data could not be compressed or decompressed"],
+		];
+
+		for (const [code, reason] of expected) {
+			if (code === "authentication-failed") continue; // Own authentication category below.
+			const notification = reportRestoreFailure(new CryptoContainerError(code, RAW), false);
+			expect(notification).toEqual({
+				title: "Restore failed",
+				message:
+					"The file could not be opened as a SessionPort checkpoint; no sessions were changed. " +
+					`Reason: ${reason} (${code}).`,
+				variant: "error",
+			});
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		// authentication-failed stays in its own category: fixed authentication
+		// copy with no crypto reason and no raw text.
+		const auth = reportRestoreFailure(new CryptoContainerError("authentication-failed", RAW), false);
+		expect(auth.message).toBe("The checkpoint could not be authenticated; no sessions were changed.");
+		expect(auth.message).not.toContain("Reason:");
+		expect(auth.message).not.toContain(RAW);
+	});
+
+	test("unknown or forged crypto codes and code-shaped plain objects keep the generic restore copy", () => {
+		const cryptoBase = "The file could not be opened as a SessionPort checkpoint; no sessions were changed.";
+
+		for (const code of ["future-code", "constructor", "__proto__", "toString"]) {
+			const forged = reportRestoreFailure(new CryptoContainerError(code as CryptoErrorCode, RAW), false);
+			expect(forged.message).toBe(cryptoBase);
+			expect(forged.message).not.toContain(code);
+			expect(forged.message).not.toContain(RAW);
+		}
+
+		const prototypeForged = reportRestoreFailure(Object.create(CryptoContainerError.prototype), false);
+		expect(prototypeForged.message).toBe(cryptoBase);
+		expect(prototypeForged.message).not.toContain(RAW);
+
+		// A crypto-shaped plain object is not a CryptoContainerError and its code
+		// is not on the filesystem allowlist: generic copy, no leak.
+		for (const code of ["cipher-failure", "future-code"]) {
+			const fake = reportRestoreFailure({ code, message: RAW }, false);
+			expect(fake.message).toBe("Restore failed; no sessions were changed.");
+			expect(fake.message).not.toContain(code);
+			expect(fake.message).not.toContain(RAW);
+		}
+	});
+
+	test("classifies memory exhaustion as a resource failure before and after execution", () => {
+		const notification = reportRestoreFailure(new RangeError(RAW), false);
+		expect(notification.message).toBe(
+			"The checkpoint could not be processed because its data is too large for the available memory; no sessions were changed.",
+		);
+		expect(notification.message).not.toContain(RAW);
+		expect(notification.message).not.toBe("Checkpoint failed; no artifact was written.");
+
+		// The execution-started branch still wins over the resource category.
+		const afterExecution = reportRestoreFailure(new RangeError(RAW), true);
+		expect(afterExecution.message).toContain("no atomic rollback");
+		expect(afterExecution.message).not.toContain(RAW);
+	});
+
+	test("maps known raw filesystem codes to fixed restore copy and never echoes unknown codes", () => {
+		const expected: ReadonlyArray<readonly [string, string]> = [
+			["ENOENT", "The checkpoint file no longer exists; no sessions were changed."],
+			["EACCES", "The checkpoint file could not be read because it is not accessible; no sessions were changed."],
+			["EPERM", "The checkpoint file could not be read because it is not accessible; no sessions were changed."],
+			["EISDIR", "The checkpoint path is not a regular file; no sessions were changed."],
+			["ENOTDIR", "The checkpoint path is not a regular file; no sessions were changed."],
+		];
+
+		for (const [code, message] of expected) {
+			const rawError = Object.assign(new Error(RAW), { code });
+			const notification = reportRestoreFailure(rawError, false);
+			expect(notification.message).toBe(message);
+			expect(notification.message).not.toContain(code);
+			expect(notification.message).not.toContain(RAW);
+		}
+
+		const plain = reportRestoreFailure({ code: "ENOENT", message: RAW }, false);
+		expect(plain.message).toBe("The checkpoint file no longer exists; no sessions were changed.");
+		expect(plain.message).not.toContain(RAW);
+
+		const unknown = reportRestoreFailure(Object.assign(new Error(RAW), { code: "EWEIRD" }), false);
+		expect(unknown.message).toBe("Restore failed; no sessions were changed.");
+		expect(unknown.message).not.toContain("EWEIRD");
+		expect(unknown.message).not.toContain(RAW);
+
+		// A RangeError carrying a filesystem code stays a resource failure.
+		const rangeWithCode = Object.assign(new RangeError(RAW), { code: "ENOENT" });
+		const resource = reportRestoreFailure(rangeWithCode, false);
+		expect(resource.message).toBe(
+			"The checkpoint could not be processed because its data is too large for the available memory; no sessions were changed.",
+		);
+		expect(resource.message).not.toContain("ENOENT");
+		expect(resource.message).not.toContain(RAW);
 	});
 
 	test("an empty execution result is never reported as success", () => {
@@ -463,5 +886,26 @@ describe("restore reports", () => {
 				summary: { total: 0, imported: 0, skipped: 0, failed: 0, blocked: 0, notAttempted: 0 },
 			}),
 		);
+	});
+
+	test("the replacement fallback reports the updated count and still shows the recovery path", () => {
+		const report: RestoreReplacementReport = {
+			entries: [
+				{ sessionID: "ses_update", title: "Updated session", outcome: "updated" },
+				{ sessionID: "ses_copy", title: "Copied session", outcome: "copied" },
+			],
+			recoveryPath: "C:/work/.sessionport/recovery.sessionport",
+		};
+
+		const fallback = reportRestoreReplacementFallback(report);
+
+		expect(fallback.title).toBe("Restore finished");
+		expect(fallback.variant).toBe("success");
+		expect(fallback.message).toContain("0 replaced, 1 updated, 1 copied");
+		expect(fallback.message).toContain("2 total");
+		expect(fallback.message).toContain("could not be displayed");
+		expect(fallback.message).toContain("Encrypted recovery file: C:/work/.sessionport/recovery.sessionport");
+		expect(fallback.message).not.toContain("ses_");
+		expect(fallback.message).not.toContain("no atomic rollback");
 	});
 });

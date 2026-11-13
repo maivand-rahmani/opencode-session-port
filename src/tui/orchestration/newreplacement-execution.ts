@@ -5,10 +5,21 @@
  * the mutations that the owner-approved 0.1.7 local policy allows:
  *
  * - A frozen preview is built before any write. It names exact destination
- *   targets (`id === plan.sourceSessionID`), titles, and one of four actions:
- *   `replace`, `copy`, `import`, or `skip`.
+ *   targets (`id === plan.sourceSessionID`), titles, and one of five actions:
+ *   `replace`, `update`, `copy`, `import`, or `skip`.
  * - No import, recovery write, or DELETE occurs unless the injected UI
  *   `confirm(preview)` resolves with exactly `true` for that frozen preview.
+ * - A required user-selected `importMode` controls existing targets: `replace`
+ *   keeps every verified-delete gate below; `keep` never requests a delete
+ *   port and imports each existing-target candidate as a copy instead.
+ * - An `update` is a same-ID lineage continuation. It is even stricter than
+ *   `replace`: the candidate must be structurally valid under the existing ID,
+ *   the target must still match the frozen full-record fingerprint, a fresh
+ *   complete inventory must show no incoming session/message references, an
+ *   encrypted recovery artifact must be written and decrypt-verified, exactly
+ *   one delete must prove absence, and exactly one same-ID import must verify.
+ *   There is no rollback if that import fails; the recovery file is the only
+ *   restore path. Forced lineage copies (`copyOnly`) never delete.
  * - Every import is exactly one injected `importSession` call. There is no
  *   retry. The full candidate record is read back and passed through the real
  *   core projection verifier before any deletion is considered.
@@ -39,6 +50,7 @@
 
 import type { JsonObject, SessionRecord } from "../../core/contracts/index.ts";
 import {
+	classifyLineageUpdate,
 	classifyReplacement,
 	fingerprintSessionRecord,
 	prepareStandaloneRecord,
@@ -59,15 +71,22 @@ import { isRecordValue, requireCallable, requireNonEmptyString } from "./shared.
 /* ------------------------------------------------------------------------- */
 
 /** Preview action for one standalone plan entry. */
-export type RestoreReplacementAction = "replace" | "copy" | "import" | "skip";
+export type RestoreReplacementAction = "replace" | "update" | "copy" | "import" | "skip";
 
 /** Fixed local reason labels; never host error text. */
 export type RestoreReplacementReason =
 	| "exact-duplicate"
+	| "lineage-current"
+	| "lineage-continuation"
+	| "lineage-conflict"
+	| "lineage-ambiguous"
+	| "lineage-linked"
+	| "lineage-update-blocked"
 	| "confirmation-cancelled"
 	| "candidate-collision"
 	| "target-absent"
 	| "safe-replace"
+	| "keep-existing"
 	| "original-fork-or-revert"
 	| "original-parent"
 	| "target-unsettled"
@@ -118,6 +137,7 @@ export interface RestoreReplacementPreview {
 /** Fixed report outcomes. */
 export type RestoreReplacementOutcome =
 	| "replaced"
+	| "updated"
 	| "copied"
 	| "imported"
 	| "skipped"
@@ -152,8 +172,12 @@ export interface RestoreReplacementReport {
 export interface StandaloneRestorePlanEntry {
 	readonly sourceSessionID: string;
 	readonly record: SessionRecord;
-	readonly classification?: "imported" | "renamed" | "skipped";
+	readonly classification?: "imported" | "renamed" | "updated" | "skipped";
 	readonly skipReason?: string;
+	/** Lineage conflict/ambiguity: import alongside the target, never delete. */
+	readonly copyOnly?: boolean;
+	/** Display-safe planner note for an update or forced copy. */
+	readonly note?: string;
 }
 
 /** Completed standalone restore plan in deterministic entry order. */
@@ -202,6 +226,12 @@ export interface ReplacementDeletePort {
 /** Explicit, fully injected execution input. No defaults are applied. */
 export interface RestoreReplacementExecutionInput {
 	readonly plan: StandaloneRestorePlan;
+	/**
+	 * User-selected import mode. `replace` keeps the existing verified-delete
+	 * behavior; `keep` never deletes and imports every existing-target candidate
+	 * as a copy alongside the old session.
+	 */
+	readonly importMode: "replace" | "keep";
 	/** Raw original checkpoint records; used only for graph/fork/revert warnings. */
 	readonly sourceRecords: readonly SessionRecord[];
 	/** Complete destination snapshot used for exact old-target lookup and recovery baseline. */
@@ -280,6 +310,10 @@ interface PlannedEntry {
 	readonly candidateSessionID: string;
 	readonly record: SessionRecord;
 	readonly skip: boolean;
+	readonly skipReason: string | undefined;
+	readonly update: boolean;
+	readonly copyOnly: boolean;
+	readonly note: string | undefined;
 }
 
 interface PreviewDecision {
@@ -572,6 +606,10 @@ export async function runRestoreReplacementExecution(
 	if (!isRecordValue(input.plan)) throw new TypeError("input.plan must be a completed standalone restore plan");
 	const rawEntries = input.plan["entries"];
 	if (!Array.isArray(rawEntries)) throw new TypeError("input.plan.entries must be an explicit array");
+	const importMode = input.importMode;
+	if (importMode !== "replace" && importMode !== "keep") {
+		throw new TypeError('input.importMode must be "replace" or "keep"');
+	}
 	requireCallable(input.confirm, "input.confirm");
 	requireCallable(input.readSession, "input.readSession");
 	requireCallable(input.readReferenceInventory, "input.readReferenceInventory");
@@ -623,9 +661,23 @@ export async function runRestoreReplacementExecution(
 		const sourceSessionID = requireNonEmptyString(raw["sourceSessionID"], `input.plan.entries[${index}].sourceSessionID`);
 		const record = cloneJsonRecord(requireSessionRecord(raw["record"], `input.plan.entries[${index}].record`));
 		const candidateSessionID = infoObject(record)["id"] as string;
-		const classification = raw["classification"];
-		if (classification !== undefined && classification !== "imported" && classification !== "renamed" && classification !== "skipped") {
-			throw new TypeError(`input.plan.entries[${index}].classification must be imported, renamed, or skipped when present`);
+		const classification = raw["classification"];		if (
+			classification !== undefined &&
+			classification !== "imported" &&
+			classification !== "renamed" &&
+			classification !== "updated" &&
+			classification !== "skipped"
+		) {
+			throw new TypeError(`input.plan.entries[${index}].classification must be imported, renamed, updated, or skipped when present`);
+		}
+		if (raw["copyOnly"] !== undefined && typeof raw["copyOnly"] !== "boolean") {
+			throw new TypeError(`input.plan.entries[${index}].copyOnly must be a boolean when present`);
+		}
+		if (raw["note"] !== undefined && typeof raw["note"] !== "string") {
+			throw new TypeError(`input.plan.entries[${index}].note must be a string when present`);
+		}
+		if (classification === "updated" && (sourceSessionID !== candidateSessionID || raw["copyOnly"] === true)) {
+			throw new TypeError(`input.plan.entries[${index}] is an update and must target its own session ID without copyOnly`);
 		}
 		if (sourceIDs.has(sourceSessionID)) {
 			throw new TypeError(`input.plan.entries repeats sourceSessionID ${JSON.stringify(sourceSessionID)}`);
@@ -640,6 +692,10 @@ export async function runRestoreReplacementExecution(
 			candidateSessionID,
 			record,
 			skip: classification === "skipped",
+			skipReason: typeof raw["skipReason"] === "string" ? raw["skipReason"] : undefined,
+			update: classification === "updated",
+			copyOnly: raw["copyOnly"] === true,
+			note: typeof raw["note"] === "string" ? raw["note"] : undefined,
 		});
 	}
 
@@ -662,18 +718,96 @@ export async function runRestoreReplacementExecution(
 		const displayTitle = titleOf(oldTarget !== undefined ? infoObject(oldTarget) : candidateInfo);
 
 		if (entry.skip) {
+			const skipReason =
+				entry.skipReason === "lineage-current" ? ("lineage-current" as const) : ("exact-duplicate" as const);
 			decisions.push({
 				entry: makePreviewEntry({
 					sessionID: displayID,
 					title: displayTitle,
 					action: "skip",
-					reason: "exact-duplicate",
+					reason: skipReason,
 				}),
 				candidateSessionID: entry.candidateSessionID,
 			});
 			continue;
 		}
-		if (entry.sourceSessionID === entry.candidateSessionID) {
+
+		if (entry.update) {
+			if (entry.candidateSessionID !== entry.sourceSessionID) {
+				decisions.push({
+					entry: makePreviewEntry({
+						sessionID: displayID,
+						title: displayTitle,
+						action: "skip",
+						reason: "prepared-record-invalid",
+					}),
+					candidateSessionID: entry.candidateSessionID,
+				});
+				continue;
+			}
+			if (oldTarget === undefined) {
+				decisions.push({
+					entry: makePreviewEntry({
+						sessionID: displayID,
+						title: displayTitle,
+						action: "import",
+						reason: "target-absent",
+					}),
+					candidateSessionID: entry.candidateSessionID,
+				});
+				continue;
+			}
+			const prepared = prepareUpdateCandidate(entry);
+			let eligible = false;
+			let baseline: string | undefined;
+			if (prepared !== undefined) {
+				try {
+					const updateMerge = mergeReferenceInventory([prepared], destinationSnapshot, globalInventory.infos);
+					const classification = classifyLineageUpdate({
+						source: prepared,
+						target: oldTarget,
+						authorizedTargetID: entry.sourceSessionID,
+						referenceInventory: updateMerge.infos,
+						inventoryComplete: globalInventory.complete && !updateMerge.unresolved,
+					});
+					if (classification.mode === "replace") {
+						baseline = fingerprintSessionRecord(oldTarget);
+						eligible = true;
+					}
+				} catch {
+					eligible = false;
+				}
+			}
+			if (!eligible || baseline === undefined) {
+				decisions.push({
+					entry: makePreviewEntry({
+						sessionID: displayID,
+						title: displayTitle,
+						action: "skip",
+						reason: "lineage-update-blocked",
+					}),
+					candidateSessionID: entry.candidateSessionID,
+				});
+				continue;
+			}
+			decisions.push({
+				entry: makePreviewEntry({
+					sessionID: displayID,
+					title: displayTitle,
+					action: "update",
+					reason: "lineage-continuation",
+				}),
+				candidateSessionID: entry.candidateSessionID,
+				baselineFingerprint: baseline,
+			});
+			continue;
+		}
+
+		if (
+			destinationByID.has(entry.candidateSessionID) ||
+			sourceByID.has(entry.candidateSessionID) ||
+			globalInventory.infos.some((info) => info["id"] === entry.candidateSessionID)
+		) {
 			decisions.push({
 				entry: makePreviewEntry({
 					sessionID: displayID,
@@ -685,11 +819,21 @@ export async function runRestoreReplacementExecution(
 			});
 			continue;
 		}
-		if (
-			destinationByID.has(entry.candidateSessionID) ||
-			sourceByID.has(entry.candidateSessionID) ||
-			globalInventory.infos.some((info) => info["id"] === entry.candidateSessionID)
-		) {
+
+		if (entry.copyOnly) {
+			decisions.push({
+				entry: makePreviewEntry({
+					sessionID: displayID,
+					title: displayTitle,
+					action: "copy",
+					reason: copyNoteReason(entry.note),
+				}),
+				candidateSessionID: entry.candidateSessionID,
+			});
+			continue;
+		}
+
+		if (entry.sourceSessionID === entry.candidateSessionID) {
 			decisions.push({
 				entry: makePreviewEntry({
 					sessionID: displayID,
@@ -718,6 +862,21 @@ export async function runRestoreReplacementExecution(
 		let action: RestoreReplacementAction = "copy";
 		let reason: RestoreReplacementReason = "safe-replace";
 		let baselineFingerprint: string | undefined;
+
+		// User-selected keep mode: never classify, fingerprint, request a delete
+		// port, or delete. The candidate is imported alongside the old target.
+		if (importMode === "keep") {
+			decisions.push({
+				entry: makePreviewEntry({
+					sessionID: displayID,
+					title: displayTitle,
+					action: "copy",
+					reason: "keep-existing",
+				}),
+				candidateSessionID: entry.candidateSessionID,
+			});
+			continue;
+		}
 
 		if (previewMerge.unresolved || previewMerge.restrictedTargetIDs.has(entry.sourceSessionID)) {
 			reason = "incoming-reference";
@@ -795,7 +954,7 @@ export async function runRestoreReplacementExecution(
 
 	const provisionalReplaceTargetIDs: string[] = [];
 	for (const decision of decisions) {
-		if (decision.entry.action !== "replace") continue;
+		if (decision.entry.action !== "replace" && decision.entry.action !== "update") continue;
 		const plannedEntry = planned.find((entry) => entry.sourceSessionID === decision.entry.sessionID);
 		if (plannedEntry !== undefined && !provisionalReplaceTargetIDs.includes(plannedEntry.sourceSessionID)) {
 			provisionalReplaceTargetIDs.push(plannedEntry.sourceSessionID);
@@ -823,16 +982,19 @@ export async function runRestoreReplacementExecution(
 	// surface never aborts imports: confirmed replace targets become copies.
 	const finalDecisions: PreviewDecision[] = [];
 	for (const decision of decisions) {
-		if (decision.entry.action !== "replace" || deleteCapability) {
+		if ((decision.entry.action !== "replace" && decision.entry.action !== "update") || deleteCapability) {
 			finalDecisions.push(decision);
 			continue;
 		}
+		// A replace candidate has a distinct ID and can safely degrade to a copy.
+		// An update candidate carries the existing target ID, so without delete
+		// capability it can only be skipped; importing it would collide.
 		finalDecisions.push({
 			...decision,
 			entry: makePreviewEntry({
 				sessionID: decision.entry.sessionID,
 				title: decision.entry.title,
-				action: "copy",
+				action: decision.entry.action === "update" ? "skip" : "copy",
 				reason: "delete-capability-unavailable",
 			}),
 		});
@@ -840,7 +1002,9 @@ export async function runRestoreReplacementExecution(
 
 	const preview: RestoreReplacementPreview = Object.freeze({
 		entries: Object.freeze(finalDecisions.map((decision) => decision.entry)),
-		recoveryRequired: finalDecisions.some((decision) => decision.entry.action === "replace"),
+		recoveryRequired: finalDecisions.some(
+			(decision) => decision.entry.action === "replace" || decision.entry.action === "update",
+		),
 	});
 
 	/* -- 3. Explicit confirmation gate. No write on any non-true answer. -- */
@@ -889,6 +1053,52 @@ export async function runRestoreReplacementExecution(
 					title: decision.entry.title,
 					outcome: "skipped",
 					reason: decision.entry.reason,
+				}),
+			);
+			continue;
+		}
+
+		if (action === "update") {
+			if (decision.baselineFingerprint === undefined) {
+				reportEntries.push(
+					Object.freeze({
+						sessionID: decision.entry.sessionID,
+						title: decision.entry.title,
+						outcome: "kept",
+						reason: "fingerprint-unavailable",
+					}),
+				);
+				continue;
+			}
+			const update = await updateExistingTarget({
+				entry,
+				baselineFingerprint: decision.baselineFingerprint,
+				importer: input.importer,
+				readSession: input.readSession,
+				readReferenceInventory: input.readReferenceInventory,
+				recovery: input.recovery,
+				deletePort,
+				attemptedDeleteIDs,
+				workingTargets: workingTargetRecords,
+				clock: input.clock,
+				targetDirectory,
+				targetProjectID,
+				canonicalProjectID,
+			});
+			if (update.removedOld) {
+				const workingIndex = workingTargetRecords.findIndex(
+					(record) => infoObject(record)["id"] === entry.sourceSessionID,
+				);
+				if (workingIndex >= 0) workingTargetRecords.splice(workingIndex, 1);
+			}
+			if (update.actual !== undefined) workingTargetRecords.push(update.actual);
+			if (update.recoveryPath !== undefined && recoveryPath === undefined) recoveryPath = update.recoveryPath;
+			reportEntries.push(
+				Object.freeze({
+					sessionID: decision.entry.sessionID,
+					title: decision.entry.title,
+					outcome: update.outcome,
+					...(update.reason !== undefined ? { reason: update.reason } : {}),
 				}),
 			);
 			continue;
@@ -1159,6 +1369,198 @@ export async function runRestoreReplacementExecution(
 /* ------------------------------------------------------------------------- */
 /* Execution helpers                                                         */
 /* ------------------------------------------------------------------------- */
+
+/** Fixed display reason for a forced lineage copy; never accepts raw text. */
+function copyNoteReason(note: string | undefined): RestoreReplacementReason {
+	if (note === "lineage-ambiguous") return "lineage-ambiguous";
+	if (note === "lineage-linked") return "lineage-linked";
+	return "lineage-conflict";
+}
+
+/** Validate a same-ID update candidate without importing it. */
+function prepareUpdateCandidate(entry: PlannedEntry): SessionRecord | undefined {
+	try {
+		const prepared = requireSessionRecord(prepareStandaloneRecord(entry.record), "prepareStandaloneRecord(record)");
+		if (infoObject(prepared)["id"] !== entry.sourceSessionID) return undefined;
+		if (hasBlockingGraphMetadata(infoObject(prepared))) return undefined;
+		return prepared;
+	} catch {
+		return undefined;
+	}
+}
+
+interface UpdateExecutionResult {
+	readonly outcome: RestoreReplacementOutcome;
+	readonly reason?: RestoreReplacementReason;
+	readonly removedOld: boolean;
+	readonly actual?: SessionRecord;
+	readonly recoveryPath?: string;
+}
+
+/**
+ * Same-ID lineage update: every fresh gate, then encrypted recovery, exactly one
+ * delete, verified absence, and exactly one same-ID import. The old target is
+ * removed from the live store before the new record exists, so a failed import
+ * is reported truthfully and the recovery artifact is the only restore path.
+ * There is no retry, rollback, or atomicity claim.
+ */
+async function updateExistingTarget(input: {
+	readonly entry: PlannedEntry;
+	readonly baselineFingerprint: string;
+	readonly importer: SessionImportAdapter;
+	readonly readSession: (sessionID: string) => Promise<SessionRecord | undefined>;
+	readonly readReferenceInventory: () => Promise<ReplacementReferenceInventory>;
+	readonly recovery: ReplacementRecoveryPort;
+	readonly deletePort: ReplacementDeletePort | undefined;
+	readonly attemptedDeleteIDs: Set<string>;
+	readonly workingTargets: readonly SessionRecord[];
+	readonly clock: () => number;
+	readonly targetDirectory: string;
+	readonly targetProjectID: string;
+	readonly canonicalProjectID: string;
+}): Promise<UpdateExecutionResult> {
+	const prepared = prepareUpdateCandidate(input.entry);
+	if (prepared === undefined) return { outcome: "kept", reason: "prepared-record-invalid", removedOld: false };
+
+	try {
+		const now = input.clock();
+		if (typeof now !== "number" || !Number.isFinite(now)) {
+			return { outcome: "kept", reason: "clock-invalid", removedOld: false };
+		}
+	} catch {
+		return { outcome: "kept", reason: "clock-invalid", removedOld: false };
+	}
+
+	const targetID = input.entry.sourceSessionID;
+	const freshTarget = await readExact(input.readSession, targetID);
+	if (freshTarget.kind === "absent") {
+		// The old target disappeared after the preview; importing the update is
+		// now an ordinary import and involves no delete.
+		const imported = await importCandidate({
+			entry: input.entry,
+			importer: input.importer,
+			readSession: input.readSession,
+			clock: input.clock,
+			targetDirectory: input.targetDirectory,
+			targetProjectID: input.targetProjectID,
+			canonicalProjectID: input.canonicalProjectID,
+			preparedRecord: input.entry.record,
+		});
+		return imported.ok
+			? { outcome: "imported", reason: "old-already-absent", removedOld: false, actual: imported.value.actual }
+			: { outcome: "failed", reason: imported.reason, removedOld: false };
+	}
+	if (freshTarget.kind === "unreadable") {
+		return { outcome: "kept", reason: "target-readback-failed", removedOld: false };
+	}
+
+	let freshFingerprint: string;
+	try {
+		freshFingerprint = fingerprintSessionRecord(freshTarget.record);
+	} catch {
+		return { outcome: "kept", reason: "target-readback-failed", removedOld: false };
+	}
+	if (freshFingerprint !== input.baselineFingerprint) {
+		return { outcome: "kept", reason: "target-changed", removedOld: false };
+	}
+	if (hasBlockingGraphMetadata(infoObject(freshTarget.record))) {
+		return { outcome: "kept", reason: "target-unsettled-at-delete", removedOld: false };
+	}
+
+	let freshInventory: ReplacementReferenceInventory;
+	try {
+		freshInventory = requireInventory(await input.readReferenceInventory(), "readReferenceInventory()");
+	} catch {
+		return { outcome: "kept", reason: "inventory-incomplete", removedOld: false };
+	}
+	if (!freshInventory.complete) {
+		return { outcome: "kept", reason: "inventory-incomplete", removedOld: false };
+	}
+
+	const freshMerge = mergeReferenceInventory(
+		[prepared],
+		[...input.workingTargets, freshTarget.record],
+		freshInventory.infos,
+	);
+	let classification: ReplacementClassification | undefined;
+	try {
+		classification = classifyLineageUpdate({
+			source: prepared,
+			target: freshTarget.record,
+			authorizedTargetID: targetID,
+			referenceInventory: freshMerge.infos,
+			inventoryComplete: !freshMerge.unresolved,
+		});
+	} catch {
+		classification = undefined;
+	}
+	if (classification === undefined) {
+		return { outcome: "kept", reason: "classifier-unavailable", removedOld: false };
+	}
+	if (classification.mode !== "replace") {
+		return { outcome: "kept", reason: "classifier-copy", removedOld: false };
+	}
+
+	if (input.deletePort === undefined || typeof input.deletePort.removeSession !== "function") {
+		return { outcome: "kept", reason: "delete-capability-missing", removedOld: false };
+	}
+	if (input.attemptedDeleteIDs.has(targetID)) {
+		return { outcome: "kept", reason: "delete-capability-missing", removedOld: false };
+	}
+
+	let recoveryVerified = false;
+	let recoveryArtifactPath: string | undefined;
+	try {
+		const recovery = await input.recovery.writeAndVerify([...input.workingTargets]);
+		recoveryVerified = isRecordValue(recovery) && recovery["verified"] === true;
+		if (recoveryVerified && isRecordValue(recovery)) {
+			const path = recovery["path"];
+			if (typeof path === "string" && path.length > 0) recoveryArtifactPath = path;
+		}
+	} catch {
+		recoveryVerified = false;
+	}
+	if (!recoveryVerified) {
+		return { outcome: "kept", reason: "recovery-unverified", removedOld: false };
+	}
+
+	input.attemptedDeleteIDs.add(targetID);
+	const reconciliation = await reconcileDelete(input.deletePort, targetID, input.readSession);
+	if (reconciliation.outcome !== "replaced") {
+		return {
+			outcome: reconciliation.outcome,
+			...(reconciliation.reason !== undefined ? { reason: reconciliation.reason } : {}),
+			removedOld: false,
+			...(recoveryArtifactPath !== undefined ? { recoveryPath: recoveryArtifactPath } : {}),
+		};
+	}
+
+	const imported = await importCandidate({
+		entry: input.entry,
+		importer: input.importer,
+		readSession: input.readSession,
+		clock: input.clock,
+		targetDirectory: input.targetDirectory,
+		targetProjectID: input.targetProjectID,
+		canonicalProjectID: input.canonicalProjectID,
+		preparedRecord: input.entry.record,
+	});
+	if (!imported.ok) {
+		return {
+			outcome: "failed",
+			reason: imported.reason,
+			removedOld: true,
+			...(recoveryArtifactPath !== undefined ? { recoveryPath: recoveryArtifactPath } : {}),
+		};
+	}
+	return {
+		outcome: "updated",
+		reason: "lineage-continuation",
+		removedOld: true,
+		actual: imported.value.actual,
+		...(recoveryArtifactPath !== undefined ? { recoveryPath: recoveryArtifactPath } : {}),
+	};
+}
 
 async function importCandidate(input: {
 	readonly entry: PlannedEntry;

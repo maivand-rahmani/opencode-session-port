@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	ArtifactFileError,
+	deleteCheckpointArtifacts,
+	planCheckpointCleanup,
 	readEncryptedArtifact,
 	resolveCheckpointOutputPath,
 	resolveLatestCheckpointArtifact,
@@ -280,6 +282,90 @@ describe("resolveLatestCheckpointArtifact (bare /restore discovery)", () => {
 		});
 		// The linked directory was never traversed or modified.
 		expect((await readFile(inner)).byteLength).toBe(2);
+	});
+});
+
+describe("planCheckpointCleanup / deleteCheckpointArtifacts", () => {
+	test("keeps the newest checkpoint and lists older ones newest-first", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		const oldest = path.join(directory, "checkpoint-oldest.sessionport");
+		const middle = path.join(directory, "checkpoint-middle.sessionport");
+		const newest = path.join(directory, "checkpoint-newest.sessionport");
+		for (const target of [oldest, middle, newest]) await writeFile(target, syntheticBytes(2));
+		await utimes(oldest, new Date(1_000_000), new Date(1_000_000));
+		await utimes(middle, new Date(5_000_000), new Date(5_000_000));
+		await utimes(newest, new Date(9_000_000), new Date(9_000_000));
+
+		const plan = await planCheckpointCleanup({ projectDirectory: root });
+
+		expect(plan.directory).toBe(directory);
+		expect(plan.latest).toBe(newest);
+		expect(plan.older).toEqual([middle, oldest]);
+	});
+
+	test("excludes recovery backups, non-checkpoint names, directories, and symlinks", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		const newest = path.join(directory, "checkpoint-newest.sessionport");
+		await writeFile(newest, syntheticBytes(2));
+		await writeFile(path.join(directory, "recovery-2026.sessionport"), syntheticBytes(2));
+		await writeFile(path.join(directory, "notes.txt"), syntheticBytes(2));
+		await mkdir(path.join(directory, "nested.sessionport"));
+		try {
+			await symlink(newest, path.join(directory, "linked.sessionport"), "file");
+		} catch {
+			// Platform-dependent; the other exclusions still apply.
+		}
+
+		const plan = await planCheckpointCleanup({ projectDirectory: root });
+
+		expect(plan.latest).toBe(newest);
+		expect(plan.older).toEqual([]);
+	});
+
+	test("a missing .sessionport directory produces an empty plan and creates nothing", async () => {
+		const root = await makeTempRoot();
+
+		const plan = await planCheckpointCleanup({ projectDirectory: root });
+
+		expect(plan.latest).toBeUndefined();
+		expect(plan.older).toEqual([]);
+		await expect(lstat(path.join(root, ".sessionport"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("deletes only regular checkpoint files directly inside .sessionport", async () => {
+		const root = await makeTempRoot();
+		const directory = path.join(root, ".sessionport");
+		await mkdir(directory);
+		const older = path.join(directory, "checkpoint-older.sessionport");
+		const newer = path.join(directory, "checkpoint-newer.sessionport");
+		const recovery = path.join(directory, "recovery-keep.sessionport");
+		const outside = path.join(root, "outside.sessionport");
+		for (const target of [older, newer, recovery, outside]) await writeFile(target, syntheticBytes(2));
+
+		const deleted = await deleteCheckpointArtifacts([
+			older,
+			recovery,
+			outside,
+			path.join(directory, "notes.txt"),
+			path.join(directory, "missing.sessionport"),
+		]);
+
+		expect(deleted).toBe(1);
+		await expect(lstat(older)).rejects.toMatchObject({ code: "ENOENT" });
+		expect((await readFile(newer)).byteLength).toBe(2);
+		expect((await readFile(recovery)).byteLength).toBe(2);
+		expect((await readFile(outside)).byteLength).toBe(2);
+	});
+
+	test("rejects a non-array deletion request", async () => {
+		await expect(deleteCheckpointArtifacts(undefined as never)).rejects.toMatchObject({
+			name: "ArtifactFileError",
+			code: "invalid-request",
+		});
 	});
 });
 

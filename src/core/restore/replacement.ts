@@ -422,6 +422,129 @@ export function fingerprintSessionRecord(record: SessionRecord): string {
 	return sha256Hex(canonical);
 }
 
+/**
+ * Identity/volatile fields the supported import/copy paths change. A copied
+ * record receives a derived session ID; the host import replaces projectID,
+ * version, slug, location/directory, and `time.updated`, and prepares a
+ * standalone copy by removing parentID/fork/revert. Message IDs are rederived
+ * for copied records. Everything else — title, metadata, cost/tokens, every
+ * message body, ordering, and absent-vs-null distinctions — remains
+ * significant. This list is deliberately narrow: broad normalization would
+ * create false matches.
+ */
+const CONTENT_IGNORED_INFO_KEYS = [
+	"id",
+	"projectID",
+	"parentID",
+	"fork",
+	"revert",
+	"slug",
+	"version",
+	"location",
+	"directory",
+	"path",
+] as const;
+
+/**
+ * Fingerprint of one session's CONTENT, ignoring only the identity/volatile
+ * fields above and per-message IDs. Two records that differ only because one
+ * was imported/copied under derived IDs have the same content fingerprint.
+ *
+ * This is a duplicate-content detector, NOT a lineage or identity proof:
+ * two separately created sessions with identical content also match. Callers
+ * must never use it to authorize a delete, overwrite, or merge; a match may
+ * only justify skipping an import whose exact content already exists locally.
+ */
+export function fingerprintSessionContent(record: SessionRecord): string {
+	const snapshot = snapshotSessionRecord(record, "invalid-record");
+	const info = cloneObject(snapshot.info);
+	for (const key of CONTENT_IGNORED_INFO_KEYS) delete info[key];
+	const metadata = info["metadata"];
+	if (isJsonObject(metadata)) {
+		// SessionPort lineage is identity metadata, not session content. Removing
+		// it (and an object left empty) keeps a stamped copy equal to the
+		// unstamped original it came from.
+		const normalizedMetadata = cloneObject(metadata);
+		delete normalizedMetadata["sessionport"];
+		if (Object.keys(normalizedMetadata).length === 0) delete info["metadata"];
+		else info["metadata"] = normalizedMetadata;
+	}
+	const time = info["time"];
+	if (isJsonObject(time)) {
+		const normalizedTime = cloneObject(time);
+		delete normalizedTime["updated"];
+		info["time"] = normalizedTime;
+	}
+	const messages = snapshot.messages.map((message) => {
+		const copy = cloneObject(message);
+		delete copy["id"];
+		return copy;
+	});
+	return sha256Hex(canonicalJson({ info, messages } as unknown as JsonValue));
+}
+
+/**
+ * Per-message content hashes in order, ignoring only the message `id`. Used to
+ * decide whether one session's message history is a strict prefix of another's
+ * (a continuation) without comparing multi-megabyte message bodies in memory.
+ */
+export function fingerprintSessionMessages(record: SessionRecord): string[] {
+	const snapshot = snapshotSessionRecord(record, "invalid-record");
+	const hashes: string[] = [];
+	for (let index = 0; index < snapshot.messages.length; index++) {
+		const copy = cloneObject(snapshot.messages[index]!);
+		delete copy["id"];
+		hashes.push(sha256Hex(canonicalJson(copy as unknown as JsonValue)));
+	}
+	return hashes;
+}
+
+/**
+ * Fingerprint of the info fields that must agree before two records can be
+ * treated as the same continuing session. Usage counters (`cost`, `tokens`),
+ * volatile timestamps, host-rewritten identity fields, graph references, and
+ * the SessionPort lineage stamp are excluded; title, agent, model, permissions,
+ * metadata (other than lineage), `time.created`, and any unknown info field are
+ * significant. A message-only match with a different info fingerprint is a
+ * conflict, never a silent metadata overwrite.
+ */
+export function fingerprintSessionLineageInfo(record: SessionRecord): string {
+	const snapshot = snapshotSessionRecord(record, "invalid-record");
+	const info = cloneObject(snapshot.info);
+	for (const key of [
+		"id",
+		"projectID",
+		"parentID",
+		"fork",
+		"revert",
+		"slug",
+		"version",
+		"location",
+		"directory",
+		"path",
+		"cost",
+		"tokens",
+	] as const) {
+		delete info[key];
+	}
+	const time = info["time"];
+	if (isJsonObject(time)) {
+		const normalizedTime = cloneObject(time);
+		for (const key of Object.keys(normalizedTime)) {
+			if (key !== "created") delete normalizedTime[key];
+		}
+		info["time"] = normalizedTime;
+	}
+	const metadata = info["metadata"];
+	if (isJsonObject(metadata)) {
+		const normalizedMetadata = cloneObject(metadata);
+		delete normalizedMetadata["sessionport"];
+		if (Object.keys(normalizedMetadata).length === 0) delete info["metadata"];
+		else info["metadata"] = normalizedMetadata;
+	}
+	return sha256Hex(canonicalJson(info as unknown as JsonValue));
+}
+
 /* ------------------------------------------------------------------------- */
 /* Replacement classification                                                */
 /* ------------------------------------------------------------------------- */
@@ -650,6 +773,85 @@ export function classifyReplacement(input: ClassifyReplacementInput): Replacemen
 			return copy("source-has-incoming-references");
 		}
 		if (entry.revertMessageID !== undefined && targetMessageIDs.has(entry.revertMessageID)) {
+			return copy("target-has-incoming-references");
+		}
+	}
+
+	return { mode: "replace" };
+}
+
+/**
+ * Same-ID update eligibility, separate from `classifyReplacement` because a
+ * lineage update deliberately deletes and re-imports the SAME session ID.
+ *
+ * Requires the exact authorized target, standalone and settled source and
+ * target records, a complete well-formed inventory, and no parent/fork/revert
+ * reference from any inventory entry into either version's session or message
+ * IDs. The caller must have already proven a message-prefix continuation; this
+ * function only answers whether replacing the target is mechanically safe.
+ */
+export function classifyLineageUpdate(input: {
+	readonly source: SessionRecord;
+	readonly target: SessionRecord;
+	readonly authorizedTargetID: string;
+	readonly referenceInventory: readonly JsonObject[];
+	readonly inventoryComplete: boolean;
+}): ReplacementClassification {
+	const copy = (reason: ReplacementCopyReason): ReplacementClassification => ({ mode: "copy", reason });
+
+	const rawInput: unknown = input;
+	if (!isJsonObject(rawInput)) throw new ReplacementPolicyError("invalid-input");
+	if (rawInput["source"] === undefined || rawInput["source"] === null) {
+		throw new ReplacementPolicyError("invalid-input");
+	}
+	if (rawInput["target"] === undefined || rawInput["target"] === null) return copy("target-missing");
+
+	const source = snapshotSessionRecord(rawInput["source"], "invalid-record");
+	const target = snapshotSessionRecord(rawInput["target"], "invalid-record");
+	const targetID = target.info["id"] as string;
+
+	if (
+		typeof rawInput["authorizedTargetID"] !== "string" ||
+		rawInput["authorizedTargetID"].length === 0 ||
+		rawInput["authorizedTargetID"] !== targetID ||
+		source.info["id"] !== targetID
+	) {
+		return copy("target-not-authorized");
+	}
+
+	if (hasSessionReference(source.info)) return copy("source-has-references");
+	if (hasSessionReference(target.info)) return copy("target-has-references");
+
+	const sourceUnsupported = firstUnsettled(source);
+	if (sourceUnsupported === "unsettled") return copy("source-unsettled");
+	if (sourceUnsupported === "unsupported-tool") return copy("source-unsupported-tool");
+
+	const targetUnsupported = firstUnsettled(target);
+	if (targetUnsupported === "unsettled") return copy("target-unsettled");
+	if (targetUnsupported === "unsupported-tool") return copy("target-unsupported-tool");
+
+	if (rawInput["inventoryComplete"] !== true) return copy("inventory-incomplete");
+	const inventory = scanInventory(rawInput["referenceInventory"]);
+	if (!inventory.ok) return copy(inventory.reason);
+
+	if (!inventory.entries.some((entry) => entry.id === targetID)) return copy("inventory-incomplete");
+
+	const sourceMessageIDs = new Set(source.messages.map((message) => message["id"] as string));
+	const targetMessageIDs = new Set(target.messages.map((message) => message["id"] as string));
+
+	for (const entry of inventory.entries) {
+		if (entry.parentID === targetID) return copy("target-has-incoming-references");
+		if (entry.forkSessionID === targetID) return copy("target-has-incoming-references");
+		if (
+			entry.boundaryMessageID !== undefined &&
+			(sourceMessageIDs.has(entry.boundaryMessageID) || targetMessageIDs.has(entry.boundaryMessageID))
+		) {
+			return copy("target-has-incoming-references");
+		}
+		if (
+			entry.revertMessageID !== undefined &&
+			(sourceMessageIDs.has(entry.revertMessageID) || targetMessageIDs.has(entry.revertMessageID))
+		) {
 			return copy("target-has-incoming-references");
 		}
 	}

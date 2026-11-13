@@ -31,10 +31,15 @@
  * - non-array responses, non-object records, missing/blank/non-string `id` or
  *   `canonical`, and non-string `name` values → `ProjectDestinationError`
  *   (`invalid-response`);
- * - conflicting `projectID` ↔ `targetDirectory` pairs (one ID mapping to
- *   different paths, one path mapping to different IDs, or a repeated pair
- *   with different labels) → `ProjectDestinationError` (`invalid-response`);
- *   only entries that are unambiguously identical (same ID, same canonical,
+ * - conflicting `projectID` ↔ `targetDirectory` pairs: one ID mapping to
+ *   different paths, or one ID/canonical pair repeated with different labels,
+ *   are rejected as ambiguous. Multiple IDs sharing one canonical directory are
+ *   not rejected: OpenCode can retain historical project records for the same
+ *   checkout. `listDestinations` disambiguates each such group with one
+ *   read-only `location.get` and keeps the project ID the host resolves for
+ *   that directory. If that capability is unavailable or the response does not
+ *   match one of the grouped records, the whole listing fails closed.
+ * - only entries that are unambiguously identical (same ID, same canonical,
  *   same label) are deduplicated.
  * - Error messages carry only record positions/counts and value types, never
  *   project IDs, paths, or names.
@@ -45,8 +50,9 @@
  * `project.list` takes no required argument; the pinned declaration types its
  * only parameter as optional (`requestOptions?`), so the resolver's single
  * `undefined` argument is declaration-equivalent to `client.project.list()`.
- * Host/API rejections propagate unchanged; this adapter never wraps, retries,
- * or swallows them.
+ * `client.location.get` is resolved the same way and called only to
+ * disambiguate duplicate canonical directories. Host/API rejections propagate
+ * unchanged; this adapter never wraps, retries, or swallows them.
  *
  * Evidence boundary: pinned v2.0.22 declaration/source research (`lib-31`) and
  * synthetic fake-client tests only. This module makes no live host call and no
@@ -95,6 +101,9 @@ export class ProjectDestinationError extends Error {
 export interface ProjectListClientLike {
 	readonly project?: {
 		list?(): Promise<unknown>;
+	};
+	readonly location?: {
+		get?(input: { readonly location: { readonly directory: string } }): Promise<unknown>;
 	};
 }
 
@@ -167,13 +176,19 @@ export function createProjectDestinationsAdapter(client: unknown): ProjectDestin
 			"The installed TUI client does not expose a callable project.list; cannot enumerate destination candidates",
 		);
 	}
+	const locationGet = resolveUnaryMethod<{ readonly location: { readonly directory: string } }>(
+		client,
+		"location",
+		"get",
+	);
 	return {
 		async listDestinations(): Promise<readonly ProjectDestinationCandidate[]> {
 			// The resolver always applies exactly one argument; the pinned
 			// declaration's only parameter is optional, so `undefined` is the
 			// declaration-equivalent of calling `client.project.list()`.
 			const response = await projectList(undefined);
-			return mapProjectListResponse(response);
+			const candidates = mapProjectListResponse(response);
+			return resolveDuplicateCanonicals(candidates, locationGet);
 		},
 	};
 }
@@ -186,10 +201,12 @@ export function createProjectDestinationsAdapter(client: unknown): ProjectDestin
  * Maps a raw `project.list` response to destination candidates.
  *
  * Strict and fail-closed: any non-array response or any malformed record
- * rejects the entire list (no filtering, no partial results). Duplicate
- * entries are collapsed only when unambiguously identical; every other
- * repeated `projectID` or `canonical` value rejects as an ambiguous pair.
- * Error messages never embed project data (only positions, counts, types).
+ * rejects the entire list (no filtering, no partial results). Exact duplicate
+ * records are collapsed. A repeated project ID with a different canonical or
+ * label rejects as a host inconsistency. Multiple IDs sharing one canonical
+ * directory are kept here and resolved later by `resolveDuplicateCanonicals`
+ * with one read-only `location.get`. Error messages never embed project data
+ * (only positions, counts, types).
  */
 export function mapProjectListResponse(response: unknown): readonly ProjectDestinationCandidate[] {
 	if (!Array.isArray(response)) {
@@ -200,32 +217,114 @@ export function mapProjectListResponse(response: unknown): readonly ProjectDesti
 	const total = response.length;
 	const candidates: ProjectDestinationCandidate[] = [];
 	const byProjectID = new Map<string, ProjectDestinationCandidate>();
-	const byTargetDirectory = new Map<string, ProjectDestinationCandidate>();
 
 	for (let index = 0; index < total; index += 1) {
 		const candidate = parseProjectRecord(response[index], index, total);
 		const knownByProjectID = byProjectID.get(candidate.projectID);
-		const knownByTargetDirectory = byTargetDirectory.get(candidate.targetDirectory);
-		if (knownByProjectID !== undefined || knownByTargetDirectory !== undefined) {
-			// Deduplicate only an unambiguously identical entry: both lookups
-			// must resolve to the same previously accepted candidate and every
-			// candidate field must match. Anything else is a conflicting pair.
+		if (knownByProjectID !== undefined) {
+			// A repeated ID is only safe when it is the exact same record. A
+			// different canonical directory or label for one ID is a genuine
+			// host inconsistency and remains fail-closed.
 			const isExactDuplicate =
-				knownByProjectID !== undefined &&
-				knownByProjectID === knownByTargetDirectory &&
 				candidate.projectID === knownByProjectID.projectID &&
 				candidate.targetDirectory === knownByProjectID.targetDirectory &&
 				candidate.label === knownByProjectID.label;
 			if (isExactDuplicate) continue;
 			throw new ProjectDestinationError(
-				`project.list record ${index + 1} of ${total} conflicts with an earlier project ID/canonical directory pair; refusing to guess a destination`,
+				`project.list record ${index + 1} of ${total} conflicts with an earlier record for the same project ID; refusing to guess a destination`,
 			);
 		}
 		byProjectID.set(candidate.projectID, candidate);
-		byTargetDirectory.set(candidate.targetDirectory, candidate);
 		candidates.push(candidate);
 	}
 	return candidates;
+}
+
+/**
+ * Collapses multiple project IDs that share one canonical directory. OpenCode
+ * can retain historical project records for the same checkout, and the list
+ * API may return several IDs for one directory. Restore needs one explicit
+ * `{ projectID, targetDirectory }` pair, so each duplicate group is resolved
+ * with one read-only `location.get`; only the ID the host returns for that
+ * directory is kept. A missing capability, malformed response, or an ID that
+ * is not one of the grouped records fails the whole listing closed.
+ */
+async function resolveDuplicateCanonicals(
+	candidates: readonly ProjectDestinationCandidate[],
+	locationGet: ((input: { readonly location: { readonly directory: string } }) => Promise<unknown>) | undefined,
+): Promise<readonly ProjectDestinationCandidate[]> {
+	const groups = new Map<string, ProjectDestinationCandidate[]>();
+	for (const candidate of candidates) {
+		const group = groups.get(candidate.targetDirectory);
+		if (group === undefined) groups.set(candidate.targetDirectory, [candidate]);
+		else group.push(candidate);
+	}
+	if ([...groups.values()].every((group) => group.length === 1)) return candidates;
+
+	if (locationGet === undefined) {
+		throw new HostAdapterError(
+			"capability-unavailable",
+			"The installed TUI client does not expose a callable location.get; cannot disambiguate duplicate project directories",
+		);
+	}
+
+	const resolvedByCanonical = new Map<string, ProjectDestinationCandidate>();
+	for (const [canonical, group] of groups) {
+		if (group.length === 1) continue;
+		const response = await locationGet({ location: { directory: canonical } });
+		resolvedByCanonical.set(canonical, resolveDuplicateGroup(response, canonical, group));
+	}
+
+	const resolved: ProjectDestinationCandidate[] = [];
+	const emitted = new Set<string>();
+	for (const candidate of candidates) {
+		const duplicateResolution = resolvedByCanonical.get(candidate.targetDirectory);
+		if (duplicateResolution === undefined) {
+			resolved.push(candidate);
+			continue;
+		}
+		if (emitted.has(candidate.targetDirectory)) continue;
+		emitted.add(candidate.targetDirectory);
+		resolved.push(duplicateResolution);
+	}
+	return resolved;
+}
+
+function resolveDuplicateGroup(
+	response: unknown,
+	canonical: string,
+	group: readonly ProjectDestinationCandidate[],
+): ProjectDestinationCandidate {
+	if (!isObjectRecord(response)) {
+		throw new ProjectDestinationError(
+			`location.get for a duplicate project directory did not return an object; received ${describeValue(response)}`,
+		);
+	}
+	const directory = response["directory"];
+	if (typeof directory !== "string" || directory !== canonical) {
+		throw new ProjectDestinationError(
+			"location.get for a duplicate project directory did not return the exact requested directory",
+		);
+	}
+	const project = response["project"];
+	if (!isObjectRecord(project)) {
+		throw new ProjectDestinationError(
+			`location.get for a duplicate project directory must carry a project object; received ${describeValue(project)}`,
+		);
+	}
+	const projectID = project["id"];
+	if (typeof projectID !== "string" || projectID.trim().length === 0) {
+		throw new ProjectDestinationError(
+			`location.get for a duplicate project directory must carry a non-blank string project id; received ${describeValue(projectID)}`,
+		);
+	}
+	const match = group.find((candidate) => candidate.projectID === projectID);
+	if (match === undefined) {
+		throw new ProjectDestinationError(
+			"location.get returned a project ID that does not match any project.list record for the duplicate directory; refusing to guess a destination",
+		);
+	}
+	return match;
 }
 
 /**

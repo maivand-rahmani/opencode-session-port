@@ -43,6 +43,8 @@ import {
 	fingerprintSessionRecord,
 	planRestore,
 	prepareStandaloneRecord,
+	sessionLineageID,
+	stampSessionLineage,
 	type RemappedIdDeriver,
 } from "../../core/restore/index.ts";
 import type { SessionImportAdapter } from "../adapters/index.ts";
@@ -81,6 +83,11 @@ export interface LocalRestoreInput {
 	readonly artifactPath: string;
 	readonly destinationProjectID: string;
 	readonly targetDirectory: string;
+	/**
+	 * User-selected import mode. `replace` keeps the verified-delete flow;
+	 * `keep` never deletes and imports existing-target candidates as copies.
+	 */
+	readonly importMode: "replace" | "keep";
 	readonly cryptoFactory: CheckpointCryptoFactory;
 	readonly cryptoPolicy: CryptoPolicy;
 	readonly readEncryptedArtifact: (targetPath: string) => ByteSource;
@@ -182,7 +189,11 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 			if (raw === undefined) {
 				throw new TypeError("The checkpoint plan referenced a session that is not in the payload");
 			}
-			importSources.push(prepareStandaloneRecord(raw));
+			// Lineage is resolved before flattening (the raw record's own stamp or
+			// session ID) and stamped on the standalone candidate before any host
+			// import. The host preserves info.metadata, so the copy remains linked
+			// to its original across later round-trips.
+			importSources.push(stampSessionLineage(prepareStandaloneRecord(raw), sessionLineageID(raw)));
 		}
 
 		// Second planning pass over the flattened/standalone payload rederives
@@ -198,23 +209,39 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 		const planEntries: StandaloneRestorePlanEntry[] = [];
 		for (let index = 0; index < flattenedPlan.entries.length; index += 1) {
 			const entry = flattenedPlan.entries[index]!;
+			const updateTarget = entry.classification === "updated";
 			planEntries.push({
 				// The executor treats `sourceSessionID` as an old destination target
 				// and rejects source===candidate as a collision. For a verified absent
 				// target the import legitimately keeps its original ID, so the internal
 				// lookup token must be distinct; the preview/report display the planned
-				// candidate ID when no old target exists.
-				sourceSessionID: destinationIDs.has(entry.sourceSessionID)
-					? entry.sourceSessionID
-					: `local-absent-target-${index}-${entry.sourceSessionID}`,
+				// candidate ID when no old target exists. A same-ID update is different:
+				// the target is the existing destination session and the candidate
+				// record already carries that exact ID.
+				sourceSessionID: updateTarget
+					? entry.targetSessionID
+					: destinationIDs.has(entry.sourceSessionID)
+						? entry.sourceSessionID
+						: `local-absent-target-${index}-${entry.sourceSessionID}`,
 				record: entry.record,
 				classification: entry.classification,
 				...(entry.skipReason !== undefined ? { skipReason: entry.skipReason } : {}),
+				...(entry.copyOnly === true ? { copyOnly: true } : {}),
+				...(entry.note !== undefined ? { note: entry.note } : {}),
 			});
 		}
-		// Preserve exact-plaintext skip reporting without importing or deleting.
+		// Preserve pre-flattening skip reporting without importing or deleting.
+		// Both skips mean the artifact record is already represented locally, so
+		// the executor only reports them; it never writes for either.
 		for (const entry of originalPlan.entries) {
-			if (entry.classification !== "skipped" || entry.skipReason !== "exact-local-duplicate") continue;
+			if (
+				entry.classification !== "skipped" ||
+				(entry.skipReason !== "exact-local-duplicate" &&
+					entry.skipReason !== "exact-content-duplicate" &&
+					entry.skipReason !== "lineage-current")
+			) {
+				continue;
+			}
 			planEntries.push({
 				sourceSessionID: entry.sourceSessionID,
 				record: entry.record,
@@ -261,6 +288,7 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 
 		const result: RestoreReplacementExecutionResult = await runRestoreReplacementExecution({
 			plan: { entries: planEntries },
+			importMode: input.importMode,
 			sourceRecords,
 			destination,
 			globalInventory,
@@ -399,6 +427,9 @@ function validateInput(input: LocalRestoreInput): void {
 	requireNonEmptyString(input.artifactPath, "artifactPath");
 	requireNonEmptyString(input.destinationProjectID, "destinationProjectID");
 	requireNonEmptyString(input.targetDirectory, "targetDirectory");
+	if (input.importMode !== "replace" && input.importMode !== "keep") {
+		throw new TypeError('importMode must be "replace" or "keep"');
+	}
 	requireCallable(input.readEncryptedArtifact, "readEncryptedArtifact");
 	requireCallable(input.requestPassword, "requestPassword");
 	requireCallable(input.readDestination, "readDestination");

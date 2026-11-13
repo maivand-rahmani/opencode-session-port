@@ -264,6 +264,83 @@ export interface ResolveLatestCheckpointArtifactOptions {
 	readonly projectDirectory: string;
 }
 
+/** One `.sessionport` checkpoint candidate discovered by the cleanup scan. */
+interface CheckpointCandidate {
+	readonly name: string;
+	readonly path: string;
+	readonly mtimeMs: number;
+}
+
+/** Preview of the default-directory cleanup; nothing is deleted by this plan. */
+export interface CheckpointCleanupPlan {
+	/** The project's `.sessionport` directory, whether or not it exists. */
+	readonly directory: string;
+	/** Newest checkpoint that cleanup would keep, if any. */
+	readonly latest: string | undefined;
+	/** Older checkpoint files cleanup would delete; newest-first order. */
+	readonly older: readonly string[];
+}
+
+/**
+ * Resolves and validates `<projectDirectory>/.sessionport` for scanning.
+ * Returns `undefined` when the directory does not exist; refuses a symlinked,
+ * junction, or non-directory entry.
+ */
+async function resolveCheckpointScanDirectory(projectDirectory: string): Promise<string | undefined> {
+	const directory = path.resolve(projectDirectory, CHECKPOINT_DIRECTORY_NAME);
+	let directoryStats;
+	try {
+		// lstat: a symlinked/junction directory is never followed or traversed.
+		directoryStats = await lstat(directory);
+	} catch (error) {
+		if (isErrnoCode(error, "ENOENT")) return undefined;
+		throw error;
+	}
+	if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+		throw new ArtifactFileError(
+			"invalid-request",
+			"The project's .sessionport checkpoint location is not a regular directory; refusing to scan it",
+		);
+	}
+	return directory;
+}
+
+/**
+ * Scans one validated `.sessionport` directory for checkpoint candidates.
+ * Recovery backups and non-`.sessionport` entries are excluded; each entry is
+ * re-checked with `lstat` so symlinks and swapped entries are never selected.
+ */
+async function scanCheckpointCandidates(directory: string): Promise<CheckpointCandidate[]> {
+	const candidates: CheckpointCandidate[] = [];
+	for (const entry of await readdir(directory, { withFileTypes: true })) {
+		if (!entry.name.endsWith(CHECKPOINT_FILENAME_EXTENSION)) continue;
+		// Recovery backups are restore artifacts, not user checkpoints.
+		if (entry.name.startsWith(RECOVERY_FILENAME_PREFIX)) continue;
+		if (entry.isDirectory() || entry.isSymbolicLink()) continue;
+		let candidateStats;
+		try {
+			// Re-check after readdir: the entry may have been swapped for a
+			// symlink or a different object between the two calls.
+			candidateStats = await lstat(path.join(directory, entry.name));
+		} catch (error) {
+			if (isErrnoCode(error, "ENOENT")) continue;
+			throw error;
+		}
+		if (!candidateStats.isFile()) continue;
+		const mtimeMs = candidateStats.mtimeMs;
+		if (!Number.isFinite(mtimeMs)) continue;
+		candidates.push({ name: entry.name, path: path.join(directory, entry.name), mtimeMs });
+	}
+	return candidates;
+}
+
+/** Newest-first, deterministic order shared by latest selection and cleanup. */
+function newestFirst(a: CheckpointCandidate, b: CheckpointCandidate): number {
+	if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+	if (a.name === b.name) return 0;
+	return a.name > b.name ? -1 : 1;
+}
+
 /**
  * Resolves the newest default checkpoint artifact under
  * `<projectDirectory>/.sessionport/`, or `undefined` when that directory is
@@ -298,50 +375,76 @@ export async function resolveLatestCheckpointArtifact(
 		"projectDirectory",
 	);
 
-	const directory = path.resolve(projectDirectory, CHECKPOINT_DIRECTORY_NAME);
-	let directoryStats;
-	try {
-		// lstat: a symlinked/junction directory is never followed or traversed.
-		directoryStats = await lstat(directory);
-	} catch (error) {
-		if (isErrnoCode(error, "ENOENT")) return undefined;
-		throw error;
-	}
-	if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
-		throw new ArtifactFileError(
-			"invalid-request",
-			"The project's .sessionport checkpoint location is not a regular directory; refusing to scan it",
-		);
-	}
+	const directory = await resolveCheckpointScanDirectory(projectDirectory);
+	if (directory === undefined) return undefined;
+	const candidates = (await scanCheckpointCandidates(directory)).sort(newestFirst);
+	return candidates[0]?.path;
+}
 
-	let bestName: string | undefined;
-	let bestMtimeMs = Number.NEGATIVE_INFINITY;
-	for (const entry of await readdir(directory, { withFileTypes: true })) {
-		if (!entry.name.endsWith(CHECKPOINT_FILENAME_EXTENSION)) continue;
-		// Recovery backups are restore artifacts, not user checkpoints: the bare
-		// `/restore` newest-checkpoint selector never selects them.
-		if (entry.name.startsWith(RECOVERY_FILENAME_PREFIX)) continue;
-		// Dirent-level exclusion first; the lstat below is authoritative for
-		// the rest (including entries whose dirent type is unknown).
-		if (entry.isDirectory() || entry.isSymbolicLink()) continue;
+/**
+ * Plans deletion of older default checkpoint artifacts. Scans the same
+ * `<projectDirectory>/.sessionport` directory as bare `/restore`, excludes
+ * recovery backups, symlinks, directories, and non-`.sessionport` entries,
+ * keeps the newest checkpoint, and returns the rest newest-first. This function
+ * only reads metadata: it never opens, reads, writes, or deletes a file.
+ */
+export async function planCheckpointCleanup(
+	options: ResolveLatestCheckpointArtifactOptions,
+): Promise<CheckpointCleanupPlan> {
+	const input: unknown = options;
+	if (typeof input !== "object" || input === null) {
+		throw new ArtifactFileError("invalid-request", "planCheckpointCleanup options must be an object");
+	}
+	const projectDirectory = requireNonEmptyString(
+		(input as { readonly projectDirectory?: unknown }).projectDirectory,
+		"projectDirectory",
+	);
+	const directory = path.resolve(projectDirectory, CHECKPOINT_DIRECTORY_NAME);
+	const scanDirectory = await resolveCheckpointScanDirectory(projectDirectory);
+	if (scanDirectory === undefined) return { directory, latest: undefined, older: [] };
+	const candidates = (await scanCheckpointCandidates(scanDirectory)).sort(newestFirst);
+	return {
+		directory,
+		latest: candidates[0]?.path,
+		older: candidates.slice(1).map((candidate) => candidate.path),
+	};
+}
+
+/**
+ * Deletes exactly the provided older checkpoint paths. Each path must be a
+ * regular, non-symlink `.sessionport` file directly inside a `.sessionport`
+ * directory; recovery backups and anything else are skipped. A path that
+ * disappears is skipped; every other filesystem error propagates unchanged.
+ * Returns the number of files actually unlinked.
+ */
+export async function deleteCheckpointArtifacts(paths: readonly string[]): Promise<number> {
+	if (!Array.isArray(paths)) {
+		throw new ArtifactFileError("invalid-request", "deleteCheckpointArtifacts paths must be an array");
+	}
+	let deleted = 0;
+	for (const rawPath of paths) {
+		const candidate = requireNonEmptyString(rawPath, "checkpoint path");
+		const name = path.basename(candidate);
+		if (!name.endsWith(CHECKPOINT_FILENAME_EXTENSION)) continue;
+		if (name.startsWith(RECOVERY_FILENAME_PREFIX)) continue;
+		if (path.basename(path.dirname(candidate)) !== CHECKPOINT_DIRECTORY_NAME) continue;
 		let candidateStats;
 		try {
-			// Re-check after readdir: the entry may have been swapped for a
-			// symlink or a different object between the two calls.
-			candidateStats = await lstat(path.join(directory, entry.name));
+			candidateStats = await lstat(candidate);
 		} catch (error) {
 			if (isErrnoCode(error, "ENOENT")) continue;
 			throw error;
 		}
-		if (!candidateStats.isFile()) continue;
-		const mtimeMs = candidateStats.mtimeMs;
-		if (!Number.isFinite(mtimeMs)) continue;
-		if (bestName === undefined || mtimeMs > bestMtimeMs || (mtimeMs === bestMtimeMs && entry.name > bestName)) {
-			bestName = entry.name;
-			bestMtimeMs = mtimeMs;
+		if (candidateStats.isSymbolicLink() || !candidateStats.isFile()) continue;
+		try {
+			await unlink(candidate);
+			deleted += 1;
+		} catch (error) {
+			if (isErrnoCode(error, "ENOENT")) continue;
+			throw error;
 		}
 	}
-	return bestName === undefined ? undefined : path.join(directory, bestName);
+	return deleted;
 }
 
 /* ------------------------------------------------------------------------- */

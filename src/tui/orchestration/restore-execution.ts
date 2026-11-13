@@ -138,8 +138,13 @@ interface MutableOutcome {
 	status: RestoreSessionExecutionStatus;
 }
 
-const CLASSIFICATIONS: ReadonlySet<string> = new Set(["skipped", "imported", "renamed"]);
-const SKIP_REASONS: ReadonlySet<string> = new Set(["exact-local-duplicate", "exact-planned-retry"]);
+const CLASSIFICATIONS: ReadonlySet<string> = new Set(["skipped", "imported", "renamed", "updated"]);
+const SKIP_REASONS: ReadonlySet<string> = new Set([
+	"exact-local-duplicate",
+	"exact-content-duplicate",
+	"lineage-current",
+	"exact-planned-retry",
+]);
 
 function summarize(outcomes: readonly RestoreSessionOutcome[]): RestoreExecutionSummary {
 	const counts: Record<RestoreSessionExecutionStatus, number> = {
@@ -205,7 +210,12 @@ export async function runRestoreExecution(input: RestoreExecutionInput): Promise
 		const targetSessionID = requireNonEmptyString(raw["targetSessionID"], `plan.entries[${index}].targetSessionID`);
 		const classification = raw["classification"];
 		if (typeof classification !== "string" || !CLASSIFICATIONS.has(classification)) {
-			throw new TypeError(`plan.entries[${index}].classification must be "skipped", "imported", or "renamed"`);
+			throw new TypeError(`plan.entries[${index}].classification must be "skipped", "imported", "renamed", or "updated"`);
+		}
+		if (classification === "updated") {
+			throw new TypeError(
+				`plan.entries[${index}] is an in-place update; only runRestoreReplacementExecution may execute it`,
+			);
 		}
 		const rawSkipReason = raw["skipReason"];
 		let skipReason: RestoreSkipReason | undefined;

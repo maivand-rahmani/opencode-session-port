@@ -44,5 +44,6 @@ export type {
 	SessionReadPort,
 } from "./port.ts";
 export { serializeCheckpointPayload } from "./serialize.ts";
+export { serializeCheckpointPayloadChunks } from "./serialize-stream.ts";
 export { findUnsettledMessageReason } from "./unsettled.ts";
 export type { UnsettledMessageReason } from "./unsettled.ts";

@@ -18,6 +18,7 @@ import {
 	type SessionRecord,
 } from "../../../src/core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../../src/core/crypto/index.ts";
+import { stampSessionLineage } from "../../../src/core/restore/index.ts";
 import { resolveLatestCheckpointArtifact, resolveRecoveryArtifactPath, writeEncryptedArtifact, readEncryptedArtifact } from "../../../src/tui/artifacts/files.ts";
 import {
 	EXPERIMENTAL_CRYPTO_POLICY,
@@ -25,11 +26,17 @@ import {
 	EXPERIMENTAL_MAX_PASSWORD_BYTES,
 } from "../../../src/tui/wiring/index.ts";
 import { createSessionPortHandlers, type SessionPortHandlerDependencies } from "../../../src/tui/wiring/index.ts";
-import type { RestoreReplacementPreview, RestoreReplacementReport } from "../../../src/tui/orchestration/index.ts";
+import {
+	runLocalRestore,
+	type LocalRestoreInput,
+	type RestoreReplacementPreview,
+	type RestoreReplacementReport,
+} from "../../../src/tui/orchestration/index.ts";
 import {
 	createFakeClient,
 	createFakeDialog,
 	createFakePasswordProvider,
+	deriveTestId,
 	sessionRecord,
 	userMessage,
 	TEST_ACTIVE_DIRECTORY,
@@ -121,6 +128,8 @@ interface HarnessOptions {
 	readonly breakGlobalInventory?: boolean;
 	/** Removes the callable session.get dependency-read capability. */
 	readonly withoutSessionGet?: boolean;
+	/** User-selected import mode; omitted pins the existing replace behavior. */
+	readonly importMode?: "replace" | "keep";
 }
 
 interface Harness {
@@ -238,6 +247,9 @@ function createHarness(options: HarnessOptions): Harness {
 				reports.push(report);
 			},
 		},
+		// Every existing test keeps the verified replace behavior unless it
+		// explicitly selects keep mode.
+		chooseRestoreImportMode: async () => options.importMode ?? "replace",
 		resolveRecoveryArtifactPath: resolveRecoveryPath,
 		clock: () => Date.now(),
 		requestPassword: password.provider,
@@ -269,6 +281,134 @@ function createHarness(options: HarnessOptions): Harness {
 		written,
 		sessions,
 	};
+}
+
+interface DirectRestoreHarness {
+	readonly input: LocalRestoreInput;
+	readonly previews: RestoreReplacementPreview[];
+	readonly reports: RestoreReplacementReport[];
+	readonly imports: SessionRecord[];
+	readonly deleteFactoryScopes: Array<readonly string[]>;
+	readonly deleteCalls: string[];
+	readonly recoveryWrites: string[];
+}
+
+/**
+ * Builds one explicit `LocalRestoreInput` so the import-mode pass-through can
+ * be observed without the composition seam that owns the user's mode choice.
+ * All effects are synthetic; only the reversible in-memory crypto stand-in is
+ * used, and no file, host call, or real password is involved.
+ */
+function createDirectRestoreHarness(options: {
+	readonly destination: readonly SessionRecord[];
+	readonly checkpoint: readonly SessionRecord[];
+	readonly importMode: "replace" | "keep";
+}): DirectRestoreHarness {
+	const live = new Map<string, SessionRecord>();
+	for (const record of options.destination) live.set(String(record.info["id"]), record);
+	const previews: RestoreReplacementPreview[] = [];
+	const reports: RestoreReplacementReport[] = [];
+	const imports: SessionRecord[] = [];
+	const deleteFactoryScopes: string[][] = [];
+	const deleteCalls: string[] = [];
+	const recoveryWrites: string[] = [];
+	const files = new Map<string, Uint8Array>();
+	const checkpointBytes = encodeJson({ sessions: options.checkpoint });
+	const crypto = createReversibleCrypto({ checkpointBytes });
+	const now = 1000;
+
+	const input: LocalRestoreInput = {
+		artifactPath: ARTIFACT_PATH,
+		destinationProjectID: TEST_DEST_PROJECT_ID,
+		targetDirectory: TEST_DEST_DIRECTORY,
+		importMode: options.importMode,
+		cryptoFactory: crypto,
+		cryptoPolicy: EXPERIMENTAL_CRYPTO_POLICY,
+		readEncryptedArtifact(targetPath) {
+			const stored = files.get(targetPath);
+			return (async function* artifact() {
+				yield stored ?? Uint8Array.of(0);
+			})();
+		},
+		requestPassword: async () => PASSWORD,
+		readDestination: async () => options.destination,
+		readGloballyVisibleSessionIDs: async () =>
+			options.destination.map((record) => String(record.info["id"])),
+		readSession: async (sessionID) => live.get(sessionID),
+		readReferenceInventory: async () => ({
+			infos: options.destination.map((record) => record.info),
+			complete: true,
+		}),
+		importer: {
+			async importSession(request) {
+				imports.push(request.record);
+				const record: SessionRecord = {
+					info: {
+						...request.record.info,
+						projectID: TEST_DEST_PROJECT_ID,
+						location: { directory: TEST_DEST_DIRECTORY },
+						time: {
+							...(request.record.info["time"] as Record<string, unknown>),
+							updated: now,
+						},
+					} as SessionRecord["info"],
+					messages: request.record.messages.map((message) => ({ ...message })),
+				};
+				live.set(String(record.info["id"]), record);
+				return {
+					id: record.info["id"],
+					projectID: TEST_DEST_PROJECT_ID,
+					location: { directory: TEST_DEST_DIRECTORY },
+				};
+			},
+		},
+		deletePortFactory(authorizedTargetIDs) {
+			deleteFactoryScopes.push([...authorizedTargetIDs]);
+			return {
+				capability: { available: true },
+				async removeSession(sessionID) {
+					deleteCalls.push(sessionID);
+					live.delete(sessionID);
+					return { status: "deleted" };
+				},
+			};
+		},
+		resolveRecoveryPath: async () => "C:/work/dest/.sessionport/recovery-direct.sessionport",
+		async writeEncryptedArtifact(targetPath, source) {
+			const chunks: Uint8Array[] = [];
+			let bytes = 0;
+			for await (const chunk of source) {
+				chunks.push(Uint8Array.from(chunk));
+				bytes += chunk.byteLength;
+			}
+			const stored = new Uint8Array(bytes);
+			let offset = 0;
+			for (const chunk of chunks) {
+				stored.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			files.set(targetPath, stored);
+			recoveryWrites.push(targetPath);
+			return bytes;
+		},
+		idDeriver: {
+			derive(namespace, _identity, originalID) {
+				return deriveTestId(namespace, originalID);
+			},
+		},
+		ui: {
+			async confirm(preview) {
+				previews.push(preview);
+				return true;
+			},
+			async report(report) {
+				reports.push(report);
+			},
+		},
+		clock: () => now,
+	};
+
+	return { input, previews, reports, imports, deleteFactoryScopes, deleteCalls, recoveryWrites };
 }
 
 function localSession(id: string, title: string, projectID = TEST_DEST_PROJECT_ID): SessionRecord {
@@ -304,6 +444,70 @@ describe("local-first restore wiring", () => {
 		expect(harness.client.removeInputs).toHaveLength(0);
 		expect(harness.reports[0]?.entries.map((entry) => entry.outcome)).toEqual(["imported"]);
 		expect(harness.previews[0]?.entries.map((entry) => entry.action)).toEqual(["import"]);
+		const metadata = harness.sessions[0]!.info["metadata"] as { sessionport?: { lineageID?: string } } | undefined;
+		expect(metadata?.sessionport?.lineageID).toBe("ses_new");
+	});
+
+	test("local restore passes keep mode through and never deletes an existing target", async () => {
+		const harness = createDirectRestoreHarness({
+			destination: [localSession("ses_old", "local title")],
+			checkpoint: [sessionRecord("ses_old", [userMessage("msg_old")], "proj_source", { title: "checkpoint title" })],
+			importMode: "keep",
+		});
+
+		const outcome = await runLocalRestore(harness.input);
+
+		expect(outcome.status).toBe("completed");
+		if (outcome.status !== "completed") return;
+		expect(outcome.preview.entries[0]?.action).toBe("copy");
+		expect(outcome.preview.entries[0]?.reason).toBe("keep-existing");
+		expect(outcome.preview.recoveryRequired).toBe(false);
+		expect(harness.imports).toHaveLength(1);
+		expect(String(harness.imports[0]!.info["id"])).not.toBe("ses_old");
+		expect(harness.deleteFactoryScopes).toEqual([]);
+		expect(harness.deleteCalls).toEqual([]);
+		expect(harness.recoveryWrites).toEqual([]);
+		expect(outcome.report.entries[0]?.outcome).toBe("copied");
+		expect(outcome.report.entries[0]?.reason).toBe("keep-existing");
+	});
+
+	test("local restore passes replace mode through with recovery and verified delete", async () => {
+		const harness = createDirectRestoreHarness({
+			destination: [localSession("ses_old", "local title")],
+			checkpoint: [sessionRecord("ses_old", [userMessage("msg_old")], "proj_source", { title: "checkpoint title" })],
+			importMode: "replace",
+		});
+
+		const outcome = await runLocalRestore(harness.input);
+
+		expect(outcome.status).toBe("completed");
+		if (outcome.status !== "completed") return;
+		expect(outcome.preview.entries[0]?.action).toBe("replace");
+		expect(outcome.preview.recoveryRequired).toBe(true);
+		expect(harness.deleteFactoryScopes).toEqual([["ses_old"]]);
+		expect(harness.deleteCalls).toEqual(["ses_old"]);
+		expect(harness.recoveryWrites).toHaveLength(1);
+		expect(outcome.report.entries[0]?.outcome).toBe("replaced");
+	});
+
+	test("keep mode imports alongside the existing session and never removes it", async () => {
+		const harness = createHarness({
+			destination: [localSession("ses_old", "local title")],
+			checkpoint: [sessionRecord("ses_old", [userMessage("msg_old")], "proj_source", { title: "checkpoint title" })],
+			withRemove: true,
+			importMode: "keep",
+		});
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.previews[0]?.entries[0]?.action).toBe("copy");
+		expect(harness.previews[0]?.entries[0]?.reason).toBe("keep-existing");
+		expect(harness.previews[0]?.recoveryRequired).toBe(false);
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.client.removeInputs).toEqual([]);
+		expect(harness.written).toHaveLength(0);
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("copied");
+		expect(harness.reports[0]?.entries[0]?.reason).toBe("keep-existing");
 	});
 
 	test("an exact plaintext duplicate is skipped without import or delete", async () => {
@@ -321,6 +525,127 @@ describe("local-first restore wiring", () => {
 		expect(harness.client.removeInputs).toHaveLength(0);
 		expect(harness.previews[0]?.entries[0]?.action).toBe("skip");
 		expect(harness.previews[0]?.entries[0]?.reason).toBe("exact-duplicate");
+	});
+
+	test("a content-identical copy under derived IDs is skipped without import or delete", async () => {
+		// The second machine already holds this session as a prior derived-ID
+		// copy: same content, different session/message IDs and host-rewritten
+		// projectID/time.updated. Re-importing it must not add another copy.
+		const sourceMessage = userMessage("msg_same");
+		const checkpoint = sessionRecord("ses_same", [sourceMessage], "proj_source", { title: "same title" });
+		const copy = sessionRecord(
+			deriveTestId("session", "ses_same"),
+			[{ ...sourceMessage, id: deriveTestId("message", "msg_same") }],
+			TEST_DEST_PROJECT_ID,
+			{ title: "same title", time: { created: 1, updated: 999 } },
+		);
+		const harness = createHarness({ destination: [copy], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.importInputs).toHaveLength(0);
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("skipped");
+		expect(harness.previews[0]?.entries[0]?.action).toBe("skip");
+		expect(harness.previews[0]?.entries[0]?.reason).toBe("exact-duplicate");
+	});
+
+	test("the same session ID with host-rewritten volatile fields is skipped, not replaced", async () => {
+		// A prior restore rewrote projectID/time.updated but changed no content.
+		// Canonical equality fails; content equality must skip instead of
+		// deleting the local target and importing it again.
+		const checkpoint = sessionRecord("ses_same", [userMessage("msg_same")], "proj_source", { title: "same title" });
+		const local = sessionRecord("ses_same", [userMessage("msg_same")], TEST_DEST_PROJECT_ID, {
+			title: "same title",
+			time: { created: 1, updated: 999 },
+		});
+		const harness = createHarness({ destination: [local], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.importInputs).toHaveLength(0);
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("skipped");
+	});
+
+	test("a continued lineage updates the existing destination session in place", async () => {
+		const first = { ...userMessage("msg_s1"), text: "shared first" };
+		const second = { ...userMessage("msg_s2"), text: "new continuation" };
+		const checkpoint = stampSessionLineage(
+			sessionRecord("ses_origin", [first, second], "proj_source", { title: "Same title" }),
+			"ses_origin",
+		);
+		const destination = stampSessionLineage(
+			sessionRecord(
+				"ses_copy",
+				[{ ...first, id: "msg_d1" }],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Same title", time: { created: 1, updated: 999 } },
+			),
+			"ses_origin",
+		);
+		const harness = createHarness({ destination: [destination], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.client.removeInputs).toEqual([{ sessionID: "ses_copy" }]);
+		expect(harness.previews[0]?.entries[0]?.action).toBe("update");
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("updated");
+		expect(harness.sessions).toHaveLength(1);
+		expect(harness.sessions[0]!.info["id"]).toBe("ses_copy");
+		expect(harness.sessions[0]!.messages).toHaveLength(2);
+		const metadata = harness.sessions[0]!.info["metadata"] as { sessionport?: { lineageID?: string } } | undefined;
+		expect(metadata?.sessionport?.lineageID).toBe("ses_origin");
+
+		// A second restore of the same artifact against the now-updated local state
+		// must not add another copy or delete the updated session.
+		const again = createHarness({
+			destination: harness.sessions,
+			checkpoint: [checkpoint],
+			withRemove: true,
+		});
+		await again.handlers.restore(ARTIFACT_PATH);
+		expect(again.client.importInputs).toHaveLength(0);
+		expect(again.client.removeInputs).toHaveLength(0);
+		expect(again.previews[0]?.entries[0]?.action).toBe("skip");
+		expect(again.reports[0]?.entries[0]?.outcome).toBe("skipped");
+		expect(again.sessions).toHaveLength(1);
+	});
+
+	test("a diverged lineage keeps both versions and never deletes the local one", async () => {
+		const localFirst = { ...userMessage("msg_l1"), text: "shared first" };
+		const checkpoint = stampSessionLineage(
+			sessionRecord(
+				"ses_origin",
+				[
+					{ ...localFirst, id: "msg_s1" },
+					{ ...userMessage("msg_s2"), text: "checkpoint branch" },
+				],
+				"proj_source",
+				{ title: "Same title" },
+			),
+			"ses_origin",
+		);
+		const destination = stampSessionLineage(
+			sessionRecord(
+				"ses_copy",
+				[localFirst, { ...userMessage("msg_l2"), text: "local branch" }],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Same title" },
+			),
+			"ses_origin",
+		);
+		const harness = createHarness({ destination: [destination], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.removeInputs).toEqual([]);
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.previews[0]?.entries[0]?.action).toBe("copy");
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("copied");
+		expect(harness.sessions.map((session) => session.info["id"])).toContain("ses_copy");
+		expect(harness.sessions).toHaveLength(2);
 	});
 
 	test("a malformed original graph fails closed before any reference is stripped", async () => {

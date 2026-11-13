@@ -64,4 +64,22 @@ describe("restore report navigation", () => {
 		expect(navigator.next().session).toBeUndefined();
 		expect(navigator.last().index).toBe(0);
 	});
+
+	test("preserves the updated classification through navigation", () => {
+		const navigator = new RestoreReportNavigator([
+			{ sessionID: "ses-updated", classification: "updated", status: "imported" },
+			session("ses-imported"),
+		]);
+
+		expect(navigator.snapshot().session).toEqual({
+			sessionID: "ses-updated",
+			classification: "updated",
+			status: "imported",
+		});
+		expect(navigator.next().session).toEqual({
+			sessionID: "ses-imported",
+			classification: "imported",
+			status: "imported",
+		});
+	});
 });

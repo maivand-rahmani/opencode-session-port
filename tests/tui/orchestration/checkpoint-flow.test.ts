@@ -255,6 +255,36 @@ describe("runCheckpointFlow", () => {
 		expect(Object.prototype.hasOwnProperty.call(defaultHarness.resolveCalls[0], "explicitPath")).toBe(false);
 	});
 
+	test("seals the payload as a bounded chunk stream whose bytes equal the eager serialization", async () => {
+		const messages = Array.from({ length: 64 }, (_, index) => ({
+			...userMessage(`msg_${index}`),
+			// Roughly 4 KiB per message forces the default 64-KiB chunk buffer to split.
+			text: `${index}:`.padEnd(4096, "x"),
+		}));
+		const sessions = [sessionRecord("ses_a", messages)];
+		const chunks: Uint8Array[] = [];
+		const harness = createCheckpointHarness({
+			sessions,
+			policy: { ...TEST_COLLECTION_POLICY, maxMessagesPerSession: 100, maxTotalMessages: 100 },
+			crypto: {
+				seal: async (plaintext) =>
+					(async function* captureSeal() {
+						for await (const chunk of plaintext) chunks.push(Uint8Array.from(chunk));
+						yield Uint8Array.of(1);
+					})(),
+			},
+		});
+
+		const outcome = await runCheckpointFlow(harness.port, harness.input);
+
+		expect(outcome.status).toBe("written");
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every((chunk) => chunk.byteLength > 0 && chunk.byteLength <= 64 * 1024)).toBe(true);
+		const streamed = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+		const eager = Buffer.from(serializeCheckpointPayload({ sessions }));
+		expect(streamed.equals(eager)).toBe(true);
+	});
+
 	test("a collection failure propagates before any password prompt or effect", async () => {
 		const harness = createCheckpointHarness({ portError: new Error("host down") });
 

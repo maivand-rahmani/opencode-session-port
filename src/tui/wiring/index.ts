@@ -46,10 +46,12 @@ export {
 	EXPERIMENTAL_CRYPTO_POLICY_DEFINITION,
 	EXPERIMENTAL_CRYPTO_POLICY_ID,
 	EXPERIMENTAL_MAX_PASSWORD_BYTES,
+	EXPERIMENTAL_SUBAGENT_RETENTION,
 } from "./experimental-profile.ts";
 export {
 	reportCheckpointFailure,
 	reportCheckpointOutcome,
+	reportCheckpointRetentionCanceled,
 	reportRestoreAuthenticationFailed,
 	reportRestoreCanceled,
 	reportRestoreCapabilityUnavailable,
