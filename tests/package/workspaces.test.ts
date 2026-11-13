@@ -18,7 +18,7 @@ import {
 
 /**
  * Workspace package-boundary invariants. The root package stays the plugin
- * identity (0.1.7, frozen files/exports/scripts/pins); the API member carries
+ * identity (0.1.8, frozen files/exports/scripts/pins); the API member carries
  * the approved L2A dependencies, exact-pinned S3 runtime pins, Prisma
  * client/adapter/tooling, the exact Better Auth runtime pins, and Node test
  * tooling; the web member carries only the exact Next/React pins and their

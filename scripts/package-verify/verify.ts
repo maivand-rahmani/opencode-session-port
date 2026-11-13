@@ -67,7 +67,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const REPO_ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 export const SCRATCH_DIR_NAME = ".package-verify-work";
 export const EXPECTED_PACKAGE_NAME = "opencode-session-port";
-export const EXPECTED_VERSION = "0.1.7";
+export const EXPECTED_VERSION = "0.1.8";
 export const EXPECTED_LICENSE = "MIT";
 export const EXPECTED_DESCRIPTION =
 	"SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.";
@@ -83,14 +83,19 @@ export const EXPECTED_REPOSITORY = {
 } as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
 /**
- * Measured packed file count for the local-first 0.1.7 surface: the former 79
+ * Measured packed file count for the local-first 0.1.8 surface: the former 79
  * shipped-source files plus the six replacement-flow sources (core restore
  * replacement, session delete/reference adapters, local restore orchestration,
- * replacement execution, and the replacement dialog). Re-measured, not
- * inherited: `npm pack --dry-run --json` (85) and `bun pm pack --dry-run` (85);
- * both listings are pinned to this same value by the whitelist tests.
+ * replacement execution, and the replacement dialog), plus the 2026-11-12
+ * long-session streaming serializer (`src/core/sessions/serialize-stream.ts`),
+ * the 2026-11-13 checkpoint subagent-retention port
+ * (`src/tui/adapters/session-retention.ts`), and the two native UI flows
+ * (`checkpoint-retention-flow.ts`, `restore-import-mode-flow.ts`).
+ * Re-measured, not inherited: `npm pack --dry-run --json` (89) and
+ * `bun pm pack --dry-run` (92); both listings are pinned to this same value by
+ * the whitelist tests.
  */
-export const EXPECTED_PACKED_FILE_COUNT = 85;
+export const EXPECTED_PACKED_FILE_COUNT = 92;
 export const EXPECTED_EXPORTS = { "./tui": "./dist/tui.js" } as const;
 /** Compiled bundle produced by `build:tui` (prepack) and shipped via `exports["./tui"]`. */
 export const BUILT_ENTRY_PATH = "dist/tui.js";
@@ -129,10 +134,24 @@ export const REQUIRED_PACKED_PATHS = [
 	// present in every packed tarball (they are reached through src/**).
 	"src/core/sessions/dependencies.ts",
 	"src/core/sessions/references.ts",
+	// 2026-11-12 long-session fix: the streaming serializer is imported by the
+	// checkpoint flow and must remain in every tarball.
+	"src/core/sessions/serialize-stream.ts",
+	// 2026-11-13 checkpoint-weight policy: the retention port is imported by
+	// the checkpoint composition and must remain in every tarball.
+	"src/tui/adapters/session-retention.ts",
+	// Native per-run checkpoint retention and restore import-mode choices.
+	"src/tui/ui/checkpoint-retention-flow.ts",
+	"src/tui/ui/restore-import-mode-flow.ts",
+	// Optional additive sidebar quick actions.
+	"src/tui/ui/sidebar-actions.tsx",
+	// Native SessionPort settings modal (durable sidebar toggle).
+	"src/tui/ui/settings-dialog.tsx",
 	// Local-first 0.1.7 replacement flow: these exact sources are reached
 	// through src/** and must remain in every tarball. Exact paths only, no
 	// wildcards.
 	"src/core/restore/replacement.ts",
+	"src/core/restore/lineage.ts",
 	"src/tui/adapters/session-delete.ts",
 	"src/tui/adapters/session-reference-inventory.ts",
 	"src/tui/orchestration/local-restore.ts",

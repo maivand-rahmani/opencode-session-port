@@ -138,10 +138,11 @@ describe("packed path classification", () => {
 
 	test("local-first replacement sources are required exact packed paths", () => {
 		// The active 0.1.7 local restore/replacement flow ships as source under
-		// src/**. These six exact paths (no wildcard) must stay required, and a
+		// src/**. These seven exact paths (no wildcard) must stay required, and a
 		// listing missing any one of them must fail.
 		const replacementPaths = [
 			"src/core/restore/replacement.ts",
+			"src/core/restore/lineage.ts",
 			"src/tui/adapters/session-delete.ts",
 			"src/tui/adapters/session-reference-inventory.ts",
 			"src/tui/orchestration/local-restore.ts",

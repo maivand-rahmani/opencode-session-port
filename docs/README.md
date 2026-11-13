@@ -1,6 +1,6 @@
 # SessionPort Documentation
 
-> **Current direction (owner decision 2026-10-25): local-first 0.1.7 release.** See [local-release-0.1.7.md](local-release-0.1.7.md). Cloud/V2 is **PAUSED/FUTURE** until host issues are fixed; all cloud code/evidence is preserved. Existing M3 Windows-bounded evidence is historical, not an active published cloud feature. V2 below is retained as historical/future design, not the current release plan.
+> **Current direction (owner decision 2026-10-25): local-first release.** See [local-release-0.1.8.md](local-release-0.1.8.md) for the 0.1.8 release and [local-release-0.1.7.md](local-release-0.1.7.md) for the published 0.1.7 record. Cloud/V2 is **PAUSED/FUTURE** until host issues are fixed; all cloud code/evidence is preserved. Existing M3 Windows-bounded evidence is historical, not an active published cloud feature. V2 below is retained as historical/future design, not the current release plan.
 
 > **V1 documentation is archived.** V1 is a historical record, not the active V2 specification. V2 documentation remains a proposed draft (full owner review unrecorded), with local source implementation for bounded M1–M3 slices and no deployment or runtime acceptance.
 
