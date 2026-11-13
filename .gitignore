@@ -12,7 +12,7 @@
 .playwright-mcp
 
 # Local encrypted checkpoint artifacts; backup material is never committed.
-/.sessionport/
+ 
 
 # Temporary staged release output (release CI verify -> publish handoff)
 /release-artifact/
