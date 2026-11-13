@@ -1,10 +1,15 @@
 # SessionPort 0.1.8 — local-first release policy (2026-11-13)
 
-**Status: PREPARED FOR PUBLICATION.** The version is bumped to `0.1.8`, the
-local verification below passed, and the release is intended for the existing
-protected `npm-release` workflow. This document does **not** claim publication
-until a registry receipt is recorded. It does not approve, resume, deploy, or
-alter the paused cloud/V2 plan, and it does not pass M1/HOST-01.
+**Status: PUBLISHED — `opencode-session-port@0.1.8` is public and is the npm `latest`.** The parent verified the public registry document, tarball bytes, SHA-256, SHA-512 integrity, and `latest` on 2026-11-13. This document does not approve, resume, deploy, or alter the paused cloud/V2 plan, and it does not pass M1/HOST-01.
+
+## Publication receipt (verified 2026-11-13)
+
+- **npm:** `opencode-session-port@0.1.8`; dist-tag `latest` = `0.1.8`.
+- **Release run:** [43430825156](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/43430825156) — SUCCESS, dispatched from `main` at `b71c177b386bc9e1dae73b2fd9af353180370acc`.
+- **Source binding:** immutable `v0.1.8` tag peels to `b71c177b386bc9e1dae73b2fd9af353180370acc`; source CI [43429883852](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/43429883852); artifact `14039747071`.
+- **Public tarball:** 544,974 bytes; SHA-256 `bf054430dfd9c464456573bcfca641c8c9133d4ce4427eacbece6742778499b7`; SHA-512 integrity `sha512-VlVxqM77e8wP8uf/Emt6+wjCy81D79FSC2zoXqi7CUFNSb0kIXmQkFHqXOgA+PYu1euyYCayX+tg8k23iziqCw==`; 92 packed files.
+- **OIDC:** the release job acquired the OIDC token and published via trusted publishing. No token fallback was used.
+- **Registry note:** the registry edge briefly served the cached 0.1.7 document after publish; a cache-busted registry read confirmed `0.1.8` as `latest` and the exact tarball above.
 
 ## What 0.1.8 contains
 
@@ -64,17 +69,17 @@ Local test success is not hosted-CI success. The release workflow separately
 requires the exact tag commit's successful `ci.yml` push run and its
 `package-verify-evidence` artifact.
 
-## Release path
+## Release path (performed)
 
-1. Commit and push `main` with `package.json` version `0.1.8`.
-2. Create and push the immutable tag `v0.1.8` on that commit.
-3. Wait for the `ci.yml` push run for the tag commit to succeed.
+1. Committed and pushed `main` with `package.json` version `0.1.8` at `b71c177`.
+2. Created and pushed the immutable tag `v0.1.8` on that commit.
+3. CI push run [43429883852](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/43429883852) succeeded for the tag commit.
 4. Set the repository variable `SESSIONPORT_RELEASE_VERSION` to `0.1.8`.
-5. Dispatch the `Release` workflow from `main` with tag `v0.1.8`.
+5. Dispatched the `Release` workflow from `main` with tag `v0.1.8`; run 43430825156 succeeded.
 
 The protected `npm-release` environment and npm trusted-publisher mapping are
-owner-side prerequisites. No manual approval is currently required per the
-0.1.7 receipt.
+owner-side prerequisites. No manual approval was required, matching the 0.1.7
+receipt.
 
 ## Non-claims
 
