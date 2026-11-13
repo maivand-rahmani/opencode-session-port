@@ -2,7 +2,7 @@
 
 Local-first encrypted checkpoint and restore for OpenCode sessions.
 
-**Local-first 0.1.9.** `opencode-session-port` 0.1.9 is the local-first release described here. Registry availability is governed by npm, not this README: check the [npm package](https://www.npmjs.com/package/opencode-session-port) and [release status](https://github.com/maivand-rahmani/opencode-session-port/releases).
+**Local-first 0.1.9.** `opencode-session-port` 0.1.9 is published on npm and is the current `latest`. See the [npm package](https://www.npmjs.com/package/opencode-session-port) and the [release record](docs/local-release-0.1.9.md).
 
 SessionPort saves a project's session state to a password-protected artifact and restores it on Windows, macOS, or Linux. This release is for local self-use. SessionPort does **not** provide a hosted cloud service and its built-in cloud sync is paused; the encrypted artifact is a normal file, so you can store it in your own cloud drive and restore it on another supported machine.
 

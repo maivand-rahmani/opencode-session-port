@@ -197,7 +197,9 @@ rather than changing the established no-delete/replace contract.
 | `bun test tests/tui/wiring/local-restore.test.ts` | **30 pass / 0 fail** (170 expect calls) |
 | `bun test tests/tui/orchestration/newreplacement-execution.test.ts` | **46 pass / 0 fail** (266 expect calls) |
 | Combined four-file run | **218 pass / 0 fail** (977 expect calls) |
+| Full `bun test` (final) | **1,486 pass / 0 fail / 1 skip**, 93 files |
 | `bun run typecheck` | clean |
 
-These counts supersede the earlier local-restore count in section 6. No commit,
-push, tag, or release metadata was produced.
+These counts supersede the earlier local-restore count in section 6. The fix was
+committed as `f5010cc` and released as `v0.1.9`; the release receipt is recorded
+in `docs/local-release-0.1.9.md`.

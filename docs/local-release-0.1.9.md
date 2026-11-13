@@ -1,10 +1,14 @@
 # SessionPort 0.1.9 — local-first release policy (2026-11-13)
 
-**Status: PREPARED FOR PUBLICATION.** The version is bumped to `0.1.9`, the
-restore collision fix is in the working tree, and the release is intended for
-the existing protected `npm-release` workflow. This document does **not** claim
-publication until a registry receipt is recorded. It does not approve, resume,
-deploy, or alter the paused cloud/V2 plan, and it does not pass M1/HOST-01.
+**Status: PUBLISHED — `opencode-session-port@0.1.9` is public and is the npm `latest`.** The parent verified the public registry document, tarball bytes, SHA-256, SHA-512 integrity, and `latest` on 2026-11-13. This document does not approve, resume, deploy, or alter the paused cloud/V2 plan, and it does not pass M1/HOST-01.
+
+## Publication receipt (verified 2026-11-13)
+
+- **npm:** `opencode-session-port@0.1.9`; dist-tag `latest` = `0.1.9`.
+- **Release run:** [43447730147](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/43447730147) — SUCCESS, dispatched from `main` at `f5010cc1af351fcb66ded64fb0f2a3a84127b9dd`.
+- **Source binding:** immutable `v0.1.9` tag peels to `f5010cc1af351fcb66ded64fb0f2a3a84127b9dd`; source CI [43446652229](https://github.com/maivand-rahmani/opencode-session-port/actions/runs/43446652229) — SUCCESS; `package-verify-evidence` artifact `14048896383`.
+- **Public tarball:** 549,938 bytes; SHA-256 `63b5e842eb299f4b1b79eb5136e335ad5416e0e9eb9353d83814f77c36f8376d` (identical to the CI artifact); SHA-512 integrity `sha512-dWOx3UKL6ZlrzHJpLHdgDJUkUUfkhRpv5YSkFyajOMfdC77LM5HNL+MKS4+jVuXCLyoFvKJpJURqKwTMMs8YGA==`; 92 packed files; unpacked size 2,150,759 bytes.
+- **Registry note:** the version endpoint returned 404 for about two minutes after the publish step; a cache-busted registry read then confirmed `0.1.9` as `latest` and the exact tarball above.
 
 ## What 0.1.9 contains
 
