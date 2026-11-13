@@ -554,7 +554,7 @@ describe("portable lineage reconciliation", () => {
 		expect(entry.targetSessionID).toBe("ses_copy");
 	});
 
-	test("a derived update message ID owned by another session fails closed", () => {
+	test("a derived update message ID owned by another session becomes a free message ID", () => {
 		const source = lineageRecord(
 			"ses_a",
 			[
@@ -567,7 +567,80 @@ describe("portable lineage reconciliation", () => {
 		const destination = lineageRecord("ses_copy", [{ id: "msg_c1", text: "one" }], {}, "ses_a");
 		const other = lineageRecord("ses_other", [{ id: derivedMessageID("msg_a2"), text: "unrelated" }]);
 
-		expectCode(() => runPlan([source], [destination, other]), "message-id-collision");
+		const plan = runPlan([source], [destination, other]);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("updated");
+		expect(entry.targetSessionID).toBe("ses_copy");
+		expect(messageIDsOf(entry.record)).toEqual([
+			deriver.derive("message", IDENTITY, "msg_a1#copy-2"),
+			deriver.derive("message", IDENTITY, "msg_a2#copy-2"),
+		]);
+		expect(plan.importOrder.length).toBe(1);
+	});
+
+	test("records the existing local ID for exact-local, exact-content, and lineage-current skips", () => {
+		const localSource = sessionRecord("ses_a", ["msg_1"]);
+		const localEntry = entryFor(runPlan([localSource], [cloneJson(localSource)]), "ses_a");
+		expect(localEntry.skipReason).toBe("exact-local-duplicate");
+		expect(localEntry.targetSessionID).toBe("ses_a");
+		expect(localEntry.existingSessionID).toBe("ses_a");
+
+		const contentSource = lineageRecord("ses_b", [{ id: "msg_b1", text: "same" }], { title: "Same" });
+		const contentCopy = lineageRecord("ses_b_copy", [{ id: "msg_c1", text: "same" }], { title: "Same" });
+		const contentEntry = entryFor(runPlan([contentSource], [contentCopy]), "ses_b");
+		expect(contentEntry.skipReason).toBe("exact-content-duplicate");
+		expect(contentEntry.targetSessionID).toBe("ses_b");
+		expect(contentEntry.existingSessionID).toBe("ses_b_copy");
+
+		const lineageSource = lineageRecord("ses_c", [{ id: "msg_c1", text: "one" }], {}, "ses_lineage");
+		const lineageCopy = lineageRecord(
+			"ses_c_copy",
+			[
+				{ id: "msg_l1", text: "one" },
+				{ id: "msg_l2", text: "newer" },
+			],
+			{},
+			"ses_lineage",
+		);
+		const lineageEntry = entryFor(runPlan([lineageSource], [lineageCopy]), "ses_c");
+		expect(lineageEntry.skipReason).toBe("lineage-current");
+		expect(lineageEntry.targetSessionID).toBe("ses_c");
+		expect(lineageEntry.existingSessionID).toBe("ses_c_copy");
+	});
+
+	test("rewires a parentID reference to the existing local ID for content and lineage skips", () => {
+		const contentRoot = lineageRecord("ses_root", [{ id: "msg_r1", text: "same" }], { title: "Root" });
+		const contentChild = sessionRecord("ses_child", ["msg_child"], { parentID: "ses_root" });
+		const contentLocal = lineageRecord("ses_root_local", [{ id: "msg_l1", text: "same" }], { title: "Root" });
+		const contentPlan = runPlan([contentRoot, contentChild], [contentLocal]);
+		const contentRootEntry = entryFor(contentPlan, "ses_root");
+		expect(contentRootEntry.skipReason).toBe("exact-content-duplicate");
+		expect(contentRootEntry.existingSessionID).toBe("ses_root_local");
+		expect(entryFor(contentPlan, "ses_child").record.info["parentID"]).toBe("ses_root_local");
+
+		const lineageRoot = lineageRecord(
+			"ses_lineage_root",
+			[{ id: "msg_r1", text: "one" }],
+			{},
+			"ses_lineage",
+		);
+		const lineageChild = sessionRecord("ses_lineage_child", ["msg_child"], {
+			parentID: "ses_lineage_root",
+		});
+		const lineageLocal = lineageRecord(
+			"ses_lineage_local",
+			[
+				{ id: "msg_l1", text: "one" },
+				{ id: "msg_l2", text: "newer" },
+			],
+			{},
+			"ses_lineage",
+		);
+		const lineagePlan = runPlan([lineageRoot, lineageChild], [lineageLocal]);
+		const lineageRootEntry = entryFor(lineagePlan, "ses_lineage_root");
+		expect(lineageRootEntry.skipReason).toBe("lineage-current");
+		expect(lineageRootEntry.existingSessionID).toBe("ses_lineage_local");
+		expect(entryFor(lineagePlan, "ses_lineage_child").record.info["parentID"]).toBe("ses_lineage_local");
 	});
 });
 
@@ -801,11 +874,16 @@ describe("exact deterministic retry detection", () => {
 /* ------------------------------------------------------------------ */
 
 describe("planned-ID collisions", () => {
-	test("fails when the derived session ID exists with different data", () => {
+	test("preserves both copies when the derived session ID exists with different data", () => {
 		const source = sessionRecord("ses_a", ["msg_1"]);
 		const divergent = sessionRecord("ses_a", ["msg_other"]);
 		const occupied = sessionRecord(derivedSessionID("ses_a"), ["msg_zzz"]);
-		expectCode(() => runPlan([source], [divergent, occupied]), "session-id-collision");
+		const plan = runPlan([source], [divergent, occupied]);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("renamed");
+		expect(entry.targetSessionID).toBe(derivedSessionID("ses_a#copy-2"));
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_1#copy-2")]);
+		expect(plan.importOrder.length).toBe(1);
 	});
 
 	test("fails when two planned sessions derive the same target session ID", () => {
@@ -823,7 +901,7 @@ describe("planned-ID collisions", () => {
 		expectCode(() => runPlan([sourceA, sourceB], destination, collidingDeriver), "session-id-collision");
 	});
 
-	test("fails when a planned message ID already exists in the destination", () => {
+	test("rederives a free message ID when a planned message ID already exists in the destination", () => {
 		const fixed = `msg_${"ab".repeat(32)}`;
 		const fixedDeriver: RemappedIdDeriver = {
 			derive(namespace, artifactIdentity, originalID) {
@@ -833,7 +911,12 @@ describe("planned-ID collisions", () => {
 		};
 		const source = sessionRecord("ses_a", ["msg_1"]);
 		const destination = [sessionRecord("ses_b", [fixed])];
-		expectCode(() => runPlan([source], destination, fixedDeriver), "message-id-collision");
+		const plan = runPlan([source], destination, fixedDeriver);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("imported");
+		expect(entry.targetSessionID).toBe("ses_a");
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_1#copy-2")]);
+		expect(plan.importOrder.length).toBe(1);
 	});
 
 	test("fails when two planned messages derive the same target message ID", () => {
@@ -873,13 +956,13 @@ describe("planned-ID collisions", () => {
 			sessionRecord("ses_b", ["msg_other_b"]),
 			sharedRetryRecord,
 		];
-		expectCode(() => runPlan([sourceA, sourceB], destination, collidingDeriver), "session-id-collision");
+		expectCode(() => runPlan([sourceA, sourceB], destination, collidingDeriver), "message-id-collision");
 	});
 
-	test("fails when a skipped session's message ID and a planned import's target coalesce", () => {
+	test("rederives a planned import away from a skipped session's message ID", () => {
 		// Final mapped message IDs must be unique across every artifact entry:
-		// the exact-local skip keeps its original ID and the import rederives to
-		// the same target.
+		// the exact-local skip keeps its original ID and the import rederives a
+		// free variant instead of coalescing with it.
 		const sharedMessageTarget = `msg_${"ab".repeat(32)}`;
 		const collidingDeriver: RemappedIdDeriver = {
 			derive(namespace, artifactIdentity, originalID) {
@@ -889,7 +972,204 @@ describe("planned-ID collisions", () => {
 		};
 		const skipped = sessionRecord("ses_skip", [sharedMessageTarget]);
 		const imported = sessionRecord("ses_new", ["msg_new"]);
-		expectCode(() => runPlan([skipped, imported], [cloneJson(skipped)], collidingDeriver), "message-id-collision");
+		const plan = runPlan([skipped, imported], [cloneJson(skipped)], collidingDeriver);
+		const entry = entryFor(plan, "ses_new");
+		expect(entry.classification).toBe("imported");
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_new#copy-2")]);
+		expect(messageIDsOf(entry.record)).not.toContain(sharedMessageTarget);
+		expect(plan.importOrder.length).toBe(1);
+	});
+
+	test("keeps a free renamed session target when only messages collide", () => {
+		// The source session ID is divergent, so the plan renames to the free
+		// derived session ID. Only a message target collides; the session target
+		// must stay free and must not be re-derived unnecessarily.
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [
+			sessionRecord("ses_a", ["msg_other"]),
+			sessionRecord("ses_other", [derivedMessageID("msg_1")]),
+		];
+		const plan = runPlan([source], destination);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("renamed");
+		expect(entry.targetSessionID).toBe(derivedSessionID("ses_a"));
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_1#copy-2")]);
+		expect(plan.importOrder.length).toBe(1);
+	});
+
+	test("rederives session and messages when a prior copy occupies both", () => {
+		// Simulates a repeated restore whose earlier derived-ID copy diverged:
+		// the derived session target and its derived message IDs are both owned
+		// by the destination, so both need the same next variant.
+		const source = lineageRecord("ses_a", [{ id: "msg_a1", text: "one" }], {}, "ses_a");
+		const local = lineageRecord("ses_a", [{ id: "msg_local", text: "local" }], {}, "ses_a");
+		const priorCopy = lineageRecord(
+			derivedSessionID("ses_a"),
+			[
+				{ id: derivedMessageID("msg_a1"), text: "prior first" },
+				{ id: "msg_prior", text: "prior local" },
+			],
+			{},
+			"ses_a",
+		);
+		const plan = runPlan([source], [local, priorCopy]);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("renamed");
+		expect(entry.targetSessionID).toBe(derivedSessionID("ses_a#copy-2"));
+		expect(entry.copyOnly).toBe(true);
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_a1#copy-2")]);
+		expect(plan.importOrder.length).toBe(1);
+	});
+
+	test("rebuilds references after a collision variant changes targets", () => {
+		// The parent's session and message targets change during collision
+		// resolution. The child record must resolve parent/fork/revert against
+		// the rebuilt maps, not the pre-resolution targets.
+		const parent = sessionRecord("ses_parent", ["msg_parent"]);
+		const child = sessionRecord("ses_child", ["msg_child"], {
+			parentID: "ses_parent",
+			fork: { sessionID: "ses_parent", boundary: { type: "before", messageID: "msg_parent" } },
+			revert: { messageID: "msg_child" },
+		});
+		const destination = [
+			sessionRecord("ses_parent", ["msg_other_parent"]),
+			sessionRecord(derivedSessionID("ses_parent"), ["msg_zzz"]),
+		];
+		const plan = runPlan([parent, child], destination);
+		const parentEntry = entryFor(plan, "ses_parent");
+		const childEntry = entryFor(plan, "ses_child");
+		const variantSessionID = derivedSessionID("ses_parent#copy-2");
+		const variantMessageID = deriver.derive("message", IDENTITY, "msg_parent#copy-2");
+
+		expect(parentEntry.classification).toBe("renamed");
+		expect(parentEntry.targetSessionID).toBe(variantSessionID);
+		expect(messageIDsOf(parentEntry.record)).toEqual([variantMessageID]);
+
+		expect(childEntry.classification).toBe("imported");
+		expect(childEntry.targetSessionID).toBe("ses_child");
+		const info = childEntry.record.info as unknown as Record<string, unknown>;
+		expect(info["parentID"]).toBe(variantSessionID);
+		const fork = info["fork"] as Record<string, unknown>;
+		expect(fork["sessionID"]).toBe(variantSessionID);
+		expect((fork["boundary"] as Record<string, unknown>)["messageID"]).toBe(variantMessageID);
+		expect((info["revert"] as Record<string, unknown>)["messageID"]).toBe(
+			deriver.derive("message", IDENTITY, "msg_child"),
+		);
+		expect(plan.importOrder.map((item) => item.sourceSessionID)).toEqual(["ses_parent", "ses_child"]);
+	});
+
+	test("skips a collision variant that equals a globally occupied session ID", () => {
+		const globalOnly = deriver.derive("session", IDENTITY, "ses_elsewhere");
+		const collidingDeriver: RemappedIdDeriver = {
+			derive(namespace, artifactIdentity, originalID) {
+				if (namespace === "session" && originalID === "ses_a") return derivedSessionID("ses_a");
+				if (namespace === "session" && originalID === "ses_a#copy-2") return globalOnly;
+				return deriver.derive(namespace, artifactIdentity, originalID);
+			},
+		};
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [
+			sessionRecord("ses_a", ["msg_other"]),
+			sessionRecord(derivedSessionID("ses_a"), ["msg_zzz"]),
+		];
+		const plan = runPlanWithGlobal([source], destination, [globalOnly], collidingDeriver);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.targetSessionID).toBe(deriver.derive("session", IDENTITY, "ses_a#copy-3"));
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_1#copy-3")]);
+	});
+
+	test("skips a collision variant that equals a skipped session target", () => {
+		const skippedID = `ses_${"ab".repeat(32)}`;
+		const skipped = sessionRecord(skippedID, ["msg_skip"]);
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [
+			sessionRecord("ses_a", ["msg_other"]),
+			sessionRecord(derivedSessionID("ses_a"), ["msg_zzz"]),
+			cloneJson(skipped),
+		];
+		const collidingDeriver: RemappedIdDeriver = {
+			derive(namespace, artifactIdentity, originalID) {
+				if (namespace === "session" && originalID === "ses_a#copy-2") return skippedID;
+				return deriver.derive(namespace, artifactIdentity, originalID);
+			},
+		};
+		const plan = runPlan([skipped, source], destination, collidingDeriver);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.targetSessionID).toBe(deriver.derive("session", IDENTITY, "ses_a#copy-3"));
+		expect(messageIDsOf(entry.record)).toEqual([deriver.derive("message", IDENTITY, "msg_1#copy-3")]);
+	});
+
+	test("skips a collision variant that equals a skipped session's message target", () => {
+		// A content-duplicate skip keeps its source message ID even though that
+		// ID is absent from the destination. The variant must still avoid it so
+		// two artifact entries never coalesce.
+		const skippedMessageID = `msg_${"cd".repeat(32)}`;
+		const localMessageID = `msg_${"ef".repeat(32)}`;
+		const skipped = lineageRecord(
+			"ses_skip",
+			[{ id: skippedMessageID, text: "shared" }],
+			{},
+			"ses_shared",
+		);
+		const destinationCopy = lineageRecord(
+			"ses_copy",
+			[{ id: localMessageID, text: "shared" }],
+			{},
+			"ses_shared",
+		);
+		const imported = sessionRecord("ses_new", ["msg_new"], { title: "different title" });
+		const collidingDeriver: RemappedIdDeriver = {
+			derive(namespace, artifactIdentity, originalID) {
+				if (namespace !== "message") return deriver.derive(namespace, artifactIdentity, originalID);
+				if (originalID === "msg_new") return localMessageID;
+				if (originalID === "msg_new#copy-2") return skippedMessageID;
+				return deriver.derive(namespace, artifactIdentity, originalID);
+			},
+		};
+		const plan = runPlan([skipped, imported], [destinationCopy], collidingDeriver);
+		const skippedEntry = entryFor(plan, "ses_skip");
+		const importedEntry = entryFor(plan, "ses_new");
+		expect(skippedEntry.classification).toBe("skipped");
+		expect(skippedEntry.skipReason).toBe("exact-content-duplicate");
+		expect(importedEntry.classification).toBe("imported");
+		expect(messageIDsOf(importedEntry.record)).toEqual([
+			deriver.derive("message", IDENTITY, "msg_new#copy-3"),
+		]);
+		expect(messageIDsOf(importedEntry.record)).not.toContain(skippedMessageID);
+	});
+
+	test("fails closed when every session collision variant is destination-owned", () => {
+		const occupiedTarget = derivedSessionID("ses_a");
+		const occupiedVariant = derivedSessionID("ses_other");
+		const stuckDeriver: RemappedIdDeriver = {
+			derive(namespace, artifactIdentity, originalID) {
+				if (namespace === "session") {
+					if (originalID === "ses_a") return occupiedTarget;
+					if (originalID.startsWith("ses_a#copy-")) return occupiedVariant;
+				}
+				return deriver.derive(namespace, artifactIdentity, originalID);
+			},
+		};
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [
+			sessionRecord("ses_a", ["msg_other"]),
+			sessionRecord(occupiedTarget, ["msg_zzz"]),
+			sessionRecord(occupiedVariant, ["msg_yyy"]),
+		];
+		expectCode(() => runPlan([source], destination, stuckDeriver), "message-id-collision");
+	});
+
+	test("fails closed when every message collision variant is destination-owned", () => {
+		const fixed = `msg_${"ab".repeat(32)}`;
+		const stuckDeriver: RemappedIdDeriver = {
+			derive(namespace, artifactIdentity, originalID) {
+				if (namespace === "message") return fixed;
+				return deriver.derive(namespace, artifactIdentity, originalID);
+			},
+		};
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [sessionRecord("ses_b", [fixed])];
+		expectCode(() => runPlan([source], destination, stuckDeriver), "message-id-collision");
 	});
 });
 
@@ -984,13 +1264,29 @@ describe("cross-project global session inventory", () => {
 		);
 	});
 
-	test("fails closed when the derived target exists in the destination with different data", () => {
+	test("does not resolve around a global-only session target even when messages collide", () => {
+		// Message-collision resolution must not weaken the global-only
+		// session-ID fail-closed rule: the session target stays occupied outside
+		// the selected destination and no variant may replace it.
+		const source = sessionRecord("ses_a", ["msg_1"]);
+		const destination = [sessionRecord("ses_other", [derivedMessageID("msg_1")])];
+		expectCode(
+			() => runPlanWithGlobal([source], destination, ["ses_a", derivedSessionID("ses_a")]),
+			"session-id-collision",
+		);
+	});
+
+	test("preserves both copies when the derived target exists in the destination with different data", () => {
 		const source = sessionRecord("ses_a", ["msg_1"]);
 		const destination = [
 			sessionRecord("ses_a", ["msg_other"]),
 			sessionRecord(derivedSessionID("ses_a"), ["msg_zzz"]),
 		];
-		expectCode(() => runPlanWithGlobal([source], destination, ["ses_a"]), "session-id-collision");
+		const plan = runPlanWithGlobal([source], destination, ["ses_a"]);
+		const entry = entryFor(plan, "ses_a");
+		expect(entry.classification).toBe("renamed");
+		expect(entry.targetSessionID).toBe(derivedSessionID("ses_a#copy-2"));
+		expect(plan.importOrder.length).toBe(1);
 	});
 
 	test("rewrites parent, fork boundary, and revert references for global-only collisions", () => {

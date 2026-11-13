@@ -4,6 +4,7 @@
  * All records are synthetic. No host, file, network, Git, LLM, tool, or crypto
  * container is used. The tests pin:
  * - standalone preparation removes ONLY info.parentID/fork/revert;
+ * - import preparation preserves a valid parentID while removing fork/revert;
  * - stable complete-record SHA-256 fingerprints (sorted keys, array order,
  *   absent-vs-null);
  * - fail-closed classification (copy, never delete) for references, children,
@@ -17,6 +18,7 @@ import {
 	classifyLineageUpdate,
 	classifyReplacement,
 	fingerprintSessionRecord,
+	prepareImportRecord,
 	prepareStandaloneRecord,
 	ReplacementPolicyError,
 	verifyImportedRecord,
@@ -163,6 +165,70 @@ describe("prepareStandaloneRecord", () => {
 		};
 		expect(() => prepareStandaloneRecord(hostile as unknown as SessionRecord)).toThrow(ReplacementPolicyError);
 		expect(getterCalls).toBe(0);
+	});
+});
+
+describe("prepareImportRecord", () => {
+	test("preserves a valid parentID and strips fork/revert without mutating the source", () => {
+		const source = record(SOURCE_ID, [userMessage("msg_1")], {
+			parentID: "ses_parent",
+			fork: { sessionID: "ses_fork", boundary: { type: "through", messageID: "msg_boundary" } },
+			revert: { messageID: "msg_revert", partID: "part_1" },
+			opaque: { nested: { reference: "ses_looking-but-opaque" } },
+		});
+		const before = JSON.parse(JSON.stringify(source)) as unknown;
+
+		const prepared = prepareImportRecord(source, { keepParentID: true });
+
+		expect(prepared.info["parentID"]).toBe("ses_parent");
+		expect(prepared.info["fork"]).toBeUndefined();
+		expect(prepared.info["revert"]).toBeUndefined();
+		expect(prepared.info["opaque"]).toEqual({ nested: { reference: "ses_looking-but-opaque" } });
+		expect(prepared.messages).toEqual(source.messages);
+		expect(source).toEqual(before);
+		expect(prepared).not.toBe(source);
+		expect(prepared.info).not.toBe(source.info);
+		expect(prepared.messages).not.toBe(source.messages);
+	});
+
+	test("treats null parentID as absent and supports explicit standalone preparation", () => {
+		const nullParent = prepareImportRecord(
+			record(SOURCE_ID, [], { parentID: null, fork: null, revert: null }),
+			{ keepParentID: true },
+		);
+		expect(nullParent.info["parentID"]).toBeUndefined();
+		expect(nullParent.info["fork"]).toBeUndefined();
+		expect(nullParent.info["revert"]).toBeUndefined();
+
+		const stripped = prepareImportRecord(record(SOURCE_ID, [], { parentID: "ses_parent" }), {
+			keepParentID: false,
+		});
+		expect(stripped.info["parentID"]).toBeUndefined();
+
+		const defaultStripped = prepareImportRecord(record(SOURCE_ID, [], { parentID: "ses_parent" }));
+		expect(defaultStripped.info["parentID"]).toBeUndefined();
+	});
+
+	test("rejects malformed schema references with the fixed redacted error", () => {
+		const malformed = [
+			record(SOURCE_ID, [], { parentID: "not-a-session" }),
+			record(SOURCE_ID, [], {
+				fork: { sessionID: "ses_fork", boundary: { type: "sideways", messageID: "msg_1" } },
+			}),
+			record(SOURCE_ID, [], { revert: { messageID: "not-a-message" } }),
+		];
+		for (const candidate of malformed) {
+			let caught: unknown;
+			try {
+				prepareImportRecord(candidate, { keepParentID: true });
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).toBeInstanceOf(ReplacementPolicyError);
+			expect((caught as ReplacementPolicyError).code).toBe("unsupported-reference");
+			expect((caught as Error).message).toBe("SessionPort replacement policy rejected the input");
+			expect((caught as Error).message).not.toContain(SOURCE_ID);
+		}
 	});
 });
 
@@ -505,9 +571,40 @@ describe("verifyImportedRecord", () => {
 		expect(verify(expected, extraLocation)).toEqual({ verified: false, reason: "session-location" });
 	});
 
-	test("rejects expected references and malformed actual records", () => {
-		const withRef = record(SOURCE_ID, [userMessage("msg_1")], { parentID: "ses_parent" });
-		expect(verify(withRef, actualRecord(withRef))).toEqual({ verified: false, reason: "expected-references" });
+	test("accepts an exactly matching expected parentID and rejects mismatches or extra actual references", () => {
+		const expected = prepareImportRecord(
+			record(SOURCE_ID, [userMessage("msg_1")], { parentID: "ses_parent" }),
+			{ keepParentID: true },
+		);
+		expect(verify(expected, actualRecord(expected, {}, false))).toEqual({ verified: true });
+
+		// The host may omit or null a parentID only when the expected record has
+		// no parent; dropping an expected parent is a failed verification.
+		expect(verify(expected, actualRecord(expected))).toEqual({ verified: false, reason: "session-reference" });
+		const wrongParent = actualRecord(expected, { parentID: "ses_other" }, false);
+		expect(verify(expected, wrongParent)).toEqual({ verified: false, reason: "session-reference" });
+		const missingParent = actualRecord(expected, {}, false);
+		delete (missingParent.info as Record<string, unknown>)["parentID"];
+		expect(verify(expected, missingParent)).toEqual({ verified: false, reason: "session-reference" });
+
+		const parentless = prepareStandaloneRecord(record(SOURCE_ID, [userMessage("msg_1")]));
+		const extraParent = actualRecord(parentless, { parentID: "ses_parent" });
+		expect(verify(parentless, extraParent)).toEqual({ verified: false, reason: "session-reference" });
+
+		const extraFork = actualRecord(expected, {
+			fork: { sessionID: "ses_fork", boundary: { type: "before", messageID: "msg_1" } },
+		}, false);
+		expect(verify(expected, extraFork)).toEqual({ verified: false, reason: "session-reference" });
+	});
+
+	test("rejects expected fork/revert references and malformed actual records", () => {
+		const withFork = record(SOURCE_ID, [userMessage("msg_1")], {
+			fork: { sessionID: "ses_fork", boundary: { type: "before", messageID: "msg_1" } },
+		});
+		expect(verify(withFork, actualRecord(withFork))).toEqual({ verified: false, reason: "expected-references" });
+
+		const withRevert = record(SOURCE_ID, [userMessage("msg_1")], { revert: { messageID: "msg_1" } });
+		expect(verify(withRevert, actualRecord(withRevert))).toEqual({ verified: false, reason: "expected-references" });
 
 		const expected = expectedRecord();
 		expect(

@@ -37,10 +37,11 @@
  *
  * Crypto, password handling, I/O, host calls, and record parsing live outside
  * this module. The real `src/core/restore/replacement.ts` exports are wired
- * directly: `prepareStandaloneRecord`, `fingerprintSessionRecord`,
- * `classifyReplacement` (`{mode:"replace"|"copy"}`), and
- * `verifyImportedRecord` (`{verified,reason?}`). No placeholder classifier or
- * verifier shim is injected.
+ * directly: `prepareImportRecord`/`prepareStandaloneRecord`,
+ * `fingerprintSessionRecord`, `classifyReplacement`
+ * (`{mode:"replace"|"copy"}`), and `verifyImportedRecord`
+ * (`{verified,reason?}`). No placeholder classifier or verifier shim is
+ * injected.
  *
  * No CAS, atomicity, TOCTOU-safety, or live-host claim is made. Manual
  * quiescence is required. This module performs no console output and never
@@ -53,6 +54,7 @@ import {
 	classifyLineageUpdate,
 	classifyReplacement,
 	fingerprintSessionRecord,
+	prepareImportRecord,
 	prepareStandaloneRecord,
 	verifyImportedRecord,
 	type ImportedRecordVerification,
@@ -383,6 +385,25 @@ function stringInfo(info: { readonly [key: string]: unknown }, key: string): str
 function hasBlockingGraphMetadata(info: { readonly [key: string]: unknown }): boolean {
 	const parentID = info["parentID"];
 	if (typeof parentID === "string" && parentID.trim().length > 0) return true;
+	const fork = info["fork"];
+	if (fork !== undefined && fork !== null) return true;
+	const revert = info["revert"];
+	if (revert !== undefined && revert !== null) return true;
+	return false;
+}
+
+/**
+ * Import-time graph gate. Fork/revert are stripped during preparation; if
+ * either somehow remains, the import fails closed. A parentID is allowed
+ * because preparation preserves it only for a target-absent import, and
+ * `importCandidate` proves the parent is already present before calling the
+ * host. A malformed/empty parentID still fails closed.
+ */
+function hasBlockingImportGraphMetadata(info: { readonly [key: string]: unknown }): boolean {
+	const parentID = info["parentID"];
+	if (parentID !== undefined && parentID !== null) {
+		if (typeof parentID !== "string" || parentID.length === 0) return true;
+	}
 	const fork = info["fork"];
 	if (fork !== undefined && fork !== null) return true;
 	const revert = info["revert"];
@@ -1113,6 +1134,12 @@ export async function runRestoreReplacementExecution(
 			targetProjectID,
 			canonicalProjectID,
 			preparedRecord: entry.record,
+			// Target-absent imports and non-destructive copies keep a resolved
+			// parentID. Replace/update operate on an existing target and keep the
+			// existing parentless/own-parent contract.
+			preserveParentID: action === "import" || action === "copy",
+			parentExists: (sessionID) =>
+				workingTargetRecords.some((record) => infoObject(record)["id"] === sessionID),
 		});
 		if (!imported.ok) {
 			reportEntries.push(
@@ -1445,6 +1472,7 @@ async function updateExistingTarget(input: {
 			targetProjectID: input.targetProjectID,
 			canonicalProjectID: input.canonicalProjectID,
 			preparedRecord: input.entry.record,
+			preserveParentID: false,
 		});
 		return imported.ok
 			? { outcome: "imported", reason: "old-already-absent", removedOld: false, actual: imported.value.actual }
@@ -1544,6 +1572,7 @@ async function updateExistingTarget(input: {
 		targetProjectID: input.targetProjectID,
 		canonicalProjectID: input.canonicalProjectID,
 		preparedRecord: input.entry.record,
+		preserveParentID: false,
 	});
 	if (!imported.ok) {
 		return {
@@ -1571,21 +1600,33 @@ async function importCandidate(input: {
 	readonly targetProjectID: string;
 	readonly canonicalProjectID: string;
 	readonly preparedRecord: SessionRecord;
+	/** Target-absent imports keep a resolved parentID; copy/replace stay roots. */
+	readonly preserveParentID: boolean;
+	/** Proves a preserved parent already exists in the destination or an import. */
+	readonly parentExists?: (sessionID: string) => boolean;
 }): Promise<ImportResult> {
 	let prepared: SessionRecord;
 	try {
 		prepared = requireSessionRecord(
-			prepareStandaloneRecord(input.preparedRecord),
-			"prepareStandaloneRecord(record)",
+			prepareImportRecord(input.preparedRecord, { keepParentID: input.preserveParentID }),
+			"prepareImportRecord(record)",
 		);
 	} catch {
 		return { ok: false, reason: "prepared-record-invalid" };
 	}
-	if (infoObject(prepared)["id"] !== input.entry.candidateSessionID) {
+	const preparedInfo = infoObject(prepared);
+	if (preparedInfo["id"] !== input.entry.candidateSessionID) {
 		return { ok: false, reason: "prepared-record-invalid" };
 	}
-	if (hasBlockingGraphMetadata(infoObject(prepared))) {
+	if (hasBlockingImportGraphMetadata(preparedInfo)) {
 		return { ok: false, reason: "prepared-record-invalid" };
+	}
+	const parentID = preparedInfo["parentID"];
+	if (typeof parentID === "string") {
+		if (parentID === input.entry.candidateSessionID) return { ok: false, reason: "prepared-record-invalid" };
+		if (input.parentExists === undefined || !input.parentExists(parentID)) {
+			return { ok: false, reason: "prepared-record-invalid" };
+		}
 	}
 
 	let importStartedAt: number;

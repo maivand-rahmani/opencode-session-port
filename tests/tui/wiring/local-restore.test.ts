@@ -18,7 +18,7 @@ import {
 	type SessionRecord,
 } from "../../../src/core/contracts/index.ts";
 import { createCheckpointCryptoFactory } from "../../../src/core/crypto/index.ts";
-import { stampSessionLineage } from "../../../src/core/restore/index.ts";
+import { planRestore, prepareImportRecord, stampSessionLineage } from "../../../src/core/restore/index.ts";
 import { resolveLatestCheckpointArtifact, resolveRecoveryArtifactPath, writeEncryptedArtifact, readEncryptedArtifact } from "../../../src/tui/artifacts/files.ts";
 import {
 	EXPERIMENTAL_CRYPTO_POLICY,
@@ -613,6 +613,114 @@ describe("local-first restore wiring", () => {
 		expect(again.sessions).toHaveLength(1);
 	});
 
+	test("a repeated restore with a changed derived copy rederives IDs instead of failing", async () => {
+		const first = { ...userMessage("msg_s1"), text: "shared first" };
+		const checkpoint = stampSessionLineage(
+			sessionRecord(
+				"ses_origin",
+				[first, { ...userMessage("msg_s2"), text: "checkpoint continuation" }],
+				"proj_source",
+				{ title: "Same title" },
+			),
+			"ses_origin",
+		);
+		// Simulate the local copy left by an earlier restore of this artifact:
+		// the derived session/message IDs already exist, but the local copy
+		// diverged after import. A second restore must preserve a new copy.
+		const destination = stampSessionLineage(
+			sessionRecord(
+				deriveTestId("session", "ses_origin"),
+				[
+					{ ...first, id: deriveTestId("message", "msg_s1") },
+					{ ...userMessage("msg_local"), id: deriveTestId("message", "msg_local") },
+				],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Same title", time: { created: 1, updated: 999 } },
+			),
+			"ses_origin",
+		);
+		const harness = createHarness({ destination: [destination], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("copied");
+		const imported = harness.client.importInputs[0] as {
+			readonly info: { readonly id: string };
+			readonly messages: ReadonlyArray<{ readonly id: string }>;
+		};
+		expect(imported.info.id).toBe("ses_origin");
+		expect(imported.messages.map((message) => message.id)).toEqual([
+			deriveTestId("message", "msg_s1#copy-2"),
+			deriveTestId("message", "msg_s2#copy-2"),
+		]);
+		expect(imported.messages.map((message) => message.id)).not.toContain(
+			deriveTestId("message", "msg_s1"),
+		);
+		expect(harness.sessions).toHaveLength(2);
+	});
+
+	test("a repeated restore whose prior copy occupies the derived IDs rederives a new copy", async () => {
+		const first = { ...userMessage("msg_s1"), text: "shared first" };
+		const checkpoint = stampSessionLineage(
+			sessionRecord(
+				"ses_origin",
+				[first, { ...userMessage("msg_s2"), text: "checkpoint continuation" }],
+				"proj_source",
+				{ title: "Same title" },
+			),
+			"ses_origin",
+		);
+		// The destination already contains a same-ID local copy and a prior
+		// derived-ID copy left by an earlier restore. Both are stamped with the
+		// same lineage, and the prior copy diverged afterwards, so re-restoring
+		// the artifact proposes the same derived session/message IDs that the
+		// prior copy owns. The planner must derive a free variant instead of
+		// failing the whole restore.
+		const local = stampSessionLineage(
+			sessionRecord(
+				"ses_origin",
+				[
+					{ ...first, id: "msg_local1" },
+					{ ...userMessage("msg_local2"), text: "local branch" },
+				],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Same title", time: { created: 1, updated: 999 } },
+			),
+			"ses_origin",
+		);
+		const priorCopy = stampSessionLineage(
+			sessionRecord(
+				deriveTestId("session", "ses_origin"),
+				[
+					{ ...first, id: deriveTestId("message", "msg_s1") },
+					{ ...userMessage("msg_local3"), text: "prior local branch" },
+				],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Same title", time: { created: 1, updated: 999 } },
+			),
+			"ses_origin",
+		);
+		const harness = createHarness({ destination: [local, priorCopy], checkpoint: [checkpoint], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(1);
+		expect(harness.reports[0]?.entries[0]?.outcome).toBe("copied");
+		const imported = harness.client.importInputs[0] as {
+			readonly info: { readonly id: string };
+			readonly messages: ReadonlyArray<{ readonly id: string }>;
+		};
+		expect(imported.info.id).toBe(deriveTestId("session", "ses_origin#copy-2"));
+		expect(imported.messages.map((message) => message.id)).toEqual([
+			deriveTestId("message", "msg_s1#copy-2"),
+			deriveTestId("message", "msg_s2#copy-2"),
+		]);
+		expect(harness.sessions).toHaveLength(3);
+	});
+
 	test("a diverged lineage keeps both versions and never deletes the local one", async () => {
 		const localFirst = { ...userMessage("msg_l1"), text: "shared first" };
 		const checkpoint = stampSessionLineage(
@@ -694,6 +802,274 @@ describe("local-first restore wiring", () => {
 		expect(harness.previews[0]?.entries[0]?.reason).toBe("delete-capability-unavailable");
 		expect(harness.client.importInputs).toHaveLength(1);
 		expect(harness.reports[0]?.entries[0]?.outcome).toBe("copied");
+	});
+
+	test("a parent is imported before its child regardless of payload order", async () => {
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], "proj_source", {
+			parentID: "ses_parent",
+		});
+		const parent = sessionRecord("ses_parent", [userMessage("msg_parent")], "proj_source");
+		const harness = createHarness({ destination: [], checkpoint: [child, parent], withRemove: true });
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(
+			harness.client.importInputs.map((input) => (input as { readonly info: { readonly id: string } }).info.id),
+		).toEqual(["ses_parent", "ses_child"]);
+		expect(harness.previews[0]?.entries.map((entry) => entry.sessionID)).toEqual(["ses_parent", "ses_child"]);
+		expect(harness.reports[0]?.entries.map((entry) => entry.outcome)).toEqual(["imported", "imported"]);
+		const importedChild = harness.client.importInputs.find(
+			(input) => (input as { readonly info: { readonly id: string } }).info.id === "ses_child",
+		) as { readonly info: { readonly parentID?: unknown } } | undefined;
+		expect(importedChild?.info.parentID).toBe("ses_parent");
+	});
+
+	test("an exact-duplicate root is skipped while its child is imported in keep and replace modes", async () => {
+		const root = sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" });
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], TEST_DEST_PROJECT_ID, {
+			parentID: "ses_root",
+		});
+		for (const importMode of ["keep", "replace"] as const) {
+			const harness = createHarness({
+				destination: [
+					sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" }),
+				],
+				checkpoint: [root, child],
+				withRemove: true,
+				importMode,
+			});
+
+			await harness.handlers.restore(ARTIFACT_PATH);
+
+			expect(harness.client.removeInputs).toHaveLength(0);
+			expect(
+				harness.client.importInputs.map((input) => (input as { readonly info: { readonly id: string } }).info.id),
+			).toEqual(["ses_child"]);
+			expect(harness.reports[0]?.entries.find((entry) => entry.sessionID === "ses_root")?.outcome).toBe("skipped");
+			expect(harness.reports[0]?.entries.find((entry) => entry.sessionID === "ses_child")?.outcome).toBe("imported");
+			expect(harness.sessions.map((session) => session.info["id"])).toEqual(["ses_root", "ses_child"]);
+		}
+	});
+
+	test("the imported child keeps the exact-duplicate root as parentID in keep and replace modes", async () => {
+		const root = sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" });
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], TEST_DEST_PROJECT_ID, {
+			parentID: "ses_root",
+		});
+		for (const importMode of ["keep", "replace"] as const) {
+			const harness = createHarness({
+				destination: [
+					sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" }),
+				],
+				checkpoint: [root, child],
+				withRemove: true,
+				importMode,
+			});
+
+			await harness.handlers.restore(ARTIFACT_PATH);
+
+			expect(harness.client.removeInputs).toHaveLength(0);
+			expect(harness.client.importInputs).toHaveLength(1);
+			const importedChild = harness.client.importInputs[0] as {
+				readonly info: { readonly id: string; readonly parentID?: unknown };
+			};
+			expect(importedChild.info.id).toBe("ses_child");
+			expect(importedChild.info.parentID).toBe("ses_root");
+		}
+	});
+
+	test("a lineage-current root under a different local ID is kept and its child imports under that ID", async () => {
+		const lineage = "ses_lineage_root";
+		const root = stampSessionLineage(
+			sessionRecord("ses_root", [{ ...userMessage("msg_r1"), text: "shared root" }], "proj_source", {
+				title: "Root",
+			}),
+			lineage,
+		);
+		const child = sessionRecord("ses_child", [userMessage("msg_c")], "proj_source", {
+			parentID: "ses_root",
+		});
+		const localRoot = stampSessionLineage(
+			sessionRecord(
+				"ses_local_root",
+				[
+					{ ...userMessage("msg_l1"), text: "shared root" },
+					{ ...userMessage("msg_l2"), text: "newer local branch" },
+				],
+				TEST_DEST_PROJECT_ID,
+				{ title: "Root", time: { created: 1, updated: 999 } },
+			),
+			lineage,
+		);
+		const harness = createHarness({
+			destination: [localRoot],
+			checkpoint: [root, child],
+			withRemove: true,
+			importMode: "keep",
+		});
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(harness.client.importInputs).toHaveLength(1);
+		const importedChild = harness.client.importInputs[0] as {
+			readonly info: { readonly id: string; readonly parentID?: unknown };
+		};
+		expect(importedChild.info.id).toBe("ses_child");
+		expect(importedChild.info.parentID).toBe("ses_local_root");
+		expect(harness.sessions.map((session) => session.info["id"])).toEqual(["ses_local_root", "ses_child"]);
+		expect(harness.reports[0]?.entries.some((entry) => entry.outcome === "skipped")).toBe(true);
+	});
+
+	test("a copied child keeps the remapped parent ID in keep mode", async () => {
+		const parent = sessionRecord("ses_parent", [userMessage("msg_parent")], TEST_DEST_PROJECT_ID, {
+			title: "parent",
+		});
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], TEST_DEST_PROJECT_ID, {
+			parentID: "ses_parent",
+		});
+		const destination = [
+			sessionRecord("ses_parent", [userMessage("msg_local_parent")], TEST_DEST_PROJECT_ID, {
+				title: "local parent",
+			}),
+			sessionRecord("ses_child", [userMessage("msg_local_child")], TEST_DEST_PROJECT_ID, {
+				parentID: "ses_parent",
+			}),
+		];
+		const harness = createHarness({
+			destination,
+			checkpoint: [parent, child],
+			withRemove: true,
+			importMode: "keep",
+		});
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		const renamedParentID = deriveTestId("session", "ses_parent");
+		const renamedChildID = deriveTestId("session", "ses_child");
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(
+			harness.client.importInputs.map((input) => (input as { readonly info: { readonly id: string } }).info.id),
+		).toEqual([renamedParentID, renamedChildID]);
+		const importedChild = harness.client.importInputs.find(
+			(input) => (input as { readonly info: { readonly id: string } }).info.id === renamedChildID,
+		) as { readonly info: { readonly parentID?: unknown } } | undefined;
+		expect(importedChild?.info.parentID).toBe(renamedParentID);
+		expect(harness.sessions.map((session) => session.info["id"])).toEqual([
+			"ses_parent",
+			"ses_child",
+			renamedParentID,
+			renamedChildID,
+		]);
+	});
+
+	test("a child of a renamed parent imports with the remapped parent target in keep mode", async () => {
+		const parent = sessionRecord("ses_parent", [userMessage("msg_parent")], TEST_DEST_PROJECT_ID, {
+			title: "parent",
+		});
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], TEST_DEST_PROJECT_ID, {
+			parentID: "ses_parent",
+		});
+		const destination = [
+			sessionRecord("ses_parent", [userMessage("msg_local")], TEST_DEST_PROJECT_ID, { title: "local parent" }),
+		];
+		const harness = createHarness({
+			destination,
+			checkpoint: [parent, child],
+			withRemove: true,
+			importMode: "keep",
+		});
+
+		await harness.handlers.restore(ARTIFACT_PATH);
+
+		const renamedParentID = deriveTestId("session", "ses_parent");
+		expect(harness.client.removeInputs).toHaveLength(0);
+		expect(
+			harness.client.importInputs.map((input) => (input as { readonly info: { readonly id: string } }).info.id),
+		).toEqual([renamedParentID, "ses_child"]);
+		const importedChild = harness.client.importInputs.find(
+			(input) => (input as { readonly info: { readonly id: string } }).info.id === "ses_child",
+		) as { readonly info: { readonly parentID?: unknown } } | undefined;
+		expect(importedChild?.info.parentID).toBe(renamedParentID);
+		expect(harness.sessions.map((session) => session.info["id"])).toEqual([
+			"ses_parent",
+			renamedParentID,
+			"ses_child",
+		]);
+	});
+
+	test("import planning remaps a child to a renamed parent target", () => {
+		const parent = sessionRecord("ses_parent", [userMessage("msg_parent")], "proj_source");
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], "proj_source", {
+			parentID: "ses_parent",
+		});
+		const destination = [sessionRecord("ses_parent", [userMessage("msg_local")], TEST_DEST_PROJECT_ID)];
+		const idDeriver = {
+			derive(namespace: "session" | "message", _identity: Uint8Array, originalID: string): string {
+				return deriveTestId(namespace, originalID);
+			},
+		};
+
+		const original = planRestore({
+			payload: { sessions: [parent, child] },
+			artifactIdentity: ARTIFACT_IDENTITY,
+			destination,
+			idDeriver,
+		});
+		expect(original.importOrder.map((entry) => entry.sourceSessionID)).toEqual(["ses_parent", "ses_child"]);
+
+		const rawByID = new Map([parent, child].map((record) => [record.info["id"] as string, record]));
+		const prepared = original.importOrder.map((entry) =>
+			prepareImportRecord(rawByID.get(entry.sourceSessionID)!, { keepParentID: true }),
+		);
+		const second = planRestore({
+			payload: { sessions: prepared },
+			artifactIdentity: ARTIFACT_IDENTITY,
+			destination,
+			idDeriver,
+		});
+		const parentEntry = second.importOrder.find((entry) => entry.sourceSessionID === "ses_parent")!;
+		const childEntry = second.importOrder.find((entry) => entry.sourceSessionID === "ses_child")!;
+		expect(parentEntry.classification).toBe("renamed");
+		expect(parentEntry.targetSessionID).toBe(deriveTestId("session", "ses_parent"));
+		expect(childEntry.record.info["parentID"]).toBe(parentEntry.targetSessionID);
+		expect(second.importOrder.map((entry) => entry.sourceSessionID)).toEqual(["ses_parent", "ses_child"]);
+	});
+
+	test("import planning resolves a child to an existing exact-duplicate root", () => {
+		const root = sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" });
+		const child = sessionRecord("ses_child", [userMessage("msg_child")], TEST_DEST_PROJECT_ID, {
+			parentID: "ses_root",
+		});
+		const destination = [
+			sessionRecord("ses_root", [userMessage("msg_root")], TEST_DEST_PROJECT_ID, { title: "root" }),
+		];
+		const idDeriver = {
+			derive(namespace: "session" | "message", _identity: Uint8Array, originalID: string): string {
+				return deriveTestId(namespace, originalID);
+			},
+		};
+
+		const original = planRestore({
+			payload: { sessions: [root, child] },
+			artifactIdentity: ARTIFACT_IDENTITY,
+			destination,
+			idDeriver,
+		});
+		const rootEntry = original.entries.find((entry) => entry.sourceSessionID === "ses_root")!;
+		expect(rootEntry.skipReason).toBe("exact-local-duplicate");
+		expect(original.importOrder.map((entry) => entry.sourceSessionID)).toEqual(["ses_child"]);
+
+		const second = planRestore({
+			payload: { sessions: [prepareImportRecord(child, { keepParentID: true })] },
+			artifactIdentity: ARTIFACT_IDENTITY,
+			destination,
+			idDeriver,
+		});
+		const childEntry = second.importOrder[0]!;
+		expect(childEntry.sourceSessionID).toBe("ses_child");
+		expect(childEntry.record.info["parentID"]).toBe("ses_root");
 	});
 
 	test("a fork record is copied parentless with a warning and no DELETE", async () => {

@@ -67,7 +67,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const REPO_ROOT = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 export const SCRATCH_DIR_NAME = ".package-verify-work";
 export const EXPECTED_PACKAGE_NAME = "opencode-session-port";
-export const EXPECTED_VERSION = "0.1.8";
+export const EXPECTED_VERSION = "0.1.9";
 export const EXPECTED_LICENSE = "MIT";
 export const EXPECTED_DESCRIPTION =
 	"SessionPort: experimental OpenCode TUI plugin for password-encrypted session checkpoint and restore.";
@@ -83,7 +83,7 @@ export const EXPECTED_REPOSITORY = {
 } as const;
 export const PACKAGE_FILES_ALLOWLIST = ["tui.ts", "src/**", "dist/**", "tsconfig.json"] as const;
 /**
- * Measured packed file count for the local-first 0.1.8 surface: the former 79
+ * Measured packed file count for the local-first 0.1.9 surface: the former 79
  * shipped-source files plus the six replacement-flow sources (core restore
  * replacement, session delete/reference adapters, local restore orchestration,
  * replacement execution, and the replacement dialog), plus the 2026-11-12

@@ -12,9 +12,11 @@
  *    malformed/unsupported graph fails closed instead of being silently
  *    flattened into something importable.
  * 4. The destination snapshot and the cross-project collision inventory are
- *    read once. Only then are importable sources flattened with
- *    `prepareStandaloneRecord` and planned again, which derives every target
- *    session/message ID from the authenticated artifact identity.
+ *    read once. Only then are importable sources prepared with
+ *    `prepareImportRecord` (parentID preserved, fork/revert stripped) and
+ *    planned again, which derives every target session/message ID from the
+ *    authenticated artifact identity and remaps parentID to the planned parent
+ *    target. Planned entries are executed in parent-before-child import order.
  * 5. A complete global metadata-only reference inventory is passed to the
  *    replacement executor. An incomplete global inventory downgrades every
  *    replace to copy; a collision-inventory failure still aborts preflight.
@@ -42,10 +44,12 @@ import {
 import {
 	fingerprintSessionRecord,
 	planRestore,
-	prepareStandaloneRecord,
+	prepareImportRecord,
+	RestorePlanError,
 	sessionLineageID,
 	stampSessionLineage,
 	type RemappedIdDeriver,
+	type RestorePlanEntry,
 } from "../../core/restore/index.ts";
 import type { SessionImportAdapter } from "../adapters/index.ts";
 import {
@@ -184,20 +188,49 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 			if (!rawByID.has(id)) rawByID.set(id, record);
 		}
 		const importSources: SessionRecord[] = [];
+		const importSourceIDs = new Set(originalPlan.importOrder.map((entry) => entry.sourceSessionID));
+		const skippedTargets = new Map<string, string>();
+		for (const entry of originalPlan.entries) {
+			if (entry.classification !== "skipped") continue;
+			skippedTargets.set(entry.sourceSessionID, entry.existingSessionID ?? entry.targetSessionID);
+		}
 		for (const entry of originalPlan.importOrder) {
 			const raw = rawByID.get(entry.sourceSessionID);
 			if (raw === undefined) {
 				throw new TypeError("The checkpoint plan referenced a session that is not in the payload");
 			}
-			// Lineage is resolved before flattening (the raw record's own stamp or
-			// session ID) and stamped on the standalone candidate before any host
+			// Lineage is resolved before preparation (the raw record's own stamp or
+			// session ID) and stamped on the import candidate before any host
 			// import. The host preserves info.metadata, so the copy remains linked
-			// to its original across later round-trips.
-			importSources.push(stampSessionLineage(prepareStandaloneRecord(raw), sessionLineageID(raw)));
+			// to its original across later round-trips. parentID is preserved so
+			// the second planner can remap it to the planned parent target.
+			let prepared = stampSessionLineage(
+				prepareImportRecord(raw, { keepParentID: true }),
+				sessionLineageID(raw),
+			);
+			// A skipped parent is not part of this payload. If its planned target
+			// already exists in the destination, rewire the child to that exact
+			// target now; otherwise the second planner cannot resolve the skipped
+			// parent's source ID and the reference remains fail-closed.
+			const parentID = prepared.info["parentID"];
+			if (typeof parentID === "string") {
+				const skippedTarget = skippedTargets.get(parentID);
+				if (
+					skippedTarget !== undefined &&
+					!importSourceIDs.has(skippedTarget) &&
+					destinationIDs.has(skippedTarget)
+				) {
+					prepared = {
+						info: { ...prepared.info, parentID: skippedTarget },
+						messages: prepared.messages,
+					};
+				}
+			}
+			importSources.push(prepared);
 		}
 
-		// Second planning pass over the flattened/standalone payload rederives
-		// every target session and message ID and resolves all remaining refs.
+		// Second planning pass over the import candidates rederives every target
+		// session and message ID and remaps parentID to the planned parent target.
 		const flattenedPlan = planRestore({
 			payload: { sessions: importSources },
 			artifactIdentity: authenticated.artifactIdentity,
@@ -206,9 +239,29 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 			idDeriver: input.idDeriver,
 		});
 
+		// A child may only reference an earlier import target or a session that
+		// already exists in the destination. This closes the gap where the
+		// planner can resolve a parentID through a skipped plan whose target is
+		// not actually present locally.
+		const importTargetIndex = new Map<string, number>();
+		for (let index = 0; index < flattenedPlan.importOrder.length; index += 1) {
+			importTargetIndex.set(flattenedPlan.importOrder[index]!.targetSessionID, index);
+		}
+		for (let index = 0; index < flattenedPlan.importOrder.length; index += 1) {
+			const entry = flattenedPlan.importOrder[index]!;
+			const parentID = entry.record.info["parentID"];
+			if (typeof parentID !== "string") continue;
+			if (destinationIDs.has(parentID)) continue;
+			const parentIndex = importTargetIndex.get(parentID);
+			if (parentIndex !== undefined && parentIndex < index) continue;
+			throw new RestorePlanError(
+				"dangling-session-reference",
+				"the restore plan contains a parent reference that is neither an earlier import target nor present in the destination",
+			);
+		}
+
 		const planEntries: StandaloneRestorePlanEntry[] = [];
-		for (let index = 0; index < flattenedPlan.entries.length; index += 1) {
-			const entry = flattenedPlan.entries[index]!;
+		const appendFlattenedEntry = (entry: RestorePlanEntry): void => {
 			const updateTarget = entry.classification === "updated";
 			planEntries.push({
 				// The executor treats `sourceSessionID` as an old destination target
@@ -222,13 +275,21 @@ export async function runLocalRestore(input: LocalRestoreInput): Promise<LocalRe
 					? entry.targetSessionID
 					: destinationIDs.has(entry.sourceSessionID)
 						? entry.sourceSessionID
-						: `local-absent-target-${index}-${entry.sourceSessionID}`,
+						: `local-absent-target-${planEntries.length}-${entry.sourceSessionID}`,
 				record: entry.record,
 				classification: entry.classification,
 				...(entry.skipReason !== undefined ? { skipReason: entry.skipReason } : {}),
 				...(entry.copyOnly === true ? { copyOnly: true } : {}),
 				...(entry.note !== undefined ? { note: entry.note } : {}),
 			});
+		};
+		// Parent-before-child import order is mandatory: the host requires the
+		// parent session to exist before a child import can reference it.
+		for (const entry of flattenedPlan.importOrder) appendFlattenedEntry(entry);
+		// A second-plan skip is reported but never imported or deleted.
+		for (const entry of flattenedPlan.entries) {
+			if (entry.classification !== "skipped") continue;
+			appendFlattenedEntry(entry);
 		}
 		// Preserve pre-flattening skip reporting without importing or deleting.
 		// Both skips mean the artifact record is already represented locally, so

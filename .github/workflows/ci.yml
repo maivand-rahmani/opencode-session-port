@@ -22,7 +22,23 @@ name: CI
 on:
   push:
     branches: [main]
+    # Documentation-only pushes do not need the full Windows suite. Release
+    # commits always change package.json/source, so the tag commit still runs.
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".gitignore"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".gitignore"
+
+# Cancel superseded pull-request runs only. Main pushes are never cancelled so
+# a release tag's required successful CI run cannot be discarded by a later push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -57,8 +73,22 @@ jobs:
         with:
           node-version: 22.14.0
 
+      - name: Cache Bun install cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Cache npm
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-11.5.1
+          restore-keys: npm-${{ runner.os }}-
+
       - name: Install exact npm (11.5.1)
-        run: npm install --global npm@11.5.1
+        run: npm install --global npm@11.5.1 --prefer-offline
 
       - name: Assert pinned toolchain versions
         run: |

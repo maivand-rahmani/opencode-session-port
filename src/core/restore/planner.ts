@@ -20,8 +20,12 @@
  *   exact source-record duplicate that is skipped keeps its message IDs.
  * - A divergent local session under the same session ID derives a new session
  *   ID (`renamed`); new nonconflicting sessions keep their session ID. A
- *   planned ID that collides with different destination data fails preflight
- *   and is never regenerated.
+ *   planned session/message ID still owned by the selected destination after
+ *   exact-retry and lineage reconciliation is resolved with a bounded,
+ *   deterministic `<original>#copy-<n>` variant (n = 2..100); the first free
+ *   variant wins. A same-ID update keeps its target and only rederives message
+ *   IDs. Artifact-level coalescing and global-only session-ID occupancy remain
+ *   fail-closed and are never resolved by a variant.
  * - Beyond same-ID canonical equality, the planner also skips a session whose
  *   normalized CONTENT fingerprint already exists in the destination under any
  *   session ID (`exact-content-duplicate`). This keeps repeated imports of the
@@ -45,8 +49,11 @@
  *   exact-local and exact-planned-retry skips: two distinct source sessions can
  *   never coalesce onto one target session ID or one final target message ID,
  *   even when a deriver collision makes their transformed records identical.
- *   Destination-occupancy checks apply only to entries actually being imported;
- *   exact-local/retry records already exist in the destination by definition.
+ *   Destination-owned collisions are resolved before this invariant by the
+ *   bounded copy variants above; any remaining artifact-level coalescing fails
+ *   closed. Destination-occupancy checks apply only to entries actually being
+ *   imported; exact-local/retry records already exist in the destination by
+ *   definition.
  * - Exact-content retry detection only recognizes a destination record that is
  *   exactly the deterministic planned record at the planned session ID. Retry
  *   classification is iterated to a fixed point in deterministic session-ID
@@ -86,7 +93,10 @@
  *   session that keeps its source ID, and their unchanged message references
  *   must already exist at their original IDs in the destination. Exact-retry
  *   records are the deterministic planned records built when the retry match
- *   was detected, so their references were resolved at that point.
+ *   was detected; they are never rewritten afterwards. A later collision
+ *   variant may therefore leave a skipped retry's unchanged references
+ *   pointing at the prior local copy. That is intentional copy preservation:
+ *   no skipped record is mutated, deleted, or merged.
  *
  * All inputs are snapshotted into detached JSON-only copies before validation,
  * so caller-owned objects are never mutated and non-JSON values (undefined,
@@ -180,6 +190,15 @@ export interface RestorePlanEntry {
 	readonly targetSessionID: string;
 	readonly classification: RestoreClassification;
 	readonly record: SessionRecord;
+	/**
+	 * For `exact-local-duplicate`, `exact-content-duplicate`, and
+	 * `lineage-current` skips, the actual destination session ID that matched.
+	 * It may differ from `targetSessionID`, which deliberately stays at the
+	 * artifact source ID so artifact collision checks never coalesce skipped
+	 * entries. Callers may use this only to rewire references to the real local
+	 * session; it is never an import or delete target.
+	 */
+	readonly existingSessionID?: string;
 	readonly skipReason?: RestoreSkipReason;
 	/**
 	 * Lineage conflict/ambiguity: import the candidate alongside the existing
@@ -234,6 +253,8 @@ interface SessionPlan {
 	readonly session: UniqueSession;
 	classification: RestoreClassification;
 	targetSessionID: string;
+	/** Actual local match for a content/lineage skip; never a write target. */
+	existingSessionID: string | undefined;
 	skipReason: RestoreSkipReason | undefined;
 	note: RestorePlanNote | undefined;
 	copyOnly: boolean;
@@ -263,12 +284,15 @@ function addMessageReferrer(target: Map<string, Set<string>>, messageID: string,
 
 /**
  * A record is safe for content/content-lineage reconciliation only when it is
- * standalone and no OTHER artifact session references its session or messages.
- * A skipped or rewritten record must never become a dangling reference target.
+ * standalone and no OTHER artifact session references its messages or forks.
+ * A parentID-only reference is allowed because a skipped parent can expose the
+ * real local match through `existingSessionID` and the planner maps references
+ * to that ID. Fork references stay blocked because their boundary message may
+ * not exist at the matched local copy.
  */
 function isStandaloneForReconciliation(
 	session: UniqueSession,
-	artifactReferencedSessionIDs: ReadonlySet<string>,
+	artifactForkReferencedSessionIDs: ReadonlySet<string>,
 	artifactMessageReferrers: ReadonlyMap<string, ReadonlySet<string>>,
 ): boolean {
 	const info = session.record.info;
@@ -276,7 +300,7 @@ function isStandaloneForReconciliation(
 		const value = info[key];
 		if (value !== undefined && value !== null) return false;
 	}
-	if (artifactReferencedSessionIDs.has(session.sourceSessionID)) return false;
+	if (artifactForkReferencedSessionIDs.has(session.sourceSessionID)) return false;
 	for (const messageID of session.messageIDs) {
 		const referrers = artifactMessageReferrers.get(messageID);
 		if (referrers === undefined) continue;
@@ -348,6 +372,13 @@ const TARGET_ID_PATTERNS: Readonly<Record<"session" | "message", RegExp>> = Obje
 	session: /^ses_[0-9a-f]{64}$/,
 	message: /^msg_[0-9a-f]{64}$/,
 });
+
+/**
+ * Bounded deterministic copy attempts used only when a destination already
+ * owns a planned session or message ID. The first collision-free variant wins;
+ * artifact-level and global-only collisions remain fail-closed.
+ */
+const COLLISION_COPY_ATTEMPT_LIMIT = 100;
 
 /**
  * Canonical JSON string: object keys sorted recursively at every level; array
@@ -633,7 +664,9 @@ function validateSkippedRecordReferences(
 	const requireUnchangedSessionReference = (original: string, context: string): void => {
 		if (destinationSessionIDs.has(original)) return;
 		const referenced = planBySessionID.get(original);
-		if (referenced !== undefined && referenced.targetSessionID === original) return;
+		if (referenced !== undefined && (referenced.existingSessionID ?? referenced.targetSessionID) === original) {
+			return;
+		}
 		throw new RestorePlanError(
 			"dangling-session-reference",
 			`${context} references session ${JSON.stringify(original)}, which is neither present in the destination nor kept at the same id by this plan; an unchanged skipped session cannot be rewritten`,
@@ -793,7 +826,7 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 		});
 	}
 
-	const artifactReferencedSessionIDs = new Set<string>();
+	const artifactForkReferencedSessionIDs = new Set<string>();
 	const artifactLineageCounts = new Map<string, number>();
 	const artifactMessageReferrers = new Map<string, Set<string>>();
 	for (const session of uniqueSessions) {
@@ -802,11 +835,9 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 		if (lineage.length > 0) {
 			artifactLineageCounts.set(lineage, (artifactLineageCounts.get(lineage) ?? 0) + 1);
 		}
-		const parentID = info["parentID"];
-		if (typeof parentID === "string") artifactReferencedSessionIDs.add(parentID);
 		const fork = info["fork"];
 		if (isObjectValue(fork)) {
-			if (typeof fork["sessionID"] === "string") artifactReferencedSessionIDs.add(fork["sessionID"]);
+			if (typeof fork["sessionID"] === "string") artifactForkReferencedSessionIDs.add(fork["sessionID"]);
 			const boundary = fork["boundary"];
 			if (isObjectValue(boundary) && typeof boundary["messageID"] === "string") {
 				addMessageReferrer(artifactMessageReferrers, boundary["messageID"], session.sourceSessionID);
@@ -917,6 +948,7 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 				session,
 				classification: "skipped",
 				targetSessionID: session.sourceSessionID,
+				existingSessionID: session.sourceSessionID,
 				skipReason: "exact-local-duplicate",
 				note: undefined,
 				copyOnly: false,
@@ -936,6 +968,7 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 			targetSessionID: conflict
 				? deriveTargetID("session", session.sourceSessionID, `session ${JSON.stringify(session.sourceSessionID)}`)
 				: session.sourceSessionID,
+			existingSessionID: undefined,
 			skipReason: undefined,
 			note: undefined,
 			copyOnly: false,
@@ -963,7 +996,10 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 	const sessionTargets = new Map<string, string>();
 	const messageTargets = new Map<string, string>();
 	for (const plan of plans) {
-		sessionTargets.set(plan.session.sourceSessionID, plan.targetSessionID);
+		sessionTargets.set(
+			plan.session.sourceSessionID,
+			plan.existingSessionID ?? plan.targetSessionID,
+		);
 		for (let index = 0; index < plan.session.messageIDs.length; index++) {
 			messageTargets.set(plan.session.messageIDs[index]!, plan.messageTargets[index]!);
 		}
@@ -1047,13 +1083,15 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 	 * The executor re-proves every destructive gate with fresh reads. -- */
 	for (const plan of plans) {
 		if (!plan.planned) continue;
-		if (!isStandaloneForReconciliation(plan.session, artifactReferencedSessionIDs, artifactMessageReferrers)) {
+		if (!isStandaloneForReconciliation(plan.session, artifactForkReferencedSessionIDs, artifactMessageReferrers)) {
 			continue;
 		}
 
-		if (destinationByContentFingerprint.has(fingerprintSessionContent(plan.session.record))) {
+		const contentMatch = destinationByContentFingerprint.get(fingerprintSessionContent(plan.session.record));
+		if (contentMatch !== undefined) {
 			plan.classification = "skipped";
 			plan.targetSessionID = plan.session.sourceSessionID;
+			plan.existingSessionID = contentMatch;
 			plan.skipReason = "exact-content-duplicate";
 			plan.record = plan.session.record;
 			plan.messageTargets = [...plan.session.messageIDs];
@@ -1065,9 +1103,11 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 		const candidates = lineage.length > 0 ? (destinationByLineage.get(lineage) ?? []) : [];
 		if (candidates.length === 0) continue;
 
+		let currentSessionID: string | undefined;
 		const markCurrent = (): void => {
 			plan.classification = "skipped";
 			plan.targetSessionID = plan.session.sourceSessionID;
+			plan.existingSessionID = currentSessionID;
 			plan.skipReason = "lineage-current";
 			plan.record = plan.session.record;
 			plan.messageTargets = [...plan.session.messageIDs];
@@ -1106,6 +1146,7 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 			const relation = compareMessagePrefixes(fingerprintSessionMessages(candidate), incomingMessages);
 			if (relation === "equal" || relation === "incoming-prefix") {
 				exactMatch = true;
+				currentSessionID ??= candidateID;
 				continue;
 			}
 			if (relation === "destination-prefix") {
@@ -1137,6 +1178,109 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 		else if (candidates.length > 1 || updateTargets > 1) markCopy("lineage-ambiguous");
 		else markCopy("lineage-conflict");
 	}
+
+	/* -- 5a-bis. Destination-owned ID collisions preserve both copies. A
+	 * repeated restore of the same artifact derives the same session and
+	 * message IDs; if the local copy changed, exact-retry and lineage checks no
+	 * longer match, and the destination still owns those IDs. Instead of
+	 * failing the whole restore, derive the next deterministic variant for the
+	 * colliding plan. Artifact-level coalescing and global-only session-ID
+	 * occupancy remain fail-closed in the final checks below. -- */
+	const rebuildTargetMaps = (): void => {
+		sessionTargets.clear();
+		messageTargets.clear();
+		for (const plan of plans) {
+			sessionTargets.set(
+				plan.session.sourceSessionID,
+				plan.existingSessionID ?? plan.targetSessionID,
+			);
+			for (let index = 0; index < plan.session.messageIDs.length; index++) {
+				messageTargets.set(plan.session.messageIDs[index]!, plan.messageTargets[index]!);
+			}
+		}
+	};
+	rebuildTargetMaps();
+
+	const occupiedSessionTargets = new Set<string>();
+	const occupiedMessageTargets = new Set<string>();
+	// Exact-local/lineage skips keep their original IDs; reserve them before
+	// resolving planned copies so a variant can never coalesce with a skip.
+	for (const plan of plans) {
+		if (plan.planned) continue;
+		occupiedSessionTargets.add(plan.targetSessionID);
+		for (const target of plan.messageTargets) occupiedMessageTargets.add(target);
+	}
+
+	for (const plan of plans) {
+		if (!plan.planned) continue;
+		const sessionCollision =
+			plan.classification !== "updated" && destinationSessionIDs.has(plan.targetSessionID);
+		const messageCollision = plan.messageTargets.some((target) => {
+			if (!destinationMessageIDs.has(target)) return false;
+			// A same-ID update deletes the target first, so message IDs owned by
+			// that exact target become free; any other owner is a real collision.
+			if (plan.classification === "updated" && destinationMessageOwners.get(target) === plan.targetSessionID) {
+				return false;
+			}
+			return true;
+		});
+		if (!sessionCollision && !messageCollision) {
+			occupiedSessionTargets.add(plan.targetSessionID);
+			for (const target of plan.messageTargets) occupiedMessageTargets.add(target);
+			continue;
+		}
+
+		let resolved = false;
+		for (let attempt = 2; attempt <= COLLISION_COPY_ATTEMPT_LIMIT; attempt++) {
+			const candidateSessionTarget = sessionCollision
+				? deriveTargetID(
+						"session",
+						`${plan.session.sourceSessionID}#copy-${attempt}`,
+						`collision copy ${attempt} of session ${JSON.stringify(plan.session.sourceSessionID)}`,
+					)
+				: plan.targetSessionID;
+			if (occupiedSessionTargets.has(candidateSessionTarget)) continue;
+			if (destinationSessionIDs.has(candidateSessionTarget) && candidateSessionTarget !== plan.targetSessionID) {
+				continue;
+			}
+			if (
+				candidateSessionTarget !== plan.targetSessionID &&
+				globalSessionIDs.has(candidateSessionTarget) &&
+				!destinationSessionIDs.has(candidateSessionTarget)
+			) {
+				continue;
+			}
+			const candidateMessageTargets = plan.session.messageIDs.map((messageID) =>
+				deriveTargetID(
+					"message",
+					`${messageID}#copy-${attempt}`,
+					`collision copy ${attempt} of message ${JSON.stringify(messageID)} in session ${JSON.stringify(plan.session.sourceSessionID)}`,
+				),
+			);
+			if (candidateMessageTargets.some((target) => occupiedMessageTargets.has(target))) continue;
+			if (candidateMessageTargets.some((target) => destinationMessageIDs.has(target))) continue;
+
+			// Only a renamed plan can reach a destination-owned session
+			// collision: an imported plan's target is absent by definition,
+			// and an updated plan targets the existing session it continues.
+			// A renamed plan is already a copy, so no classification change is
+			// needed; the final invariants below still reject artifact-level
+			// coalescing.
+			plan.targetSessionID = candidateSessionTarget;
+			plan.messageTargets = candidateMessageTargets;
+			resolved = true;
+			break;
+		}
+		if (!resolved) {
+			throw new RestorePlanError(
+				"message-id-collision",
+				`planned session/message IDs for session ${JSON.stringify(plan.session.sourceSessionID)} still collide with the destination after ${COLLISION_COPY_ATTEMPT_LIMIT - 1} copy attempts`,
+			);
+		}
+		occupiedSessionTargets.add(plan.targetSessionID);
+		for (const target of plan.messageTargets) occupiedMessageTargets.add(target);
+	}
+	rebuildTargetMaps();
 
 	/* -- 5b. A still-renamed plan whose derived target already exists with
 	 * different content is a collision. Deferred until the retry fixed point
@@ -1342,6 +1486,7 @@ export function planRestore(input: PlanRestoreInput): RestorePlan {
 			targetSessionID: plan.targetSessionID,
 			classification: plan.classification,
 			record: plan.record,
+			...(plan.existingSessionID !== undefined ? { existingSessionID: plan.existingSessionID } : {}),
 			...(plan.skipReason !== undefined ? { skipReason: plan.skipReason } : {}),
 			...(plan.copyOnly ? { copyOnly: true } : {}),
 			...(plan.note !== undefined ? { note: plan.note } : {}),

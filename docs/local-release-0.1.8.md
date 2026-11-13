@@ -2,6 +2,11 @@
 
 **Status: PUBLISHED — `opencode-session-port@0.1.8` is public and is the npm `latest`.** The parent verified the public registry document, tarball bytes, SHA-256, SHA-512 integrity, and `latest` on 2026-11-13. This document does not approve, resume, deploy, or alter the paused cloud/V2 plan, and it does not pass M1/HOST-01.
 
+**Platform note (later, 2026-11-13):** this 0.1.8 record retains the Windows-first
+evidence boundary it was published with. The owner reports working macOS and
+Linux local use; the current cross-OS platform statement is recorded in
+`docs/local-release-0.1.9.md`.
+
 ## Publication receipt (verified 2026-11-13)
 
 - **npm:** `opencode-session-port@0.1.8`; dist-tag `latest` = `0.1.8`.

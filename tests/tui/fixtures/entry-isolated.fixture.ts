@@ -74,6 +74,10 @@ mock.module("../../../src/core/restore/index.ts", () => ({
 	prepareStandaloneRecord: () => {
 		throw new Error("prepareStandaloneRecord is not used by entry tests");
 	},
+	prepareImportRecord: () => {
+		throw new Error("prepareImportRecord is not used by entry tests");
+	},
+	RestorePlanError: class RestorePlanError extends Error {},
 	fingerprintSessionRecord: () => {
 		throw new Error("fingerprintSessionRecord is not used by entry tests");
 	},

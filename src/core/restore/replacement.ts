@@ -4,6 +4,8 @@
  * This module owns ONLY pure policy/verification helpers:
  * - `prepareStandaloneRecord` strips the three schema-defined session-reference
  *   fields from a checkpoint record so it can be imported as a root session.
+ * - `prepareImportRecord` strips `fork`/`revert` but can preserve a valid
+ *   `parentID`, so a child can be imported after its parent exists.
  * - `fingerprintSessionRecord` returns a stable SHA-256 fingerprint over the
  *   complete canonical `{info, messages}` record.
  * - `classifyReplacement` decides whether a confirmed local target session may
@@ -29,9 +31,9 @@
  * EVIDENCE BOUNDARY: the only allowed readback normalizations are the ones
  * observed by `scripts/host-probes/native-replacement`: host-assigned
  * `info.projectID`, retargeted `info.location = { directory }`, host-updated
- * `info.time.updated` inside the import window, and absent/null root
- * `parentID`/`fork`/`revert`. No other field, extra key, type change, message
- * field, tool part, role, order, or timestamp is ignored.
+ * `info.time.updated` inside the import window, absent/null `fork`/`revert`, and
+ * an exactly matching root `parentID`. No other field, extra key, type change,
+ * message field, tool part, role, order, or timestamp is ignored.
  */
 
 import {
@@ -404,6 +406,53 @@ export function prepareStandaloneRecord(record: SessionRecord): SessionRecord {
 	delete info["parentID"];
 	delete info["fork"];
 	delete info["revert"];
+	return { info, messages: snapshot.messages };
+}
+
+/** Options for `prepareImportRecord`; `keepParentID` must be explicitly true. */
+export interface PrepareImportRecordOptions {
+	/**
+	 * Preserve a valid non-empty string `info.parentID`. Fork/revert are always
+	 * removed; absent/null parentID remains absent.
+	 */
+	readonly keepParentID?: boolean;
+}
+
+/**
+ * Returns a detached import candidate. It applies the same schema-reference
+ * validation as `prepareStandaloneRecord` and always removes `info.fork` and
+ * `info.revert`. With `{ keepParentID: true }`, a valid non-empty string
+ * `info.parentID` is preserved so the host can attach the imported child to an
+ * already-imported parent. Without that option, the result is standalone.
+ *
+ * The host requires `parentID` to identify an existing session, so callers
+ * must import parent-before-child and must never preserve an unresolved
+ * parent. Everything else is preserved exactly, including opaque metadata and
+ * every message/tool part.
+ */
+export function prepareImportRecord(
+	record: SessionRecord,
+	options: PrepareImportRecordOptions = {},
+): SessionRecord {
+	const snapshot = snapshotSessionRecord(record, "invalid-record");
+
+	const validationInfo = cloneObject(snapshot.info);
+	for (const key of ["parentID", "fork", "revert"] as const) {
+		if (validationInfo[key] === null) delete validationInfo[key];
+	}
+	if (findSchemaReferenceViolation(validationInfo, "record.info") !== undefined) {
+		throw new ReplacementPolicyError("unsupported-reference");
+	}
+
+	const info = cloneObject(snapshot.info);
+	delete info["fork"];
+	delete info["revert"];
+	const parentID = info["parentID"];
+	if (options.keepParentID === true && typeof parentID === "string" && parentID.length > 0) {
+		info["parentID"] = parentID;
+	} else {
+		delete info["parentID"];
+	}
 	return { info, messages: snapshot.messages };
 }
 
@@ -890,7 +939,9 @@ function sameOptionalField(expected: JsonObject, actual: JsonObject, key: string
  *   target after slash/trailing-slash/Windows-drive-case normalization;
  * - `info.time.updated` is a finite timestamp inside the inclusive import
  *   window and not before `info.time.created`;
- * - root `parentID`/`fork`/`revert` may be absent or exactly null.
+ * - root `fork`/`revert` may be absent or exactly null;
+ * - a root `parentID` may be absent or exactly null, or must exactly match the
+ *   expected non-empty parent ID.
  *
  * Every other session field, every message (IDs, types, roles, order, parts,
  * tools, timestamps, unknown/extra/missing fields), and the id/title/created/
@@ -927,14 +978,29 @@ export function verifyImportedRecord(input: VerifyImportedRecordInput): Imported
 		return fail("actual-malformed");
 	}
 
-	for (const key of ["parentID", "fork", "revert"] as const) {
+	for (const key of ["fork", "revert"] as const) {
 		const value = expected.info[key];
 		if (value !== undefined && value !== null) return fail("expected-references");
 	}
-	for (const key of ["parentID", "fork", "revert"] as const) {
+	const expectedParentID = expected.info["parentID"];
+	if (expectedParentID !== undefined && expectedParentID !== null) {
+		if (typeof expectedParentID !== "string" || expectedParentID.length === 0) {
+			return fail("expected-references");
+		}
+	}
+	for (const key of ["fork", "revert"] as const) {
 		const value = actual.info[key];
 		if (value !== undefined && value !== null) return fail("session-reference");
 	}
+	const actualParentID = actual.info["parentID"];
+	if (actualParentID !== undefined && actualParentID !== null) {
+		if (typeof actualParentID !== "string" || actualParentID.length === 0) {
+			return fail("session-reference");
+		}
+	}
+	const normalizedExpectedParentID = expectedParentID === null ? undefined : expectedParentID;
+	const normalizedActualParentID = actualParentID === null ? undefined : actualParentID;
+	if (normalizedExpectedParentID !== normalizedActualParentID) return fail("session-reference");
 
 	if (expected.info["id"] !== actual.info["id"]) return fail("session-id");
 

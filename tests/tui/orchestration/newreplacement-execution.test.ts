@@ -339,6 +339,28 @@ describe("same-ID lineage update", () => {
 		expect(harness.deleteIDs).toEqual([]);
 		expect(harness.events).not.toContain("recovery");
 	});
+
+	test("a child import after a same-ID update keeps the updated parent ID", async () => {
+		const first = { id: "msg_a1", type: "user", text: "one" } as JsonObject;
+		const second = { id: "msg_a2", type: "user", text: "two" } as JsonObject;
+		const harness = await run({
+			importMode: "replace",
+			entries: [
+				updateEntry("ses_a", [first, second]),
+				{
+					sourceSessionID: "local-absent-target-1-ses_child",
+					record: record("ses_child", { info: { parentID: "ses_a" } }),
+					classification: "imported",
+				},
+			],
+			destination: [record("ses_a", { messages: [first] })],
+		});
+
+		expect(harness.result.preview.entries.map((entry) => entry.action)).toEqual(["update", "import"]);
+		expect(harness.imported.map((value) => value.info["id"])).toEqual(["ses_a", "ses_child"]);
+		expect(harness.imported[1]!.info["parentID"]).toBe("ses_a");
+		expect(harness.deleteIDs).toEqual(["ses_a"]);
+	});
 });
 
 /* ------------------------------------------------------------------------- */
@@ -544,6 +566,84 @@ test("fork and revert sources become parentless copies and retain the old target
 		expect((harness.imported[0]!.info as JsonObject)["revert"]).toBeUndefined();
 		expect(harness.deleteIDs).toEqual([]);
 	}
+});
+
+test("a target-absent import keeps a resolved parentID and imports parent first", async () => {
+	const parent = record("ses_parent");
+	const child = record("ses_child", { info: { parentID: "ses_parent" } });
+	const harness = await run({
+		importMode: "replace",
+		entries: [
+			{ sourceSessionID: "local-absent-target-0-ses_parent", record: parent, classification: "imported" },
+			{ sourceSessionID: "local-absent-target-1-ses_child", record: child, classification: "imported" },
+		],
+		destination: [],
+		sourceRecords: [],
+	});
+
+	expect(harness.result.preview.entries.map((entry) => entry.action)).toEqual(["import", "import"]);
+	expect(harness.imported.map((value) => value.info["id"])).toEqual(["ses_parent", "ses_child"]);
+	expect(harness.imported[1]!.info["parentID"]).toBe("ses_parent");
+	expect(harness.deleteIDs).toEqual([]);
+});
+
+test("a target-absent child import fails closed when its parent is absent", async () => {
+	const child = record("ses_child", { info: { parentID: "ses_missing" } });
+	const harness = await run({
+		importMode: "replace",
+		entries: [{ sourceSessionID: "local-absent-target-0-ses_child", record: child, classification: "imported" }],
+		destination: [],
+		sourceRecords: [],
+	});
+
+	expect(harness.result.preview.entries[0]?.action).toBe("import");
+	expect(harness.result.report.entries[0]?.outcome).toBe("failed");
+	expect(harness.result.report.entries[0]?.reason).toBe("prepared-record-invalid");
+	expect(harness.imported).toHaveLength(0);
+	expect(harness.deleteIDs).toEqual([]);
+});
+
+test("a forced child copy keeps its resolved parentID", async () => {
+	const harness = await run({
+		importMode: "replace",
+		entries: [
+			{
+				sourceSessionID: "ses_old",
+				record: record("ses_child_copy", { info: { parentID: "ses_parent" } }),
+				classification: "renamed",
+				copyOnly: true,
+				note: "lineage-conflict",
+			},
+		],
+		destination: [record("ses_old"), record("ses_parent")],
+		sourceRecords: [record("ses_old")],
+	});
+
+	expect(harness.result.preview.entries[0]?.action).toBe("copy");
+	expect(harness.result.preview.entries[0]?.reason).toBe("lineage-conflict");
+	expect(harness.imported).toHaveLength(1);
+	expect(harness.imported[0]!.info["id"]).toBe("ses_child_copy");
+	expect(harness.imported[0]!.info["parentID"]).toBe("ses_parent");
+	expect(harness.deleteIDs).toEqual([]);
+});
+
+test("replace candidates remain parentless", async () => {
+	const harness = await run({
+		importMode: "replace",
+		entries: [
+			{
+				sourceSessionID: "ses_old",
+				record: record("ses_candidate", { info: { parentID: "ses_parent" } }),
+			},
+		],
+		destination: [record("ses_old")],
+		sourceRecords: [record("ses_old")],
+	});
+
+	expect(harness.result.preview.entries[0]?.action).toBe("replace");
+	expect(harness.imported).toHaveLength(1);
+	expect(harness.imported[0]!.info["parentID"]).toBeUndefined();
+	expect(harness.deleteIDs).toEqual(["ses_old"]);
 });
 
 test("destination children and incoming references downgrade to copy", async () => {
